@@ -9,7 +9,7 @@
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 from collections import defaultdict
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple, TypeVar
+from typing import List, Mapping, Optional, Sequence, Set, Tuple, TypeVar
 
 import prettytable as pt
 from ldops.cluster import get_cluster_view
@@ -25,13 +25,7 @@ from logdevice.admin.safety.types import (
     OperationImpact,
 )
 from logdevice.client import get_internal_log_name, is_internal_log
-from logdevice.common.types import (
-    Location,
-    LocationScope,
-    NodeID,
-    ReplicationProperty,
-    ShardID,
-)
+from logdevice.common.types import LocationScope, NodeID, ReplicationProperty, ShardID
 from nubia import context
 from nubia.internal.typing import argument, command
 from termcolor import colored, cprint
@@ -106,6 +100,11 @@ ReadUnavailableMapping = Mapping[LocationScope, Mapping[str, Set[ShardID]]]
     type=int,
     description="The maximum percentage of storage capacity that can be unavailable",
 )
+@argument(
+    "skip_capacity_checks",
+    type=bool,
+    description="Disable capacity checking altogether",
+)
 async def check_impact(
     shards: Optional[List[str]] = None,
     node_indexes: Optional[List[int]] = None,
@@ -121,10 +120,11 @@ async def check_impact(
     short: bool = False,
     max_unavailable_storage_capacity_pct=25,
     max_unavailable_sequencing_capacity_pct=25,
+    skip_capacity_checks=False,
 ):
     """
-    Return true if performaing operations to the given shards will cause
-    loss of read/write availiability or data loss.
+    Return true if performing operations to the given shards will cause
+    loss of read/write availability or data loss.
     """
 
     if shards is None:
@@ -148,7 +148,7 @@ async def check_impact(
             shard_ids.add(ShardID(node=cv.get_node_id(node_name=nn), shard_index=-1))
         for ni in node_indexes:
             shard_ids.add(ShardID(node=NodeID(node_index=ni), shard_index=-1))
-        shard_ids_expanded = cv.expand_shards(shard_ids)
+        shard_ids_expanded = cv.expand_shards(shard_ids, include_sequencers=True)
 
         return shard_ids_expanded
 
@@ -160,6 +160,10 @@ async def check_impact(
 
     # pyre-fixme[9]: target_state has type `str`; used as `ShardStorageState`.
     target_state = convert.to_storage_state(target_state)
+
+    if skip_capacity_checks:
+        max_unavailable_sequencing_capacity_pct = 100
+        max_unavailable_storage_capacity_pct = 100
 
     async with ctx.get_cluster_admin_client() as client:
         try:
@@ -205,6 +209,7 @@ async def check_impact(
         lines.append(f"Total logs checked ({response.total_logs_checked}) in {delta}s")
     print("\n".join(lines))
     if not short:
+        # pyre-fixme[6]: Expected `List[ShardID]` for 2nd param but got `List[str]`.
         print(check_impact_string(response, shards, target_state))
     if not response.impact:
         return 0
@@ -300,7 +305,9 @@ def get_biggest_scope(replication: ReplicationProperty) -> LocationScope:
 
 # TODO (T62931988) change this back to Location
 def location_up_to_scope(
-    shard: ShardID, location_per_scope: Mapping[LocationScope, str], scope: LocationScope
+    shard: ShardID,
+    location_per_scope: Mapping[LocationScope, str],
+    scope: LocationScope,
 ) -> str:
     """
     Generates a string of the location string up to a given scope. The input
@@ -395,7 +402,6 @@ def impact_on_log_string(
 
     # Maps LocationScope to the unique locations of read available domains.
     read_unavailable: ReadUnavailableMapping
-    # pyre-ignore (T47856310)
     read_unavailable = defaultdict(lambda: defaultdict(lambda: set()))
 
     n_writeable = 0

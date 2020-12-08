@@ -17,7 +17,6 @@
 
 namespace facebook { namespace logdevice {
 
-
 std::unique_ptr<BufferedWriter>
 BufferedWriter::create(std::shared_ptr<Client> client,
                        AppendCallback* callback,
@@ -64,6 +63,16 @@ int BufferedWriter::append(logid_t log_id,
                            AppendAttributes&& attrs) {
   return impl()->append(
       log_id, std::move(payload), std::move(cb_context), std::move(attrs));
+}
+
+int BufferedWriter::append(logid_t log_id,
+                           PayloadGroup&& payload_group,
+                           AppendCallback::Context cb_context,
+                           AppendAttributes&& attrs) {
+  return impl()->append(log_id,
+                        std::move(payload_group),
+                        std::move(cb_context),
+                        std::move(attrs));
 }
 
 std::vector<Status> BufferedWriter::append(std::vector<Append>&& appends) {

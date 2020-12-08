@@ -6,6 +6,7 @@ sidebar_label: Build LogDevice
 Follow these instructions to build LogDevice components including `logdeviced` (the LogDevice server), `ld-admin-server` the standalone administration server, the client library, and `ldshell`, an administrative shell utility. See the [Build artifacts](#built-binaries-and-libraries-build-artifacts) for the full list.
 
 At this time, the only supported platform is **Ubuntu 18 LTS "Bionic Beaver"**. LogDevice relies on some *C++17* features, so building LogDevice requires a compiler that supports at least *C++17*.
+At this time, the only supported platform is **Ubuntu 18 LTS "Bionic Beaver"**. LogDevice uses coroutines and relies on some *C++17* features, so building LogDevice requires a compiler that supports both. Our build system uses clang-9.
 
 ## Clone the repo and build from the source
 
@@ -27,7 +28,7 @@ Key dependencies that you need to build LogDevice:
 - CMake (minimum *3.4.0*)
 - C++ compiler that support *C++17* or higher (We will require C++20 soon!)
 - Python *3.6+* and virtualenv
-- Cython *0.28.6* (due to https://github.com/cython/cython/issues/2985)
+- Cython
 - Boost C++ Libraries (minimum *1.55.0*)
 - LibEvent
 - Zookeeper MT C++ client library
@@ -71,12 +72,14 @@ source ./staging/usr/local/bin/activate
 > `source ./staging/usr/local/bin/activate`
 
 ```shell-session
-python3 -m pip install --upgrade setuptools wheel cython==0.28.6
+python3 -m pip install --upgrade setuptools wheel cython
 ```
 
 ## Start the build
 
 ```shell-session
+export CC=clang-9
+export CXX=clang++-9
 cmake -Dthriftpy3=ON ../logdevice/
 ```
 

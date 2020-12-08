@@ -14,9 +14,9 @@
 #include "logdevice/common/RetryHandler.h"
 #include "logdevice/common/configuration/nodes/NodesConfigurationCodec.h"
 
-namespace facebook { namespace logdevice {
-
 using namespace facebook::logdevice::configuration::nodes;
+
+namespace facebook { namespace logdevice {
 
 namespace {
 constexpr size_t kMaxNumRetries = 10;
@@ -89,9 +89,10 @@ NodeRegistrationHandler::updateBuilderFromSettings(node_index_t my_idx) const {
   }
 
   if (!server_settings_.unix_socket.empty()) {
-    update_builder.setDataAddress(Sockaddr(server_settings_.unix_socket));
+    update_builder.setDefaultDataAddress(
+        Sockaddr(server_settings_.unix_socket));
   } else {
-    update_builder.setDataAddress(
+    update_builder.setDefaultDataAddress(
         Sockaddr(server_settings_.address, server_settings_.port));
   }
 
@@ -136,6 +137,43 @@ NodeRegistrationHandler::updateBuilderFromSettings(node_index_t my_idx) const {
         server_settings_.address, server_settings_.server_to_server_port));
   }
 
+  // Dedicated server-to-server Thrift API address is optional, so only set it
+  // if the unix socket is passed or if the port is greater than the default 0.
+  if (!server_settings_.server_thrift_api_unix_socket.empty()) {
+    update_builder.setServerThriftApiAddress(
+        Sockaddr(server_settings_.server_thrift_api_unix_socket));
+  } else if (server_settings_.server_thrift_api_port > 0) {
+    update_builder.setServerThriftApiAddress(Sockaddr(
+        server_settings_.address, server_settings_.server_thrift_api_port));
+  }
+
+  // Dedicated client-facing Thrift API address is optional, so only set it
+  // if the unix socket is passed or if the port is greater than the default 0.
+  if (!server_settings_.client_thrift_api_unix_socket.empty()) {
+    update_builder.setClientThriftApiAddress(
+        Sockaddr(server_settings_.client_thrift_api_unix_socket));
+  } else if (server_settings_.client_thrift_api_port > 0) {
+    update_builder.setClientThriftApiAddress(Sockaddr(
+        server_settings_.address, server_settings_.client_thrift_api_port));
+  }
+
+  // Ports per network priority is an optional feature. An empty map represents
+  // that setting is not set.
+  if (!server_settings_.unix_addresses_per_network_priority.empty()) {
+    for (const auto& [priority, socket_path] :
+         server_settings_.unix_addresses_per_network_priority) {
+      update_builder.setAddressForNetworkPriority(
+          priority, Sockaddr{socket_path});
+    }
+  } else if (!server_settings_.ports_per_network_priority.empty()) {
+    for (const auto& [priority, port] :
+         server_settings_.ports_per_network_priority) {
+      update_builder.setAddressForNetworkPriority(
+          priority,
+          Sockaddr{server_settings_.address, static_cast<in_port_t>(port)});
+    }
+  }
+
   if (!server_settings_.location.isEmpty()) {
     update_builder.setLocation(server_settings_.location);
   }
@@ -152,6 +190,11 @@ NodeRegistrationHandler::updateBuilderFromSettings(node_index_t my_idx) const {
         .setStorageCapacity(server_settings_.storage_capacity)
         .setNumShards(server_settings_.num_shards);
   }
+
+  for (const auto& kvp : server_settings_.tags) {
+    update_builder.setTag(kvp.first, kvp.second);
+  }
+
   return update_builder;
 }
 

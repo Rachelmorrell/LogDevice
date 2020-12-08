@@ -32,9 +32,9 @@ namespace membership {
  *       various different storage states. It is the _dynamic_ and mutable
  *       part of the storage configuration.
  *
- *       Note: all state and transition functions defined are not thread-safe.
- *       Upper layer is responsible for atomically update the state and
- *       propagate them to all execution contexts.
+ *       Note: All the state and transition functions defined here are not
+ * thread-safe. Upper layer is responsible for atomically updating the state and
+ *       propagating them to all execution contexts.
  */
 
 // Describe the per-shard state of a storage membership
@@ -269,6 +269,8 @@ class StorageMembership : public Membership {
   StorageSet writerViewMetaData() const;
   StorageSet readerViewMetaData() const;
 
+  std::vector<ShardID> getAllShards() const;
+
   /**
    * Return the list of storage shards whose MetaDataStorageState is either
    * METADATA or PROMOTING (i.e., not NONE).
@@ -356,7 +358,6 @@ class StorageMembership : public Membership {
     return ConstMapKeyIterator<MapType>(node_states_.cend());
   }
 
-  friend class configuration::nodes::NodesConfigLegacyConverter;
   friend class configuration::nodes::ShardStateTracker;
   friend class MembershipThriftConverter;
 };

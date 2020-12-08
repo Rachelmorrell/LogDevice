@@ -70,6 +70,8 @@ void RSMSnapshotHeader::deserialize(ProtocolReader& reader,
   reader.protoGate(CONTAINS_DELTA_LOG_READ_PTR_AND_LENGTH);
   reader.read(&length);
   reader.read(&delta_log_read_ptr);
+  reader.protoGate(CONTAINS_NODE_METADATA);
+  reader.readVector(&node_info_);
 }
 
 void RSMSnapshotHeader::serialize(ProtocolWriter& writer) const {
@@ -81,6 +83,8 @@ void RSMSnapshotHeader::serialize(ProtocolWriter& writer) const {
   writer.protoGate(CONTAINS_DELTA_LOG_READ_PTR_AND_LENGTH);
   writer.write(length);
   writer.write(delta_log_read_ptr);
+  writer.protoGate(CONTAINS_NODE_METADATA);
+  writer.writeVector(node_info_);
 }
 
 bool RSMSnapshotHeader::operator==(const RSMSnapshotHeader& out) const {
@@ -88,21 +92,36 @@ bool RSMSnapshotHeader::operator==(const RSMSnapshotHeader& out) const {
       byte_offset == out.byte_offset && offset == out.offset &&
       base_version == out.base_version &&
       (format_version < CONTAINS_DELTA_LOG_READ_PTR_AND_LENGTH ||
-       (delta_log_read_ptr == out.delta_log_read_ptr && length == out.length));
+       (delta_log_read_ptr == out.delta_log_read_ptr &&
+        length == out.length)) &&
+      (format_version < CONTAINS_NODE_METADATA ||
+       node_info_ == out.getNodeInfo());
 }
 
 std::string RSMSnapshotHeader::describe() const {
   return folly::format("RSMSnapshotHeader[format_version={}, "
                        "flags={}, byte_offset={}, offset={}, base_version={}, "
-                       "length={}, delta_log_read_ptr={}]",
+                       "length={}, delta_log_read_ptr={}, node_info={}]",
                        format_version,
                        flags,
                        byte_offset,
                        offset,
                        lsn_to_string(base_version).c_str(),
                        length,
-                       lsn_to_string(delta_log_read_ptr).c_str())
+                       lsn_to_string(delta_log_read_ptr).c_str(),
+                       node_info_)
       .str();
+}
+
+void RSMSnapshotHeader::setNodeInfo(std::string node_info) {
+  node_info_ = std::move(node_info);
+  // updating the length of the header since it is computed only upon header
+  // construction. When changing the node_info field, its value can change
+  length = computeLengthInBytes(*this);
+}
+
+const std::string& RSMSnapshotHeader::getNodeInfo() const {
+  return node_info_;
 }
 
 }} // namespace facebook::logdevice

@@ -9,6 +9,7 @@
 #pragma once
 #include <folly/io/SocketOptionMap.h>
 #include <folly/io/async/AsyncSocket.h>
+#include <folly/ssl/SSLSession.h>
 
 namespace folly {
 class AsyncTransportCertificate;
@@ -150,9 +151,9 @@ class SocketAdapter {
   }
 
   /**
-   * Get the peer certificate information if any
+   * Get the SSL object associated with socket if any.
    */
-  virtual const folly::AsyncTransportCertificate* getPeerCertificate() const {
+  virtual const SSL* getSSL() const {
     return nullptr;
   }
 
@@ -217,6 +218,23 @@ class SocketAdapter {
                                 int optname,
                                 void const* optval,
                                 socklen_t optlen) = 0;
+
+  /**
+   * Determine if the session specified during setSSLSession was reused
+   * or if the server rejected it and issued a new session.
+   */
+  virtual bool getSSLSessionReused() const = 0;
+
+  /**
+   * Get a handle to the negotiated SSL session.
+   */
+  virtual std::shared_ptr<folly::ssl::SSLSession> getSSLSession() = 0;
+
+  /**
+   * Set the SSL session to be used during sslConn.
+   */
+  virtual void
+  setSSLSession(std::shared_ptr<folly::ssl::SSLSession> session) = 0;
 };
 
 }} // namespace facebook::logdevice

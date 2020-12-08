@@ -13,10 +13,10 @@
 #include "logdevice/common/membership/StorageStateTransitions.h"
 #include "logdevice/common/types_internal.h"
 
+using namespace facebook::logdevice::configuration::nodes;
+
 namespace facebook { namespace logdevice { namespace admin {
 namespace cluster_membership {
-
-using namespace facebook::logdevice::configuration::nodes;
 
 folly::Expected<RemoveNodesHandler::Result,
                 thrift::ClusterMembershipOperationFailed>
@@ -81,7 +81,10 @@ check_is_disabled(const NodesConfiguration& nodes_configuration,
 
 folly::Optional<thrift::ClusterMembershipFailedNode>
 check_is_dead(const ClusterState& cluster_state, node_index_t idx) {
-  auto node_state = cluster_state.getNodeState(idx);
+  // The default here is FULLY_STARTED to avoid removing a node that's actually
+  // ALIVE but we don't know about it yet.
+  auto node_state =
+      cluster_state.getNodeState(idx, ClusterState::NodeState::FULLY_STARTED);
   if (node_state == ClusterState::NodeState::DEAD) {
     return folly::none;
   }
@@ -104,17 +107,17 @@ RemoveNodesHandler::checkPreconditions(
   thrift::ClusterMembershipOperationFailed failure;
   for (const auto& idx : node_idxs) {
     if (auto fail = check_is_dead(cluster_state, idx); fail.has_value()) {
-      failure.failed_nodes.push_back(std::move(fail).value());
+      failure.failed_nodes_ref()->push_back(std::move(fail).value());
       continue;
     }
 
     if (auto fail = check_is_disabled(nodes_configuration, idx);
         fail.has_value()) {
-      failure.failed_nodes.push_back(std::move(fail).value());
+      failure.failed_nodes_ref()->push_back(std::move(fail).value());
       continue;
     }
   }
-  if (failure.failed_nodes.empty()) {
+  if (failure.failed_nodes_ref()->empty()) {
     return folly::none;
   }
   return failure;

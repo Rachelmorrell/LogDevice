@@ -103,6 +103,8 @@ class GOSSIP_Message : public Message {
   Disposition onReceived(const Address& from) override;
   void onSent(Status st, const Address& to) const override;
 
+  PermissionParams getPermissionParams() const override;
+
   node_list_t node_list_;
   NodeID gossip_node_;
   GOSSIP_flags_t flags_;
@@ -158,6 +160,13 @@ class GOSSIP_Message : public Message {
   static const GOSSIP_flags_t HAS_IN_MEM_VERSIONS = 1 << 5;
   // The message contains durable RSM versions(in local store) on cluster nodes
   static const GOSSIP_flags_t HAS_DURABLE_SNAPSHOT_VERSIONS = 1 << 6;
+
+  // Node didn't process any gossip messages for some time. It's able to send
+  // gossips though. This can happen in case of either partial network failure
+  // or node overload preventing it from processing received gossip messages.
+  // If this flag is set, the rest of the message is ignored by the receiving
+  // node.
+  static const GOSSIP_flags_t LONG_TIME_SINCE_LAST_GOSSIP = 1 << 7;
 
  private:
   // flattens the matrices and then writes them

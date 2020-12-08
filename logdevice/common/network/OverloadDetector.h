@@ -10,7 +10,7 @@
 #include "folly/container/F14Map.h"
 #include "logdevice/common/Connection.h"
 #include "logdevice/common/Timer.h"
-#include "logdevice/common/configuration/NodesConfig.h"
+#include "logdevice/common/configuration/nodes/NodesConfiguration.h"
 
 namespace facebook::logdevice {
 
@@ -26,7 +26,7 @@ class OverloadDetectorDependencies {
   virtual std::shared_ptr<const configuration::nodes::NodesConfiguration>
   getNodesConfiguration();
 
-  Connection* getConnectionFor(node_index_t nid);
+  Connection* FOLLY_NULLABLE getConnectionFor(node_index_t nid);
   virtual size_t getTcpRecvBufSize(node_index_t nid);
   virtual ssize_t getTcpRecvBufOccupancy(node_index_t nid);
   virtual uint64_t getNumBytesReceived(node_index_t nid);

@@ -854,12 +854,10 @@ void RocksDBSettings::defineSettings(SettingEasyInit& init) {
        "records that do not pass copyset filters. This greatly improves the "
        "efficiency of reading and rebuilding if records are large (1KB or "
        "bigger). For small records, the overhead of maintaining the copyset "
-       "index negates the savings. **WARNING**: if this setting is enabled, "
-       "records written without --write-copyset-index will be skipped by the "
-       "copyset filter and will not be delivered to readers. Enable "
-       "--write-copyset-index first and wait for all data records written "
-       "before --write-copyset-index was enabled (if any) to be trimmed "
-       "before enabling this setting.",
+       "index negates the savings. If this setting is enabled while "
+       "--rocksdb-write-copyset-index is not, it will be ignored. After "
+       "enabling --rocksdb-write-copyset-index, all **NEW** partitions "
+       "will have copyset idnex enabled",
        SERVER | REQUIRES_RESTART,
        SettingsCategory::LogsDB);
 
@@ -975,6 +973,17 @@ void RocksDBSettings::defineSettings(SettingEasyInit& init) {
        SERVER,
        SettingsCategory::Testing);
 
+  init("rocksdb-test-stall-sst-reads",
+       &test_stall_sst_reads,
+       "false",
+       nullptr,
+       "Used for testing. If set to 'true', rocksdb::RandomAccessFile::Read() "
+       "calls will stall indefinitely, until the setting is changed to "
+       "'false'. This simulates a file read getting stuck. Can be used for "
+       "testing resilience of read path to such situation.",
+       SERVER,
+       SettingsCategory::Testing);
+
   init("rocksdb-bloom-bits-per-key",
        &bloom_bits_per_key_,
        "10",
@@ -1034,6 +1043,15 @@ void RocksDBSettings::defineSettings(SettingEasyInit& init) {
        "around max(72, bloom_bits_per_key) + 2 * bloom_bits_per_key  per log "
        "per sst (the \"2\" corresponds to CSI and findTime index entries; if "
        "one or both is disabled, it's correspondingly smaller).",
+       SERVER,
+       SettingsCategory::RocksDB);
+
+  init("rocksdb-use-nocachedump-memory-allocator",
+       &use_nocachedump_memory_allocator,
+       "false",
+       nullptr,
+       "If true, rocksdb will exclude block cache in core dumps "
+       "by using the new JemallocNodumpAllocator memory allocator option",
        SERVER,
        SettingsCategory::RocksDB);
 
@@ -1617,6 +1635,20 @@ void RocksDBSettings::defineSettings(SettingEasyInit& init) {
        SERVER,
        SettingsCategory::LogsDB);
 
+  init("rocksdb-io-tracing-stall-threshold",
+       &io_tracing_stall_threshold,
+       "30s",
+       nullptr,
+       "If this setting is nonzero, and rocksdb-io-tracing-shards is enabled, "
+       "IO tracing will spin up a background thread to periodically poll the "
+       "list of active IO operations and report when an operation is stuck for "
+       "at least this long. The purpose is to detect stuck IO operations, "
+       "which wouldn't be reported by the regular IO tracing because it only "
+       "reports an operation after it completes. If set to '0', stall "
+       "detection will be disabled, and no background thread will be created.",
+       SERVER,
+       SettingsCategory::LogsDB);
+
   init("rocksdb-paranoid-checks",
        &paranoid_checks,
        "true",
@@ -1637,6 +1669,28 @@ void RocksDBSettings::defineSettings(SettingEasyInit& init) {
        "and likely to some metadata files like MANIFEST and OPTIONS. This "
        "memory is not allocated all at once, the buffer grows exponentially "
        "up to this size; so it's ok for this setting to be too high.",
+       SERVER | REQUIRES_RESTART,
+       SettingsCategory::RocksDB);
+
+  init("write-copyset-index",
+       &write_copyset_index_,
+       "true",
+       nullptr,
+       "If set, storage nodes will write the copyset index for all records in "
+       "new partitions created after this is enabled. "
+       "Note that this won't be used until --rocksdb-use-copyset-index is "
+       "enabled.",
+       SERVER | REQUIRES_RESTART,
+       SettingsCategory::RocksDB);
+
+  init("rocksdb-write-copyset-index",
+       &write_copyset_index_,
+       "true",
+       nullptr,
+       "If set, storage nodes will write the copyset index for all records in "
+       "new partitions created after this is enabled. "
+       "Note that this won't be used until --rocksdb-use-copyset-index is "
+       "enabled.",
        SERVER | REQUIRES_RESTART,
        SettingsCategory::RocksDB);
 

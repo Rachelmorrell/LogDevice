@@ -14,11 +14,9 @@
 #include "logdevice/common/EpochMetaDataCache.h"
 #include "logdevice/common/EpochMetaDataUpdater.h"
 #include "logdevice/common/EpochStore.h"
-#include "logdevice/common/FileEpochStore.h"
 #include "logdevice/common/configuration/InternalLogs.h"
 #include "logdevice/common/configuration/LocalLogsConfig.h"
 #include "logdevice/common/configuration/UpdateableConfig.h"
-#include "logdevice/common/hash.h"
 #include "logdevice/common/nodeset_selection/NodeSetSelectorFactory.h"
 #include "logdevice/common/plugin/PluginRegistry.h"
 #include "logdevice/common/stats/Stats.h"
@@ -27,6 +25,7 @@
 #include "logdevice/lib/ClientImpl.h"
 #include "logdevice/lib/ClientPluginHelper.h"
 #include "logdevice/lib/RemoteLogsConfig.h"
+#include "logdevice/server/epoch_store/FileEpochStore.h"
 #include "logdevice/test/utils/IntegrationTestBase.h"
 #include "logdevice/test/utils/IntegrationTestUtils.h"
 
@@ -441,8 +440,6 @@ TEST_F(ConfigIntegrationTest, ClientConfigSubscription) {
   auto cluster =
       IntegrationTestUtils::ClusterFactory()
           .setParam("--file-config-update-interval", "10ms")
-          // Config synchronization makes the number of config updates vary
-          .setParam("--enable-config-synchronization", "false")
           // TODO(#8466255): remove.
           .eventLogMode(
               IntegrationTestUtils::ClusterFactory::EventLogMode::NONE)
@@ -533,7 +530,6 @@ TEST_F(ConfigIntegrationTest, ConfigSyncMethodFailure) {
 TEST_F(ConfigIntegrationTest, NumLogsConfiguredStat) {
   auto log_attrs = logsconfig::LogAttributes()
                        .with_replicationFactor(2)
-                       .with_extraCopies(0)
                        .with_syncedCopies(0)
                        .with_maxWritesInFlight(100);
 
@@ -569,11 +565,11 @@ TEST_F(ConfigIntegrationTest, NumLogsConfiguredStat) {
         NodeSetSelectorFactory::create(NodeSetSelectorType::SELECT_ALL);
     auto provisioner = std::make_shared<CustomEpochMetaDataUpdater>(
         new_config,
-        new_config->getNodesConfigurationFromServerConfigSource(),
+        cluster->getConfig()->getNodesConfiguration(),
         selector,
-        true,
-        true /* provision_if_empty */,
-        false /* update_if_exists */);
+        EpochMetaData::Updater::Options()
+            .setUseStorageSetFormat()
+            .setProvisionIfEmpty());
     (*provisioner)(EXTRA_LOG_ID, metadata, /* MetaDataTracer */ nullptr);
     auto epoch_store = cluster->createEpochStore();
     int rv = static_cast<FileEpochStore*>(epoch_store.get())
@@ -597,424 +593,6 @@ TEST_F(ConfigIntegrationTest, NumLogsConfiguredStat) {
   }
 }
 
-void IntegrationTest_RunNamespaceTest(std::shared_ptr<Client> client,
-                                      std::string delimiter,
-                                      std::string ns = "") {
-  ASSERT_TRUE((bool)client);
-
-  LogsConfig::NamespaceRangeLookupMap ranges;
-  LogsConfig::NamespaceRangeLookupMap subranges;
-  std::string prefix = ns.empty() ? ns : ns + delimiter;
-
-  std::string log_name = prefix + "sublog1";
-  auto range = client->getLogRangeByName(log_name);
-  ASSERT_EQ(1, range.first.val_);
-  ASSERT_EQ(1, range.second.val_);
-  std::unique_ptr<client::LogGroup> attributes =
-      client->getLogGroupSync(log_name);
-  ASSERT_NE(nullptr, attributes);
-  std::string full_ns = attributes->getFullyQualifiedName();
-  ASSERT_EQ(range, attributes->range());
-  ASSERT_EQ("sublog1", attributes->name());
-  ASSERT_EQ(delimiter + "ns1" + delimiter + "sublog1", full_ns);
-  ASSERT_EQ(2, attributes->attrs().replicationFactor());
-  ASSERT_EQ(10000, attributes->attrs().maxWritesInFlight());
-  ranges[full_ns] = range;
-
-  log_name = prefix + "ns2" + delimiter + "subsublog1";
-  range = client->getLogRangeByName(log_name);
-  ASSERT_EQ(2, range.first.val_);
-  ASSERT_EQ(3, range.second.val_);
-  attributes = client->getLogGroupSync(log_name);
-  ASSERT_NE(nullptr, attributes);
-  full_ns = attributes->getFullyQualifiedName();
-  ASSERT_EQ(range, attributes->range());
-  ASSERT_EQ("subsublog1", attributes->name());
-  ASSERT_EQ(delimiter + "ns1" + delimiter + "ns2" + delimiter + "subsublog1",
-            full_ns);
-  ASSERT_EQ(3, attributes->attrs().replicationFactor());
-  ASSERT_EQ(10000, attributes->attrs().maxWritesInFlight());
-  ranges[full_ns] = range;
-
-  log_name = prefix + "ns2" + delimiter + "subsublog2";
-  range = client->getLogRangeByName(log_name);
-  ASSERT_EQ(4, range.first.val_);
-  ASSERT_EQ(4, range.second.val_);
-  attributes = client->getLogGroupSync(log_name);
-  ASSERT_NE(nullptr, attributes);
-  full_ns = attributes->getFullyQualifiedName();
-  ASSERT_EQ(range, attributes->range());
-  ASSERT_EQ("subsublog2", attributes->name());
-  ASSERT_EQ(delimiter + "ns1" + delimiter + "ns2" + delimiter + "subsublog2",
-            full_ns);
-  ASSERT_EQ(1, attributes->attrs().replicationFactor());
-  ASSERT_EQ(10000, attributes->attrs().maxWritesInFlight());
-  ranges[full_ns] = range;
-
-  // This should fail because "log1" is not under "ns1"
-  log_name = prefix + "log1";
-  range = client->getLogRangeByName(log_name);
-  ASSERT_EQ(LOGID_INVALID, range.first);
-  ASSERT_EQ(LOGID_INVALID, range.second);
-  attributes = client->getLogGroupSync(log_name);
-  ASSERT_EQ(nullptr, attributes);
-
-  // This should succeed as it queries "log1" from the root namespace
-  range = client->getLogRangeByName(delimiter + "log1");
-  ASSERT_EQ(95, range.first.val_);
-  ASSERT_EQ(100, range.second.val_);
-  attributes = client->getLogGroupSync(delimiter + "log1");
-  ASSERT_NE(nullptr, attributes);
-  full_ns = attributes->getFullyQualifiedName();
-  ASSERT_EQ(range, attributes->range());
-  ASSERT_EQ("log1", attributes->name());
-  ASSERT_EQ(delimiter + "log1", full_ns);
-  ASSERT_EQ(1, attributes->attrs().replicationFactor());
-  ASSERT_EQ(10000, attributes->attrs().maxWritesInFlight());
-
-  // supposed to fetch all logs under ns1
-  auto fetched_ranges = client->getLogRangesByNamespace(ns);
-  ASSERT_EQ(ranges, fetched_ranges);
-}
-
-// Testing how the client works with a config where logs are contained in
-// namespaces
-TEST_F(ConfigIntegrationTest, LogsConfigNamespaceTest) {
-  auto config =
-      Configuration::fromJsonFile(TEST_CONFIG_FILE("namespaced_logs.conf"));
-  ASSERT_NE(nullptr, config);
-  auto cluster = IntegrationTestUtils::ClusterFactory()
-                     .doPreProvisionEpochMetaData()
-                     .create(*config);
-
-  std::unique_ptr<ClientSettings> client_settings(ClientSettings::create());
-  auto client =
-      cluster->createClient(testTimeout(), std::move(client_settings));
-  IntegrationTest_RunNamespaceTest(client, "/", "ns1");
-
-  std::unique_ptr<client::LogGroup> attributes;
-  std::string full_ns;
-  auto range = client->getLogRangeByName("log1");
-  ASSERT_EQ(95, range.first.val_);
-  ASSERT_EQ(100, range.second.val_);
-  attributes = client->getLogGroupSync("log1");
-  ASSERT_NE(nullptr, attributes);
-  full_ns = attributes->getFullyQualifiedName();
-  ASSERT_EQ(range, attributes->range());
-  ASSERT_EQ("log1", attributes->name());
-  ASSERT_EQ("/log1", full_ns);
-  ASSERT_EQ(1, attributes->attrs().replicationFactor());
-  ASSERT_EQ(10000, attributes->attrs().maxWritesInFlight());
-}
-
-// Testing how the client works with a config where logs are contained in
-// namespaces and a default namespace is specified
-TEST_F(ConfigIntegrationTest, LogsConfigNamespaceDefaultTest) {
-  auto config =
-      Configuration::fromJsonFile(TEST_CONFIG_FILE("namespaced_logs.conf"));
-  ASSERT_NE(nullptr, config);
-  auto cluster = IntegrationTestUtils::ClusterFactory()
-                     .doPreProvisionEpochMetaData()
-                     .create(*config);
-
-  std::unique_ptr<ClientSettings> client_settings(ClientSettings::create());
-  ASSERT_EQ(0, client_settings->set("default-log-namespace", "ns1"));
-  auto client =
-      cluster->createClient(testTimeout(), std::move(client_settings));
-  IntegrationTest_RunNamespaceTest(client, "/");
-}
-
-// Testing how the client works with a config where logs are contained in
-// namespaces, and the delimiter for namespaces is set to '#'
-TEST_F(ConfigIntegrationTest, LogsConfigNamespaceDelimiterTest) {
-  auto config = Configuration::fromJsonFile(
-      TEST_CONFIG_FILE("namespaced_logs_delimiter.conf"));
-  ASSERT_NE(nullptr, config);
-  auto cluster = IntegrationTestUtils::ClusterFactory()
-                     .doPreProvisionEpochMetaData()
-                     .create(*config);
-
-  std::unique_ptr<ClientSettings> client_settings(ClientSettings::create());
-  ASSERT_EQ(0, client_settings->set("default-log-namespace", "ns1"));
-  auto client =
-      cluster->createClient(testTimeout(), std::move(client_settings));
-  IntegrationTest_RunNamespaceTest(client, "#");
-}
-
-/**
- * Expand the cluster and update the cluster config version without updating
- * the client config version. Send an append to a log with a sequencer running
- * on the new node. The configs should be synced after the appendSync(), so
- * both the client and server configs should have the same number of nodes. The
- * append should also succeed since the client config would have all the
- * information about the new node.
- */
-TEST_F(ConfigIntegrationTest, ExpandWithVersionUpdate) {
-  size_t num_logs = 5;
-  auto cluster = IntegrationTestUtils::ClusterFactory()
-                     .setParam("--enable-config-synchronization")
-                     .setNumLogs(num_logs)
-                     .useHashBasedSequencerAssignment()
-                     .create(1);
-
-  // Must set version > 0 so that the first config advisory is sent
-  cluster->writeServerConfig(cluster->getConfig()
-                                 ->getServerConfig()
-                                 ->withVersion(config_version_t(1))
-                                 .get());
-  cluster->waitForServersToPartiallyProcessConfigUpdate();
-  std::shared_ptr<Configuration> cluster_config = cluster->getConfig()->get();
-
-  std::shared_ptr<UpdateableConfig> client_config =
-      std::make_shared<UpdateableConfig>(
-          std::make_shared<UpdateableServerConfig>(
-              cluster_config->serverConfig()->copy()),
-          std::make_shared<UpdateableLogsConfig>(cluster_config->logsConfig()),
-          std::make_shared<UpdateableZookeeperConfig>(
-              cluster_config->zookeeperConfig()));
-
-  std::unique_ptr<ClientSettings> client_settings(ClientSettings::create());
-  ASSERT_EQ(0, client_settings->set("enable-config-synchronization", true));
-  // To ensure there's only one connection to the target node to have
-  // deterministic stat values
-  ASSERT_EQ(0, client_settings->set("num-workers", "1"));
-  // Creating a client through instantiating an instance of ClientImpl directly
-  // makes it ignore the settings in the config, so we have to set this here
-  ASSERT_EQ(0, client_settings->set("enable-logsconfig-manager", "false"));
-  auto plugin_registry =
-      std::make_shared<PluginRegistry>(getClientPluginProviders());
-  std::shared_ptr<Client> client = std::make_shared<ClientImpl>(
-      client_config->get()->serverConfig()->getClusterName(),
-      client_config,
-      "",
-      "",
-      getDefaultTestTimeout(),
-      std::move(client_settings),
-      plugin_registry);
-  ASSERT_TRUE((bool)client);
-
-  std::string old_hash =
-      client_config->get()->serverConfig()->getMainConfigMetadata().hash;
-
-  // add a node from the nodes field in the client config; expand()
-  // bumps config version so that the update is propagated to the client.
-  cluster->expand(1);
-
-  // Get the updated cluster configuration
-  cluster_config = cluster->getConfig()->get();
-
-  // Look for a log with a sequencer running on node 1 to make sure that an
-  // append to the new node does not fail
-  int log_id = -1;
-  size_t cluster_nodes_size = cluster_config->serverConfig()->getNodes().size();
-  std::vector<double> weights(cluster_nodes_size, 1.0);
-  for (int i = 0; i < num_logs; i++) {
-    auto seq = hashing::weighted_ch(i, weights);
-    if (seq == 1) {
-      log_id = i;
-      break;
-    }
-  }
-  EXPECT_NE(log_id, -1);
-  // With mismatched versions, the configs should sync after an
-  // appendSync() call
-  char data[20];
-  lsn_t lsn = client->appendSync(logid_t(log_id), Payload(data, sizeof data));
-  // With the client config updated, the append should succeed
-  EXPECT_NE(LSN_INVALID, lsn);
-
-  auto client_server_config = client_config->get()->serverConfig();
-  auto cluster_server_config = cluster_config->serverConfig();
-  // Configs should be synced
-  size_t client_nodes_size = client_server_config->getNodes().size();
-  EXPECT_EQ(client_nodes_size, cluster_nodes_size);
-  EXPECT_EQ(
-      client_server_config->getVersion(), cluster_server_config->getVersion());
-  Stats stats =
-      checked_downcast<ClientImpl*>(client.get())->stats()->aggregate();
-  EXPECT_EQ(stats.config_changed_update, 1);
-  EXPECT_EQ(stats.config_changed_ignored_uptodate, 0);
-  // Make sure the config hash was updated in the metadata
-  std::string new_hash = client_server_config->getMainConfigMetadata().hash;
-  EXPECT_NE(old_hash, new_hash);
-}
-
-/**
- * if the client looses connection to all the servers, then reconnects
- * and then the config changes, it should receive a config update.
- * T19222939
- */
-TEST_F(ConfigIntegrationTest, ConfigSyncAfterReconnect) {
-  size_t num_logs = 5;
-  auto cluster = IntegrationTestUtils::ClusterFactory()
-                     .setParam("--enable-config-synchronization")
-                     .setNumLogs(num_logs)
-                     .useHashBasedSequencerAssignment()
-                     .create(1);
-
-  std::shared_ptr<Configuration> cluster_config = cluster->getConfig()->get();
-  // Must set version > 0 so that the first config advisory is sent
-  auto new_server_config =
-      cluster_config->serverConfig()->withVersion(config_version_t(1));
-  cluster->writeServerConfig(new_server_config.get());
-  cluster->waitForServersToPartiallyProcessConfigUpdate();
-
-  std::shared_ptr<UpdateableConfig> client_config =
-      std::make_shared<UpdateableConfig>(
-          std::make_shared<UpdateableServerConfig>(new_server_config->copy()),
-          std::make_shared<UpdateableLogsConfig>(cluster_config->logsConfig()),
-          std::make_shared<UpdateableZookeeperConfig>(
-              cluster_config->zookeeperConfig()));
-
-  std::unique_ptr<ClientSettings> client_settings(ClientSettings::create());
-  ASSERT_EQ(0, client_settings->set("enable-config-synchronization", true));
-  // To make sure only 1 connection is maintained to a node, which ensures
-  // only 1 CONFIG_CHANGED message is received
-  ASSERT_EQ(0, client_settings->set("num-workers", "1"));
-  // Creating a client through instantiating an instance of ClientImpl directly
-  // makes it ignore the settings in the config, so we have to set this here
-  ASSERT_EQ(0, client_settings->set("enable-logsconfig-manager", "false"));
-  auto plugin_registry =
-      std::make_shared<PluginRegistry>(getClientPluginProviders());
-  std::shared_ptr<Client> client = std::make_shared<ClientImpl>(
-      client_config->get()->serverConfig()->getClusterName(),
-      client_config,
-      "",
-      "",
-      getDefaultTestTimeout(),
-      std::move(client_settings),
-      plugin_registry);
-  ASSERT_TRUE((bool)client);
-
-  std::string old_hash =
-      client_config->get()->serverConfig()->getMainConfigMetadata().hash;
-
-  // the cluster has only one node, but we're going to expand it to 2 nodes
-  // so we look for a log id that will be sequenced by N0 so that both appends
-  // before and after expand go to the same node
-  int log_id = -1;
-  std::vector<double> weights(2, 1.0);
-  for (int i = 0; i < num_logs; i++) {
-    auto seq = hashing::weighted_ch(i, weights);
-    if (seq == 1) {
-      log_id = i;
-      break;
-    }
-  }
-  EXPECT_NE(log_id, -1);
-
-  // append a record to create connection to N0
-  lsn_t lsn = client->appendSync(logid_t(log_id), Payload("foo", 3));
-  EXPECT_NE(LSN_INVALID, lsn);
-
-  // now restart N0
-  cluster->getNode(0).kill();
-  cluster->getNode(0).start();
-
-  // now expand the cluster and bump config version to cause config to be
-  // updated
-  cluster->expand(1);
-
-  cluster_config = cluster->getConfig()->get();
-  new_server_config =
-      cluster_config->serverConfig()->withVersion(config_version_t(2));
-  cluster->writeServerConfig(new_server_config.get());
-  cluster->waitForServersToPartiallyProcessConfigUpdate();
-
-  // Get the updated cluster configuration
-  cluster_config = cluster->getConfig()->get();
-  size_t cluster_nodes_size = cluster_config->serverConfig()->getNodes().size();
-
-  // append another record. the client should reconnect to N1 and receive a
-  // CONFIG_CHANGED message
-  lsn = client->appendSync(logid_t(log_id), Payload("foo", 3));
-  EXPECT_NE(LSN_INVALID, lsn);
-
-  auto client_server_config = client_config->get()->serverConfig();
-  auto cluster_server_config = cluster_config->serverConfig();
-  // Configs should be synced
-  size_t client_nodes_size = client_server_config->getNodes().size();
-  EXPECT_EQ(client_nodes_size, cluster_nodes_size);
-  EXPECT_EQ(
-      client_server_config->getVersion(), cluster_server_config->getVersion());
-  Stats stats =
-      checked_downcast<ClientImpl*>(client.get())->stats()->aggregate();
-  EXPECT_EQ(stats.config_changed_update, 1);
-  EXPECT_EQ(stats.config_changed_ignored_uptodate, 0);
-  // Make sure the config hash was updated in the metadata
-  std::string new_hash = client_server_config->getMainConfigMetadata().hash;
-  EXPECT_NE(old_hash, new_hash);
-}
-
-/**
- * Start a client with a config on the same version as the cluster config, then
- * expand the cluster without a version update.  After an appendSync(), the
- * cluster config should have more nodes than the client config since the
- * CONFIG_CHANGED_Message should not be sent if the versions match.
- */
-TEST_F(ConfigIntegrationTest, ExpandWithoutVersionUpdate) {
-  auto cluster = IntegrationTestUtils::ClusterFactory()
-                     .setParam("--enable-config-synchronization")
-                     .create(1);
-
-  std::shared_ptr<Configuration> cluster_config = cluster->getConfig()->get();
-  // Must set version > 0 so that the first config advisory is sent
-  auto new_server_config =
-      cluster_config->serverConfig()->withVersion(config_version_t(1));
-  cluster->writeServerConfig(new_server_config.get());
-  cluster->waitForServersToPartiallyProcessConfigUpdate();
-
-  std::shared_ptr<UpdateableConfig> client_config =
-      std::make_shared<UpdateableConfig>(
-          std::make_shared<UpdateableServerConfig>(
-              cluster_config->serverConfig()->copy()),
-          std::make_shared<UpdateableLogsConfig>(cluster_config->logsConfig()),
-          std::make_shared<UpdateableZookeeperConfig>(
-              cluster_config->zookeeperConfig()));
-
-  std::unique_ptr<ClientSettings> client_settings(ClientSettings::create());
-  ASSERT_EQ(0, client_settings->set("enable-config-synchronization", true));
-  // Creating a client through instantiating an instance of ClientImpl directly
-  // makes it ignore the settings in the config, so we have to set this here
-  ASSERT_EQ(0, client_settings->set("enable-logsconfig-manager", "false"));
-  auto plugin_registry =
-      std::make_shared<PluginRegistry>(getClientPluginProviders());
-  std::shared_ptr<Client> client = std::make_shared<ClientImpl>(
-      client_config->get()->serverConfig()->getClusterName(),
-      client_config,
-      "",
-      "",
-      std::chrono::seconds(1),
-      std::move(client_settings),
-      plugin_registry);
-  ASSERT_TRUE((bool)client);
-
-  // Expand the cluster by one node without updating the config version
-  cluster->expand(1, /*start*/ true, /*bump_config_versiion*/ false);
-  cluster->waitForServersToPartiallyProcessConfigUpdate();
-
-  // Make an appendSync() call. Configs should not be synchronized after
-  // append since the config versions are the same.
-  char data[20];
-  client->appendSync(logid_t(1), Payload(data, sizeof data));
-  EXPECT_EQ(client_config->get()->serverConfig()->getVersion(),
-            cluster_config->serverConfig()->getVersion());
-
-  // Get the updated cluster configuration
-  cluster_config = cluster->getConfig()->get();
-
-  auto client_server_config = client_config->get()->serverConfig();
-  auto cluster_server_config = cluster_config->serverConfig();
-  // Client config should not be updated
-  size_t client_nodes_size = client_server_config->getNodes().size();
-  size_t cluster_nodes_size = cluster_server_config->getNodes().size();
-  EXPECT_LT(client_nodes_size, cluster_nodes_size);
-  Stats stats =
-      checked_downcast<ClientImpl*>(client.get())->stats()->aggregate();
-  EXPECT_EQ(stats.config_changed_update, 0);
-  EXPECT_EQ(stats.config_changed_ignored_uptodate, 0);
-}
-
 TEST_F(ConfigIntegrationTest, MetaDataLog) {
   auto cluster = IntegrationTestUtils::ClusterFactory().create(1);
 
@@ -1034,6 +612,8 @@ TEST_F(ConfigIntegrationTest, MetaDataLog) {
   client_config->updateableServerConfig()->update(
       cluster_config->serverConfig());
   client_config->updateableLogsConfig()->update(logs_config);
+  client_config->updateableNodesConfiguration()->update(
+      cluster_config->getNodesConfiguration());
   // Creating a client through instantiating an instance of ClientImpl directly
   // makes it ignore the settings in the config, so we have to set this here
   std::unique_ptr<ClientSettings> client_settings(ClientSettings::create());
@@ -1063,30 +643,35 @@ TEST_F(ConfigIntegrationTest, MetaDataLog) {
 
 TEST_F(ConfigIntegrationTest, Stats) {
   size_t num_logs = 5;
-  dbg::parseLoglevelOption("debug");
   auto cluster = IntegrationTestUtils::ClusterFactory()
-                     .setParam("--enable-config-synchronization")
                      .setNumLogs(num_logs)
                      .useHashBasedSequencerAssignment()
                      .create(1);
 
-  std::shared_ptr<Configuration> old_config = cluster->getConfig()->get();
-  auto new_server_config =
-      old_config->serverConfig()->withVersion(config_version_t(1));
-  Configuration new_config(
-      std::move(new_server_config), old_config->logsConfig());
-  std::string config_str = new_config.toString();
-  ld_info("CFG: %s", config_str.c_str() + 2000);
-  cluster->writeConfig(new_config);
-  cluster->waitForServersToPartiallyProcessConfigUpdate();
+  auto change_config = [&](std::string name,
+                           config_version_t version,
+                           bool wait_for_config = true) {
+    std::shared_ptr<Configuration> old_config = cluster->getConfig()->get();
+    auto new_server_config_json = old_config->serverConfig()->toJson(
+        old_config->logsConfig().get(), old_config->zookeeperConfig().get());
+    new_server_config_json["cluster"] = name;
+    new_server_config_json["version"] = version.val();
+    auto new_config = Configuration::fromJson(new_server_config_json, nullptr);
+
+    cluster->writeConfig(*new_config, wait_for_config);
+    if (wait_for_config) {
+      cluster->waitForServersToPartiallyProcessConfigUpdate();
+    }
+  };
+
+  change_config("cluster1", config_version_t(1));
 
   // take a snapshot of the stats
   auto initial_stats = cluster->getNode(0).stats();
 
   // test #1: no change but overwrite config to trigger reload and verify that
   // config_update_same_version is incremented
-  EXPECT_EQ(config_str, cluster->getConfig()->get()->toString());
-  cluster->writeConfig(new_config);
+  change_config("cluster1", config_version_t(1));
 
   wait_until([&]() {
     auto tmp_stats = cluster->getNode(0).stats();
@@ -1105,8 +690,7 @@ TEST_F(ConfigIntegrationTest, Stats) {
 
   // test #2: change config without updating version. expect
   // config_update_hash_mismatch and updated_config to be incremented.
-  cluster->expand(1, /*start*/ true, /*bump_config_versiion*/ false);
-  cluster->waitForServersToPartiallyProcessConfigUpdate();
+  change_config("cluster2", config_version_t(1));
 
   auto stats2 = cluster->getNode(0).stats();
   EXPECT_LE(stats["config_update_same_version"],
@@ -1119,7 +703,7 @@ TEST_F(ConfigIntegrationTest, Stats) {
 
   // test #3: change config and update version. expect updated_config
   // to be incremented
-  cluster->expand(1);
+  change_config("cluster3", config_version_t(2));
 
   auto stats3 = cluster->getNode(0).stats();
   EXPECT_LE(stats2["config_update_same_version"],
@@ -1132,7 +716,8 @@ TEST_F(ConfigIntegrationTest, Stats) {
 
   // test #4: change config with older version. expect
   // config_update_old_version to be incremented
-  cluster->writeConfig(new_config, false);
+  change_config("cluster1", config_version_t(1), false);
+
   wait_until([&]() {
     auto tmp_stats = cluster->getNode(0).stats();
     return (stats3["config_update_old_version"] + 1) ==
@@ -1172,8 +757,13 @@ TEST_F(ConfigIntegrationTest, InvalidConfigClientCreationTest2) {
 }
 
 TEST_F(ConfigIntegrationTest, SslClientCertUnsetByDefault) {
+  auto ncs_path = provisionTempNodesConfiguration(*createSimpleNodesConfig(1));
   std::string client_config_path = TEST_CONFIG_FILE("sample_no_ssl.conf");
-  auto client = ClientFactory().create(client_config_path);
+  auto client = ClientFactory()
+                    .setSetting("nodes-configuration-file-store-dir",
+                                ncs_path->path().string())
+                    .setSetting("admin-client-capabilities", "true")
+                    .create(client_config_path);
   ASSERT_NE(nullptr, client);
 
   ClientImpl* client_impl = dynamic_cast<ClientImpl*>(client.get());

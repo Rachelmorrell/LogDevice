@@ -11,7 +11,7 @@
 
 #include <folly/ScopeGuard.h>
 
-#include "logdevice/common/Connection.h"
+#include "logdevice/common/ConnectionInfo.h"
 #include "logdevice/common/Sender.h"
 #include "logdevice/common/SocketTypes.h"
 #include "logdevice/common/debug.h"
@@ -96,25 +96,22 @@ class BlockCatchupQueue : public AdminCommand {
       }
     }
 
-    auto fn = [&](Connection& s) {
-      auto sockaddr = s.peerSockaddr();
-      if (!sockaddr.getSocketAddress().isFamilyInet() ||
-          !s.peer_name_.isClientAddress() || s.peer_node_id_.isNodeID()) {
+    auto fn = [&](const ConnectionInfo& info) {
+      if (!info.peer_address.getSocketAddress().isFamilyInet() ||
+          !info.isPeerClient()) {
         return;
       }
-      if (hostname_ != "all" && sockaddr.getIPAddress() != addr) {
+      if (hostname_ != "all" && info.peer_address.getIPAddress() != addr) {
         return;
       }
-      auto cid = s.peer_name_.asClientID();
+      auto cid = info.peer_name.asClientID();
       ServerWorker* w = ServerWorker::onThisThread();
       w->serverReadStreams().blockUnblockClient(cid, type_ == "on");
     };
 
-    std::function<void(Connection&)> fn_ = fn;
-
     run_on_all_workers(server_->getProcessor(), [&]() {
       auto* worker = Worker::onThisThread();
-      worker->sender().forAllClientConnections(fn_);
+      worker->sender().forEachConnection(fn);
       return true;
     });
 

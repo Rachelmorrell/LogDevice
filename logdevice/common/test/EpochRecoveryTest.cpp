@@ -21,6 +21,8 @@
 #include "logdevice/common/test/DigestTestUtil.h"
 #include "logdevice/common/test/MockBackoffTimer.h"
 #include "logdevice/common/test/MockTimer.h"
+#include "logdevice/common/test/NodesConfigurationTestUtil.h"
+#include "logdevice/common/test/SenderTestProxy.h"
 #include "logdevice/common/test/TestUtil.h"
 
 #define N0 ShardID(0, 0)
@@ -91,10 +93,6 @@ class EpochRecoveryTest : public ::testing::Test {
   StorageSet storage_set_{N1, N2, N3};
   ReplicationProperty rep_{{NodeLocationScope::NODE, 2}};
 
-  // Shards that are in draining mode. they are fully authoritative and will be
-  // digested, but not writable so should not be included in mutation set
-  std::set<ShardID> draining_shards_;
-
   struct Result {
     Status st;
     Seal seal; // valid when preempted
@@ -112,10 +110,6 @@ class EpochRecoveryTest : public ::testing::Test {
 
   void initConfig();
   void setUp();
-
-  std::shared_ptr<const NodesConfiguration> getNodesConfiguration() const {
-    return updateable_config_->getNodesConfiguration();
-  }
 
   void setNodeState(ShardID shard, ClusterStateNodeState state) {
     node_state_map_[shard] = state;
@@ -199,10 +193,6 @@ class MockEpochRecoveryDependencies : public EpochRecoveryDependencies {
 
   void onShardRemovedFromConfig(ShardID) override {}
 
-  bool canMutateShard(ShardID shard) const override {
-    return test_->draining_shards_.count(shard) == 0;
-  }
-
   NodeID getMyNodeID() const override {
     return test_->my_node_;
   }
@@ -231,7 +221,8 @@ class MockEpochRecoveryDependencies : public EpochRecoveryDependencies {
     return std::move(timer);
   }
 
-  int registerOnSocketClosed(const Address& addr, SocketCallback& cb) override {
+  int registerOnConnectionClosed(const Address& addr,
+                                 SocketCallback& cb) override {
     test_->on_close_cb_map_[addr.asNodeID()].push_back(cb);
     return 0;
   }
@@ -297,40 +288,31 @@ void EpochRecoveryTest::initConfig() {
   // init cluster config
   configuration::Nodes nodes;
   for (ShardID shard : all_shards_) {
-    Configuration::Node& node = nodes[shard.node()];
-    node.address = Sockaddr("::1", folly::to<std::string>(4440 + shard.node()));
-    node.generation = 1;
-    node.addSequencerRole();
-    node.addStorageRole();
-
+    std::string loc;
     auto it = node_locations_.find(shard.node());
     if (it != node_locations_.end()) {
-      NodeLocation loc;
-      int rv = loc.fromDomainString(it->second);
-      ASSERT_EQ(0, rv);
-      node.location = std::move(loc);
+      loc = it->second;
     }
-
+    nodes[shard.node()] = configuration::Node::withTestDefaults(shard.node())
+                              .setLocation(loc)
+                              .setIsMetadataNode(true);
     node_state_map_[shard] = ClusterStateNodeState::FULLY_STARTED;
   }
+  auto nodes_configuration = NodesConfigurationTestUtil::provisionNodes(
+      std::move(nodes), ReplicationProperty{{NodeLocationScope::NODE, 3}});
 
   // we won't use these
   auto log_attrs = logsconfig::LogAttributes().with_replicationFactor(2);
-  Configuration::NodesConfig nodes_config(std::move(nodes));
   auto logs_config = std::make_shared<configuration::LocalLogsConfig>();
   logs_config->insert(boost::icl::right_open_interval<logid_t::raw_type>(
                           LOG_ID.val_, LOG_ID.val_ + 1),
                       "log",
                       log_attrs);
 
-  // metadata stored on all nodes with max replication factor 3
-  Configuration::MetaDataLogsConfig meta_config =
-      createMetaDataLogsConfig(nodes_config, nodes_config.getNodes().size(), 3);
-
   updateable_config_->updateableServerConfig()->update(
-      ServerConfig::fromDataTest(__FILE__, nodes_config, meta_config));
+      ServerConfig::fromDataTest(__FILE__));
   updateable_config_->updateableNodesConfiguration()->update(
-      updateable_config_->getNodesConfigurationFromServerConfigSource());
+      std::move(nodes_configuration));
   updateable_config_->updateableLogsConfig()->update(std::move(logs_config));
 }
 
@@ -340,12 +322,13 @@ void EpochRecoveryTest::setUp() {
 
   const EpochMetaData metadata(storage_set_, rep_);
   auto deps = std::make_unique<MockEpochRecoveryDependencies>(this);
-  erm_ = std::make_unique<EpochRecovery>(LOG_ID,
-                                         epoch_,
-                                         metadata,
-                                         getNodesConfiguration(),
-                                         std::move(deps),
-                                         tail_optimized_);
+  erm_ = std::make_unique<EpochRecovery>(
+      LOG_ID,
+      epoch_,
+      metadata,
+      updateable_config_->updateableNodesConfiguration(),
+      std::move(deps),
+      tail_optimized_);
 }
 
 void EpochRecoveryTest::checkRecoveryState(ERMState expected_state) {
@@ -373,11 +356,13 @@ void EpochRecoveryTest::checkRecoveryState(ERMState expected_state) {
       ASSERT_EQ(
           erm_->mutationSetSize(), rs.countShardsInState(NState::MUTATABLE));
       {
-        // mutation set should not intersect w/ shards in draining
+        // mutation set should not intersect w/ non writable shards
+        auto storage_mem =
+            updateable_config_->getNodesConfiguration()->getStorageMembership();
         auto mutation_set = rs.getNodesInState(NState::MUTATABLE);
         bool intersect = std::any_of(
-            draining_shards_.begin(), draining_shards_.end(), [&](ShardID s) {
-              return mutation_set.count(s) > 0;
+            mutation_set.begin(), mutation_set.end(), [&](ShardID s) {
+              return !storage_mem->canWriteToShard(s);
             });
         ASSERT_FALSE(intersect);
       }
@@ -406,11 +391,10 @@ void EpochRecoveryTest::checkRecoveryState(ERMState expected_state) {
     ASSERT_EQ(set, std::set<ShardID>({__VA_ARGS__}));           \
   } while (0)
 
-std::unique_ptr<DataRecordOwnsPayload>
-mockRecord(lsn_t lsn,
-           uint64_t ts,
-           size_t payload_size = 128,
-           OffsetMap offsets = OffsetMap()) {
+std::unique_ptr<RawDataRecord> mockRecord(lsn_t lsn,
+                                          uint64_t ts,
+                                          size_t payload_size = 128,
+                                          OffsetMap offsets = OffsetMap()) {
   return create_record(EpochRecoveryTest::LOG_ID,
                        lsn,
                        RecordType::NORMAL,
@@ -420,7 +404,7 @@ mockRecord(lsn_t lsn,
                        std::move(offsets));
 }
 
-std::unique_ptr<DataRecordOwnsPayload>
+std::unique_ptr<RawDataRecord>
 mockWriteStreamRecord(lsn_t lsn,
                       uint64_t ts,
                       size_t payload_size = 128,
@@ -434,10 +418,10 @@ mockWriteStreamRecord(lsn_t lsn,
                        std::move(offsets));
 }
 
-std::unique_ptr<DataRecordOwnsPayload> mockRecord(lsn_t lsn,
-                                                  RecordType type,
-                                                  uint32_t wave_or_seal_epoch,
-                                                  uint64_t ts = 1) {
+std::unique_ptr<RawDataRecord> mockRecord(lsn_t lsn,
+                                          RecordType type,
+                                          uint32_t wave_or_seal_epoch,
+                                          uint64_t ts = 1) {
   return create_record(EpochRecoveryTest::LOG_ID,
                        lsn,
                        type,
@@ -1006,13 +990,21 @@ TEST_F(EpochRecoveryTest, UnexpectedHolePlugBelowLNG) {
 }
 
 TEST_F(EpochRecoveryTest, MutationSetShouldNotContainDrainingNodes) {
-  // N2 is draining and cannot store copies, but is able to participate
+  // N2 is READ_ONLY and cannot store copies, but is able to participate
   // in digest
   storage_set_ = {N1, N2, N3};
   rep_.assign({{NodeLocationScope::NODE, 2}});
-  draining_shards_ = {N2};
 
   setUp();
+
+  {
+    auto nc = updateable_config_->getNodesConfiguration();
+    nc = nc->applyUpdate(NodesConfigurationTestUtil::setStorageMembershipUpdate(
+        *nc, {N2}, membership::StorageState::READ_ONLY, folly::none));
+    ld_check(nc);
+    updateable_config_->updateableNodesConfiguration()->update(std::move(nc));
+  }
+
   OffsetMap om;
   om.setCounter(BYTE_OFFSET, 19);
   // N3 will be absent in the beginning, causing recovery to get stuck

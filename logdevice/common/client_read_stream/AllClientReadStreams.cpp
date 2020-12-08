@@ -10,7 +10,7 @@
 #include <folly/small_vector.h>
 
 #include "logdevice/common/AdminCommandTable.h"
-#include "logdevice/common/DataRecordOwnsPayload.h"
+#include "logdevice/common/RawDataRecord.h"
 #include "logdevice/common/Sender.h"
 #include "logdevice/common/Worker.h"
 #include "logdevice/common/protocol/STOP_Message.h"
@@ -26,23 +26,25 @@ void AllClientReadStreams::insertAndStart(
   ld_check(insert_result.second); // new read streams should have unique IDs
   // Starting stream after insert, as start() might need to look up the calling
   // instance.
+  subscriber_.onStreamAdd(*insert_result.first->second);
   insert_result.first->second->start();
 }
 
 bool AllClientReadStreams::erase(read_stream_id_t id) {
-  auto it = streams_.find(id);
-  if (it != streams_.end()) {
-    streams_.erase(it);
-    return true;
-  }
-  return false;
+  auto eraseReadStream = [this](read_stream_id_t&&,
+                                std::unique_ptr<ClientReadStream>&& stream) {
+    if (stream) {
+      subscriber_.onStreamRemoved(*stream);
+    }
+  };
+  return streams_.eraseInto(id, std::move(eraseReadStream)) == 1;
 }
 
 void AllClientReadStreams::onDataRecord(
     ShardID shard,
     logid_t log_id,
     read_stream_id_t read_stream_id,
-    std::unique_ptr<DataRecordOwnsPayload>&& record) {
+    std::unique_ptr<RawDataRecord>&& record) {
   auto it = streams_.find(read_stream_id);
   if (it == streams_.end()) {
     // If the stream no longer exists on the client, tell the server to stop
@@ -149,15 +151,6 @@ void AllClientReadStreams::getReadStreamsDebugInfo(
   }
 }
 
-void AllClientReadStreams::sampleAllReadStreamsDebugInfo() const {
-  for (const auto& stream : streams_) {
-    if (stream.second) {
-      stream.second->sampleDebugInfo(
-          stream.second->getClientReadStreamDebugInfo());
-    }
-  }
-}
-
 std::string
 AllClientReadStreams::getAllReadStreamsDebugInfo(bool pretty,
                                                  bool json,
@@ -185,7 +178,8 @@ AllClientReadStreams::getAllReadStreamsDebugInfo(bool pretty,
                                    "Last Time Stuck",
                                    "Last Reported State",
                                    "Last Tail Info",
-                                   "Time Lag Record");
+                                   "Time Lag Record",
+                                   "Reader Name");
 
   auto tables = run_on_all_workers(&processor, [&]() {
     InfoClientReadStreamsTable t(table);

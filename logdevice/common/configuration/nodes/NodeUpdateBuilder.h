@@ -30,11 +30,13 @@ class NodeUpdateBuilder {
 
   NodeUpdateBuilder& setNodeIndex(node_index_t);
   NodeUpdateBuilder& setVersion(uint64_t);
-  NodeUpdateBuilder& setDataAddress(Sockaddr);
+  NodeUpdateBuilder& setDefaultDataAddress(Sockaddr);
   NodeUpdateBuilder& setGossipAddress(Sockaddr);
   NodeUpdateBuilder& setSSLAddress(Sockaddr);
   NodeUpdateBuilder& setAdminAddress(Sockaddr);
   NodeUpdateBuilder& setServerToServerAddress(Sockaddr);
+  NodeUpdateBuilder& setServerThriftApiAddress(Sockaddr);
+  NodeUpdateBuilder& setClientThriftApiAddress(Sockaddr);
   NodeUpdateBuilder& setLocation(NodeLocation);
   NodeUpdateBuilder& setName(std::string);
   NodeUpdateBuilder& isSequencerNode();
@@ -42,6 +44,10 @@ class NodeUpdateBuilder {
   NodeUpdateBuilder& setNumShards(shard_size_t);
   NodeUpdateBuilder& setStorageCapacity(double);
   NodeUpdateBuilder& setSequencerWeight(double);
+  NodeUpdateBuilder&
+      setAddressForNetworkPriority(NodeServiceDiscovery::ClientNetworkPriority,
+                                   Sockaddr);
+  NodeUpdateBuilder& setTag(std::string key, std::string value);
 
   /**
    * Validates the correctness of the update by checking:
@@ -77,14 +83,18 @@ class NodeUpdateBuilder {
   // Service Discovery
   folly::Optional<node_index_t> node_index_;
   folly::Optional<uint64_t> version_;
-  folly::Optional<Sockaddr> data_address_;
+  folly::Optional<Sockaddr> default_data_address_;
   folly::Optional<Sockaddr> gossip_address_;
   folly::Optional<Sockaddr> ssl_address_;
   folly::Optional<Sockaddr> admin_address_;
   folly::Optional<Sockaddr> server_to_server_address_;
+  folly::Optional<Sockaddr> server_thrift_api_address_;
+  folly::Optional<Sockaddr> client_thrift_api_address_;
   folly::Optional<NodeLocation> location_;
   configuration::nodes::RoleSet roles_;
   folly::Optional<std::string> name_;
+  folly::F14FastMap<NodeServiceDiscovery::ClientNetworkPriority, Sockaddr>
+      addresses_per_priority_;
 
   // Storage Attributes
   folly::Optional<shard_size_t> num_shards_;
@@ -92,6 +102,9 @@ class NodeUpdateBuilder {
 
   // Sequencer Attributes
   folly::Optional<double> sequencer_weight_;
+
+  // Custom tags. Opaque to LogDevice servers. Useful for companion services.
+  std::unordered_map<std::string, std::string> tags_;
 };
 
 }}}} // namespace facebook::logdevice::configuration::nodes

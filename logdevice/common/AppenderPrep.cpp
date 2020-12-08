@@ -142,6 +142,16 @@ void AppenderPrep::execute(std::unique_ptr<Appender> appender) {
     return;
   }
 
+  if (!isClientConnected()) {
+    RATELIMIT_INFO(std::chrono::seconds(1),
+                   10,
+                   "APPEND Request for log %lu failed because "
+                   "connection creating this append is no longer there",
+                   header_.logid.val_);
+    // Intentionally not sending a reply here since connection is lost
+    return;
+  }
+
   const PrincipalIdentity* principal = getPrincipal();
   if (principal == nullptr) {
     ld_critical("APPEND Request from %s for log %lu failed because "
@@ -393,11 +403,13 @@ std::unique_ptr<Appender> AppenderPrep::constructAppender() {
           APPEND_Header::CHECKSUM_64BIT == STORE_Header::CHECKSUM_64BIT &&
           APPEND_Header::CHECKSUM_PARITY == STORE_Header::CHECKSUM_PARITY &&
           APPEND_Header::BUFFERED_WRITER_BLOB ==
-              STORE_Header::BUFFERED_WRITER_BLOB,
+              STORE_Header::BUFFERED_WRITER_BLOB &&
+          APPEND_Header::PAYLOAD_GROUP == STORE_Header::PAYLOAD_GROUP,
       "");
   STORE_flags_t passthru_flags = header_.flags &
       (APPEND_Header::CHECKSUM | APPEND_Header::CHECKSUM_64BIT |
-       APPEND_Header::CHECKSUM_PARITY | APPEND_Header::BUFFERED_WRITER_BLOB);
+       APPEND_Header::CHECKSUM_PARITY | APPEND_Header::BUFFERED_WRITER_BLOB |
+       APPEND_Header::PAYLOAD_GROUP);
 
   // TODO: This does not account for Appender's PayloadHolder's shared segment.
   //       There is no longer a reason to calculate this externally and pass
@@ -1007,6 +1019,10 @@ const Settings& AppenderPrep::getSettings() const {
 
 const PrincipalIdentity* AppenderPrep::getPrincipal() {
   return Worker::onThisThread()->sender().getPrincipal(Address(from_));
+}
+
+bool AppenderPrep::isClientConnected() const {
+  return !Worker::onThisThread()->sender().isClosed(Address(from_));
 }
 
 void AppenderPrep::isAllowed(

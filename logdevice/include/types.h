@@ -13,8 +13,10 @@
 #include <functional>
 #include <limits>
 #include <string>
+#include <unordered_map>
 #include <utility>
 
+#include <folly/Optional.h>
 #include <folly/Range.h>
 #include <folly/io/IOBuf.h>
 
@@ -27,16 +29,6 @@ LOGDEVICE_STRONG_TYPEDEF(uint64_t, logid_t);
 
 // Used by VersionedConfigStore
 LOGDEVICE_STRONG_TYPEDEF(uint64_t, vcs_config_version_t);
-
-// Used by Stats and client APIs
-enum class MonitoringTier : uint8_t {
-  HIGH_PRI = 0,
-  MEDIUM_PRI = 1,
-  LOW_PRI = 2,
-  MAX = 3
-};
-
-std::string toString(MonitoringTier);
 
 constexpr logid_t LOGID_INVALID(0);
 constexpr logid_t LOGID_INVALID2(~0);
@@ -78,6 +70,18 @@ typedef uint8_t counter_type_t;
 // counter type used in OffsetMap. It refers to amount of data in bytes of
 // compressed data written to the log after sequencer batching logic
 const counter_type_t BYTE_OFFSET = 246;
+
+enum class Compression { NONE = 0x00, ZSTD = 0x01, LZ4 = 0x04, LZ4_HC = 0x05 };
+
+/**
+ * Returns "none", "zstd", "lz4" or "lz4_hc".
+ */
+std::string compressionToString(Compression c);
+
+/*
+ * Returns 0 on success, -1 on error.
+ */
+int parseCompression(const char* str, Compression* out_c);
 
 /**
  * This const struct represents an opaque payload that a client may wish to
@@ -167,6 +171,69 @@ struct Payload {
   size_t size_;
 };
 
+// Key used to uniquely identify payload in PayloadGroup.
+typedef int32_t PayloadKey;
+
+/**
+ * An group of payloads that can be stored in a record and read from LogDevice.
+ * Each payload in a group is uniquely identified by a key.
+ * When using buffered writes payloads with same key from multiple records are
+ * compressed together.
+ * Users must not modify IOBufs once group is submitted for any operations.
+ */
+typedef std::unordered_map<PayloadKey, folly::IOBuf> PayloadGroup;
+
+/**
+ * Describes single payload in CompressedPayloads.
+ */
+struct PayloadDescriptor {
+  /** Size of original (uncompressed) payload in bytes. */
+  size_t uncompressed_size;
+};
+
+/**
+ * Represents compressed payloads of a single key of a collection of
+ * PayloadGroups. See CompressedPayloadGroups for details.
+ */
+struct CompressedPayloads {
+  /** Compression algorithm, used to compress payloads. */
+  Compression compression;
+
+  /**
+   * Descriptors of payloads. Descriptor only present if i-th PayloadGroup
+   * contains the key.
+   */
+  std::vector<folly::Optional<PayloadDescriptor>> descriptors;
+
+  /**
+   * Concatenation of all payloads of one key, compressed using the algorithm
+   * specified in compression: compress(payload1 + payload2 + ...).
+   * To extract individual payloads, it must be uncompressed first, and then
+   * split into chunks as specified in uncompressed_size of the descriptor.
+   */
+  folly::IOBuf payload;
+};
+
+/**
+ * Represents restructured compressed collection of PayloadGroups.
+ * Suppose the following collection of payload groups:
+ * index   group ({key: payload})
+ *   1     {k1: p11}, {k2: p12}
+ *   2     {k1: p21}
+ *   3     {k1: p31}, {k2: p32}
+ *
+ * It's restructured in the following way:
+ * key   payload                    descriptors (uncompressed_size)
+ *  k1   compress(p11 + p21 + p31)  {p11.size(), p21.size(), p31.size()}
+ *  k2   compress(p12 + p32)        {p12.size(), none, p32.size()}
+ *
+ * Note that compression method can be different for different keys.
+ * For example, if compressing the payload for k1 does not result in reduced
+ * size campared to non-compressed payload, then Compression::NONE is used.
+ */
+using CompressedPayloadGroups =
+    std::unordered_map<PayloadKey, CompressedPayloads>;
+
 /**
  * Convert lsn into a string in the format e<epoch>n<esn>.
  */
@@ -182,18 +249,6 @@ enum class Severity : unsigned {
 };
 
 std::string toString(const Severity&);
-
-enum class Compression { NONE = 0x00, ZSTD = 0x01, LZ4 = 0x04, LZ4_HC = 0x05 };
-
-/**
- * Returns "none", "zstd", "lz4" or "lz4_hc".
- */
-std::string compressionToString(Compression c);
-
-/*
- * Returns 0 on success, -1 on error.
- */
-int parseCompression(const char* str, Compression* out_c);
 
 }} // namespace facebook::logdevice
 

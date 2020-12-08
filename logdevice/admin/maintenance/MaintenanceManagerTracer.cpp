@@ -8,19 +8,42 @@
 
 #include "logdevice/admin/maintenance/MaintenanceManagerTracer.h"
 
+#include "logdevice/common/MetaDataTracer.h"
+
+using namespace facebook::logdevice::configuration::nodes;
+
 namespace facebook { namespace logdevice { namespace maintenance {
 
 namespace {
-using namespace logdevice::configuration::nodes;
 
 constexpr auto kMaintenanceManagerSampleSource = "maintenance_manager";
 constexpr auto kMaintenanceAPISampleSource = "maintenance_api";
+constexpr auto kRebuildingCoordinatorSampleSource = "rebuilding_coordinator";
 
 std::string getNodeNameByIdx(const ServiceDiscoveryConfig& svd,
                              node_index_t idx) {
   auto node_svd = svd.getNodeAttributesPtr(idx);
   return node_svd != nullptr ? node_svd->name
                              : folly::sformat("UNKNOWN({})", idx);
+}
+
+// Helper function to determine the log string for a maintenance operation
+std::string getPriorityStr(const MaintenanceDefinition& maintenance) {
+  if (maintenance.priority_ref().has_value()) {
+    auto priority = maintenance.priority_ref().value();
+    switch (priority) {
+      case MaintenancePriority::IMMINENT:
+        return "imminent";
+      case MaintenancePriority::HIGH:
+        return "high";
+      case MaintenancePriority::MEDIUM:
+        return "medium";
+      case MaintenancePriority::LOW:
+        return "low";
+    }
+  } else {
+    return {};
+  }
 }
 
 // A helper function to convert container of items that have a toString
@@ -41,8 +64,9 @@ void populateSampleFromMaintenances(
     TraceSample& sample,
     const std::vector<thrift::MaintenanceDefinition>& maintenances,
     const ServiceDiscoveryConfig& svd) {
-  std::set<std::string> maintenance_ids, users,
-      maintenances_skipping_safety_check;
+  std::set<std::string> maintenance_ids;
+  std::set<std::string> users;
+  std::set<std::string> maintenances_skipping_safety_check;
   std::set<ShardID> shards_affected;
   std::set<node_index_t> node_ids_affected;
   std::set<std::string> node_name_affected;
@@ -254,11 +278,13 @@ void MaintenanceManagerTracer::trace(ApplyMaintenanceAPISample sample) {
         *trace_sample, sample.added_maintenances, *sample.service_discovery);
 
     // Extra fields for this request
-    if (sample.added_maintenances.size() > 0) {
-      // Pick the TTL of any of them, they all originated from the same
+    if (!sample.added_maintenances.empty()) {
+      // Pick the TTL/priority of any of them, they all originated from the same
       // maintenance.
+      trace_sample->addNormalValue(
+          "priority", getPriorityStr(sample.added_maintenances.at(0)));
       trace_sample->addIntValue(
-          "ttl_seconds", sample.added_maintenances.at(0).ttl_seconds);
+          "ttl_seconds", *sample.added_maintenances.at(0).ttl_seconds_ref());
     }
 
     trace_sample->addIntValue("error", sample.error ? 1 : 0);
@@ -295,6 +321,88 @@ void MaintenanceManagerTracer::trace(RemoveMaintenanceAPISample sample) {
     // TODO: Add a separate field in the tracer for the actor of the remove.
     trace_sample->addNormalValue(
         "reason", folly::sformat("{}: {}", sample.user, sample.reason));
+
+    trace_sample->addIntValue("error", sample.error ? 1 : 0);
+    if (sample.error) {
+      trace_sample->addNormalValue("error_reason", sample.error_reason);
+    }
+    return trace_sample;
+  };
+
+  publish(kMaintenanceManagerTracer, std::move(sample_builder));
+}
+
+void MaintenanceManagerTracer::trace(ApplyMaintenanceInternalSample sample) {
+  auto sample_builder =
+      [sample = std::move(sample)]() mutable -> std::unique_ptr<TraceSample> {
+    auto trace_sample = std::make_unique<TraceSample>();
+
+    // Metadata
+    trace_sample->addNormalValue("event", "APPLY_MAINTENANCE_INTERNAL");
+    trace_sample->addIntValue("verbosity", static_cast<int>(Verbosity::EVENTS));
+    trace_sample->addNormalValue(
+        "sample_source", kRebuildingCoordinatorSampleSource);
+    trace_sample->addIntValue(
+        "maintenance_state_version", sample.maintenance_state_version);
+    trace_sample->addIntValue("ncm_nc_version", sample.ncm_version.val());
+    trace_sample->addIntValue(
+        "published_nc_ctime_ms",
+        sample.nc_published_time.toMilliseconds().count());
+
+    // Added maintenances
+    populateSampleFromMaintenances(
+        *trace_sample, {sample.added_maintenance}, *sample.service_discovery);
+
+    // Add priority
+    trace_sample->addNormalValue(
+        "priority", getPriorityStr(sample.added_maintenance));
+
+    // Add reason
+    trace_sample->addNormalValue(
+        "reason", folly::sformat("internal: {}", sample.reason));
+
+    trace_sample->addIntValue(
+        "ttl_seconds", *sample.added_maintenance.ttl_seconds_ref());
+
+    trace_sample->addIntValue("error", sample.error ? 1 : 0);
+    if (sample.error) {
+      trace_sample->addNormalValue("error_reason", sample.error_reason);
+    }
+    return trace_sample;
+  };
+
+  publish(kMaintenanceManagerTracer, std::move(sample_builder));
+}
+
+void MaintenanceManagerTracer::trace(RemoveMaintenanceInternalSample sample) {
+  auto sample_builder =
+      [sample = std::move(sample)]() mutable -> std::unique_ptr<TraceSample> {
+    auto trace_sample = std::make_unique<TraceSample>();
+
+    // Metadata
+    trace_sample->addNormalValue("event", "REMOVE_MAINTENANCE_INTERNAL");
+    trace_sample->addIntValue("verbosity", static_cast<int>(Verbosity::EVENTS));
+    trace_sample->addNormalValue(
+        "sample_source", kRebuildingCoordinatorSampleSource);
+    trace_sample->addIntValue(
+        "maintenance_state_version", sample.maintenance_state_version);
+    trace_sample->addIntValue("ncm_nc_version", sample.ncm_version.val());
+    trace_sample->addIntValue(
+        "published_nc_ctime_ms",
+        sample.nc_published_time.toMilliseconds().count());
+
+    // Removed maintenance
+    trace_sample->addSetValue("maintenance_ids", {sample.removed_maintenance});
+    trace_sample->addSetValue("shards_affected", {toString(sample.shard)});
+    const node_index_t& node = sample.shard.node();
+    trace_sample->addSetValue("node_ids_affected", {toString(node)});
+    trace_sample->addSetValue(
+        "node_names_affected",
+        {getNodeNameByIdx(*sample.service_discovery, node)});
+
+    // Remove reason
+    trace_sample->addNormalValue(
+        "reason", folly::sformat("internal: {}", sample.reason));
 
     trace_sample->addIntValue("error", sample.error ? 1 : 0);
     if (sample.error) {

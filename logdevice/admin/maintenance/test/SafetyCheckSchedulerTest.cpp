@@ -103,7 +103,8 @@ SafetyCheckSchedulerMock::buildExecutionPlan(
 TEST(SafetyCheckerSchedulerTest, TestMock) {
   SafetyCheckSchedulerMock mock;
   Impact impact;
-  impact.result |= Impact::ImpactResult::READ_AVAILABILITY_LOSS;
+  impact.impact_ref()->push_back(
+      thrift::OperationImpact::READ_AVAILABILITY_LOSS);
 
   SafetyCheckSchedulerMock::CannedCheckImpact canned = {
       .disabled_shards = {{ShardID(2, 0)}},
@@ -126,7 +127,7 @@ TEST(SafetyCheckerSchedulerTest, TestMock) {
                                    false);
   folly::Expected<Impact, Status> result = std::move(f).get();
   ASSERT_TRUE(result.hasValue());
-  ASSERT_EQ(impact.result, result->result);
+  ASSERT_EQ(*impact.impact_ref(), *result->impact_ref());
 
   Impact impact2;
   canned.impact = impact2;
@@ -266,25 +267,30 @@ TEST(SafetyCheckerSchedulerTest, ShardPlanning2) {
 }
 
 TEST(SafetyCheckerSchedulerTest, ShardPlanningLocationAware) {
-  std::vector<NodeTemplate> node_templates;
-  // N0 in RK0
-  node_templates.push_back(
-      NodeTemplate{.id = 0, .location = "rg0.dc0.c10.ro0.rk0"});
-  // N1 in RK0
-  node_templates.push_back(
-      NodeTemplate{.id = 1, .location = "rg0.dc0.c10.ro0.rk0"});
-  // N2 in RK1
-  node_templates.push_back(
-      NodeTemplate{.id = 2, .location = "rg0.dc0.c10.ro0.rk1"});
-  // N3 in RK1
-  node_templates.push_back(
-      NodeTemplate{.id = 3, .location = "rg0.dc0.c10.ro0.rk1"});
-  // N4 in RK2
-  node_templates.push_back(
-      NodeTemplate{.id = 4, .location = "rg0.dc0.c10.ro0.rk2"});
-  auto nodes_config =
-      provisionNodes(std::move(node_templates),
-                     ReplicationProperty{{NodeLocationScope::RACK, 2}});
+  configuration::Nodes nodes{
+      // N0 in RK0
+      {0,
+       configuration::Node::withTestDefaults(0).setLocation(
+           "rg0.dc0.c10.ro0.rk0")},
+      // N1 in RK0
+      {1,
+       configuration::Node::withTestDefaults(1).setLocation(
+           "rg0.dc0.c10.ro0.rk0")},
+      // N2 in RK1
+      {2,
+       configuration::Node::withTestDefaults(2).setLocation(
+           "rg0.dc0.c10.ro0.rk1")},
+      // N3 in RK1
+      {3,
+       configuration::Node::withTestDefaults(3).setLocation(
+           "rg0.dc0.c10.ro0.rk1")},
+      // N4 in RK2
+      {4,
+       configuration::Node::withTestDefaults(4).setLocation(
+           "rg0.dc0.c10.ro0.rk2")},
+  };
+  auto nodes_config = provisionNodes(
+      std::move(nodes), ReplicationProperty{{NodeLocationScope::RACK, 2}});
   // Shard Workflows
   std::vector<ShardWorkflow> shard_wf_values;
   // N0S0
@@ -525,10 +531,10 @@ TEST(SafetyCheckerSchedulerTest, Scheduling) {
   SafetyCheckScheduler::NodeIndexSet safe_sequencers_to_disable;
 
   Impact bad_impact;
-  bad_impact.result |= Impact::ImpactResult::READ_AVAILABILITY_LOSS;
+  bad_impact.impact_ref()->push_back(
+      thrift::OperationImpact::READ_AVAILABILITY_LOSS);
 
   Impact safe_impact;
-  safe_impact.result = Impact::ImpactResult::NONE;
 
   // G3 test. => SAFE
   mock.shard_impacts.push_back(SafetyCheckSchedulerMock::CannedCheckImpact{

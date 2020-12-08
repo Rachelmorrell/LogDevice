@@ -48,7 +48,7 @@ class AsyncCheckpointedReaderImpl : public AsyncCheckpointedReader {
 
   int resumeReading(logid_t log_id) override;
 
-  void setMonitoringTier(MonitoringTier tier) override;
+  void addMonitoringTag(std::string) override;
 
   void withoutPayload() override;
 
@@ -63,6 +63,8 @@ class AsyncCheckpointedReaderImpl : public AsyncCheckpointedReader {
   void doNotDecodeBufferedWrites() override;
 
   void getBytesBuffered(std::function<void(size_t)> callback) override;
+
+  void setReaderName(const std::string& reader_name) override;
 
  private:
   std::unique_ptr<AsyncReader> reader_;

@@ -10,12 +10,14 @@
 #include <folly/io/async/AsyncSocket.h>
 #include <gtest/gtest.h>
 
+#include "logdevice/common/ConnectionKind.h"
 #include "logdevice/common/ProtocolHandler.h"
 #include "logdevice/common/libevent/test/EvBaseMock.h"
 #include "logdevice/common/network/MessageReader.h"
 #include "logdevice/common/protocol/CHECK_NODE_HEALTH_Message.h"
 #include "logdevice/common/protocol/GET_SEQ_STATE_Message.h"
 #include "logdevice/common/test/ConnectionTest_fixtures.h"
+#include "logdevice/common/test/NodesConfigurationTestUtil.h"
 
 using ::testing::_;
 using ::testing::Args;
@@ -34,7 +36,7 @@ class ServerConnectionTest : public ConnectionTest {
     settings_.server = true;
     source_node_id_ = server_name_;
     ev_base_folly_.selectEvBase(EvBase::FOLLY_EVENTBASE);
-    deps_ = new TestSocketDependencies(this);
+    deps_ = new TestNetworkDependencies(this);
   }
 
   void SetUp() override {
@@ -50,8 +52,9 @@ class ServerConnectionTest : public ConnectionTest {
         SocketType::DATA /* socket type */,
         ConnectionType::PLAIN,
         flow_group_,
-        std::unique_ptr<SocketDependencies>(deps_),
-        std::move(sock));
+        std::unique_ptr<SocketNetworkDependencies>(deps_),
+        std::move(sock),
+        ConnectionKind::DATA);
     // A server socket is connected from the beginning.
     EXPECT_TRUE(connected());
     EXPECT_FALSE(handshaken());
@@ -272,6 +275,65 @@ TEST_F(ServerConnectionTest, Handshake) {
   conn_->releaseMessage(*envelope);
   // We should be handshaken now.
   EXPECT_TRUE(handshaken());
+}
+
+// Check that last used time gets updated on key events
+TEST_F(ClientConnectionTest, LastUsedUpdatedOnMessages) {
+  std::unique_ptr<folly::IOBuf> hello_buf;
+  ON_CALL(*sock_, connect_(_, _, _, _, _))
+      .WillByDefault(SaveArg<0>(&conn_callback_));
+  ON_CALL(*sock_, good()).WillByDefault(Return(true));
+  EXPECT_CALL(*sock_, writeChain_(_, _, _))
+      .WillOnce(Invoke([this, &hello_buf](folly::AsyncSocket::WriteCallback* cb,
+                                          folly::IOBuf* buf,
+                                          folly::WriteFlags) {
+        wr_callback_ = cb;
+        hello_buf.reset(buf);
+      }));
+  ON_CALL(*sock_, setReadCB(_)).WillByDefault(SaveArg<0>(&rd_callback_));
+  EXPECT_EQ(conn_->connect(), 0);
+  conn_callback_->connectSuccess();
+  EXPECT_TRUE(usedSinceLastCheck());
+  ev_base_folly_.loopOnce();
+  writeSuccess();
+  receiveAckMessage();
+  EXPECT_TRUE(usedSinceLastCheck());
+  // Send a message.
+  Envelope* envelope = create_message(*conn_);
+  ASSERT_NE(envelope, nullptr);
+  conn_->releaseMessage(*envelope);
+  EXPECT_TRUE(usedSinceLastCheck());
+  // No activity on connection since last check
+  EXPECT_FALSE(usedSinceLastCheck());
+}
+
+// Check that last used time gets updated on key events
+TEST_F(ClientConnectionTest, ListenerKeepConnectionActive) {
+  std::unique_ptr<folly::IOBuf> hello_buf;
+  ON_CALL(*sock_, connect_(_, _, _, _, _))
+      .WillByDefault(SaveArg<0>(&conn_callback_));
+  ON_CALL(*sock_, good()).WillByDefault(Return(true));
+  EXPECT_CALL(*sock_, writeChain_(_, _, _))
+      .WillOnce(Invoke([this, &hello_buf](folly::AsyncSocket::WriteCallback* cb,
+                                          folly::IOBuf* buf,
+                                          folly::WriteFlags) {
+        wr_callback_ = cb;
+        hello_buf.reset(buf);
+      }));
+  ON_CALL(*sock_, setReadCB(_)).WillByDefault(SaveArg<0>(&rd_callback_));
+  EXPECT_EQ(conn_->connect(), 0);
+  conn_callback_->connectSuccess();
+  EXPECT_TRUE(usedSinceLastCheck());
+  ev_base_folly_.loopOnce();
+  writeSuccess();
+  receiveAckMessage();
+  EXPECT_TRUE(usedSinceLastCheck());
+  {
+    EmptySocketCallback cb;
+    conn_->pushOnCloseCallback(cb);
+    EXPECT_TRUE(usedSinceLastCheck());
+  }
+  EXPECT_FALSE(usedSinceLastCheck());
 }
 
 TEST_F(ServerConnectionTest, IncomingMessageBytesLimitHandshake) {
@@ -1166,7 +1228,7 @@ TEST_F(ClientConnectionTest, SenderBytesPendingTest) {
   auto raw_msg = new VarLengthTestMessage(3 /* min_proto */, 42 /* size */);
   std::unique_ptr<facebook::logdevice::Message> msg(raw_msg);
   auto msg_size_max_proto = msg->size();
-  auto msg_size_at_proto = msg->size(conn_->getProto());
+  auto msg_size_at_proto = msg->size(conn_->getInfo().protocol.value());
   auto envelope = conn_->registerMessage(std::move(msg));
   // Message cost at max compatibility is added at registerMessage.
   EXPECT_EQ(bytes_pending_, msg_size_max_proto);
@@ -1180,4 +1242,57 @@ TEST_F(ClientConnectionTest, SenderBytesPendingTest) {
   writeSuccess();
   // Message written into tcp socket.
   EXPECT_EQ(bytes_pending_, 0);
+}
+
+TEST_F(ClientConnectionTest, ShouldDetectChangesInAddressForConnection) {
+  using namespace configuration::nodes;
+
+  const Sockaddr kTestAddress1 = conn_->getInfo().peer_address;
+  const Sockaddr kTestAddress2 = Sockaddr{get_localhost_address_str(), 4441};
+  const int server_nidx = server_name_.index();
+  const int other_server_nidx = server_nidx + 1;
+  const auto generation = server_name_.generation();
+  const auto metadata_replication_property =
+      ReplicationProperty{{NodeLocationScope::NODE, 1}};
+
+  // setup nodes configuration to contain server_name_
+  Configuration::Nodes nodes;
+  for (auto nidx : {server_nidx, other_server_nidx}) {
+    nodes[nidx].generation = generation;
+    nodes[nidx].addSequencerRole();
+    nodes[nidx].addStorageRole(2);
+  }
+  nodes_configuration_ = NodesConfigurationTestUtil::provisionNodes(
+      nodes, metadata_replication_property);
+
+  EXPECT_CALL(*deps_, getNodeSockaddr(_, _, _))
+      .WillRepeatedly(testing::ReturnRef(kTestAddress1));
+
+  EXPECT_FALSE(conn_->isNodeConnectionAddressOrGenerationOutdated())
+      << "Initial config should have correct address";
+
+  EXPECT_CALL(*deps_, getNodeSockaddr(_, _, _))
+      .WillRepeatedly(testing::ReturnRef(kTestAddress2));
+  EXPECT_TRUE(conn_->isNodeConnectionAddressOrGenerationOutdated())
+      << "Changing node address in config should result in outdated address";
+
+  EXPECT_CALL(*deps_, getNodeSockaddr(_, _, _))
+      .WillRepeatedly(testing::ReturnRef(kTestAddress1));
+  EXPECT_FALSE(conn_->isNodeConnectionAddressOrGenerationOutdated())
+      << "Initial config should have correct address";
+
+  nodes[server_nidx].generation = generation + 1;
+  nodes_configuration_ = NodesConfigurationTestUtil::provisionNodes(
+      nodes, metadata_replication_property);
+  EXPECT_TRUE(conn_->isNodeConnectionAddressOrGenerationOutdated())
+      << "Change in generation should be detected";
+
+  // replace config by one without server
+  nodes.erase(server_nidx);
+  nodes_configuration_ = NodesConfigurationTestUtil::provisionNodes(
+      nodes, metadata_replication_property);
+
+  EXPECT_TRUE(conn_->isNodeConnectionAddressOrGenerationOutdated())
+      << "Removing node from config should make connection have outdated "
+         "address.";
 }

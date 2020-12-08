@@ -5,7 +5,7 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
-#include "logdevice/server/RecordRebuildingAmend.h"
+#include "logdevice/server/rebuilding/RecordRebuildingAmend.h"
 
 #include <folly/Random.h>
 #include <gtest/gtest.h>
@@ -13,6 +13,7 @@
 #include "logdevice/common/FlowGroup.h"
 #include "logdevice/common/LocalLogStoreRecordFormat.h"
 #include "logdevice/common/protocol/STORE_Message.h"
+#include "logdevice/common/test/SenderTestProxy.h"
 #include "logdevice/common/test/TestUtil.h"
 
 // Shortcuts for writing ShardIDs

@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <limits>
+#include <memory>
 
 #include <folly/Executor.h>
 #include <folly/dynamic.h>
@@ -22,6 +23,7 @@
 #include "logdevice/common/protocol/ProtocolWriter.h"
 #include "logdevice/common/types_internal.h"
 #include "logdevice/include/Err.h"
+#include "logdevice/include/PermissionActions.h"
 
 namespace facebook { namespace logdevice {
 
@@ -29,6 +31,16 @@ class ProtocolReader;
 class ProtocolWriter;
 struct Address;
 struct MessageReadResult;
+
+/**
+ * Stores security specific permission requirements
+ * of a message, based on the message type.
+ */
+struct PermissionParams {
+  bool requiresPermission{false};
+  ACTION action{ACTION::MAX};
+  logid_t log_id{LOGID_INVALID};
+};
 
 /**
  * @file  an object of class Message represents a message that was received
@@ -53,6 +65,21 @@ struct Message {
    * deserialize() will read.
    */
   virtual void serialize(ProtocolWriter&) const = 0;
+  /**
+   * Serializes message to IOBuf with respect to given protocol version.
+   *
+   * @param protocol         Protocol version to comply
+   * @param checksum_enabled Whether checksum should be calculated and attached
+   *                         to message. Passing true does not guarantee
+   *                         checksum (it also depends on protocol version and
+   *                         message type) but passing false will prevent
+   *                         checksumming regaradless of other settings.
+   *
+   * @return pointer to IOBuf containing result or nullptr if serialization
+   *         failed. In case of failure caller should check global error code.
+   */
+  std::unique_ptr<folly::IOBuf> serialize(uint16_t protocol,
+                                          bool checksum_enabled) const;
 
   /**
    * The type of a static factory that constructs a Message from a
@@ -245,6 +272,15 @@ struct Message {
   virtual std::vector<std::pair<std::string, folly::dynamic>>
   getDebugInfo() const {
     return {};
+  }
+
+  /**
+   * Returns permission parameters for the particular type of message.
+   * This is used to determine security requirements of a message.
+   */
+  virtual PermissionParams getPermissionParams() const {
+    PermissionParams params;
+    return params;
   }
 
   Message& operator=(const Message&) = delete;

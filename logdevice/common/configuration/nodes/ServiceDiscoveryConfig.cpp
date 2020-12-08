@@ -14,8 +14,7 @@
 #include "logdevice/common/debug.h"
 #include "logdevice/common/types_internal.h"
 
-namespace facebook { namespace logdevice { namespace configuration {
-namespace nodes {
+namespace facebook::logdevice::configuration::nodes {
 
 namespace {
 template <typename F>
@@ -32,28 +31,55 @@ bool isFieldValid(const F& field, folly::StringPiece name) {
 }
 
 template <typename F>
+bool isMapFieldValid(const F& field, folly::StringPiece name) {
+  for (const auto& [k, v] : field) {
+    if (!isFieldValid(v, name)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+template <typename F>
 bool isOptionalFieldValid(const F& field, folly::StringPiece name) {
   return !field.hasValue() || isFieldValid(field.value(), name);
 }
 
 } // namespace
 
-const Sockaddr& NodeServiceDiscovery::getGossipAddress() const {
-  return gossip_address.has_value() ? gossip_address.value() : address;
+std::string NodeServiceDiscovery::networkPriorityToString(
+    const NodeServiceDiscovery::ClientNetworkPriority& priority) {
+  using ClientNetworkPriority = NodeServiceDiscovery::ClientNetworkPriority;
+  switch (priority) {
+    case ClientNetworkPriority::HIGH:
+      return "H";
+    case ClientNetworkPriority::MEDIUM:
+      return "M";
+    case ClientNetworkPriority::LOW:
+      return "L";
+  }
+  ld_check(false);
+  folly::assume_unreachable();
 }
 
-const Sockaddr& NodeServiceDiscovery::getServerToServerAddress() const {
-  return server_to_server_address.has_value() ? server_to_server_address.value()
-                                              : address;
+const Sockaddr& NodeServiceDiscovery::getGossipAddress() const {
+  return gossip_address.has_value() ? gossip_address.value()
+                                    : default_client_data_address;
 }
 
 bool NodeServiceDiscovery::isValid() const {
-  if (!isFieldValid(address, "address") ||
+  if (!isFieldValid(
+          default_client_data_address, "default_client_data_address") ||
       !isOptionalFieldValid(gossip_address, "gossip_address") ||
       !isOptionalFieldValid(ssl_address, "ssl_address") ||
       !isOptionalFieldValid(admin_address, "admin_address") ||
       !isOptionalFieldValid(
-          server_to_server_address, "server_to_server_address")) {
+          server_to_server_address, "server_to_server_address") ||
+      !isOptionalFieldValid(
+          server_thrift_api_address, "server_thrift_api_address") ||
+      !isOptionalFieldValid(
+          client_thrift_api_address, "client_thrift_api_address") ||
+      !isMapFieldValid(addresses_per_priority, "addresses_per_priority")) {
     return false;
   }
 
@@ -62,6 +88,16 @@ bool NodeServiceDiscovery::isValid() const {
                     5,
                     "no role is set. expect at least one role.");
     return false;
+  }
+
+  if (!addresses_per_priority.empty()) {
+    if (!addresses_per_priority.count(ClientNetworkPriority::MEDIUM)) {
+      RATELIMIT_ERROR(std::chrono::seconds(10),
+                      5,
+                      "If an address for any priority is defined, the config "
+                      "should also contain the MEDIUM priority address.");
+      return false;
+    }
   }
 
   std::string name_invalid_reason;
@@ -98,83 +134,67 @@ bool NodeServiceDiscovery::isValidForReset(
     return false;
   }
 
-  // The node can't change its location if it's a storage node AND its version
-  // remains the same.
-  // TODO(T57564225): Agree on location string update policy
-  if (current.version == version && current.location != location &&
-      hasRole(NodeRole::STORAGE)) {
-    ld_error(
-        "Storage nodes' location is assumed to be immutable to maintain the "
-        "correctness of the replication property of the historical nodesets. "
-        "Current value: '%s', requested update: '%s'",
-        current.location.has_value() ? current.location->toString().c_str()
-                                     : "",
-        location.has_value() ? location->toString().c_str() : "");
-    return false;
-  }
+  // TODO Uncomment this after the SFZ location string migration has completed
+  // fleetwide. This allows for a safe migration of the location string.
+  // The CWS migration script safely starts a maintenance, stops the nodes, and
+  // disables expands on a per scope basis. T76073606
+  // // The node can't change its location if it's a storage node AND its
+  // version
+  // // remains the same.
+  // // TODO(T57564225): Agree on location string update policy
+  // if (current.version == version && current.location != location &&
+  //     hasRole(NodeRole::STORAGE)) {
+  //   ld_error(
+  //       "Storage nodes' location is assumed to be immutable to maintain the "
+  //       "correctness of the replication property of the historical nodesets.
+  //       " "Current value: '%s', requested update: '%s'",
+  //       current.location.has_value() ? current.location->toString().c_str()
+  //                                    : "",
+  //       location.has_value() ? location->toString().c_str() : "");
+  //   return false;
+  // }
 
   // If we reached this point, all the eligible fields can be mutated freely.
   return true;
 }
 
 std::string NodeServiceDiscovery::toString() const {
+  std::vector<std::string> addresses_strs;
+  for (const auto& [priority, sock_addr] : addresses_per_priority) {
+    addresses_strs.push_back(folly::sformat(
+        "{}:{}", networkPriorityToString(priority), sock_addr.toString()));
+  }
+
   return folly::sformat(
-      "[{} => A:{},G:{},S:{},AA:{},S2SA:{},L:{},R:{},V:{}]",
+      "[{} => "
+      "A:{},G:{},S:{},AA:{},S2SA:{},STA:{},CTA:{},APNP:{{{}}},L:{},R:{},V:{},T:"
+      "{}]",
       name,
-      address.toString(),
+      default_client_data_address.toString(),
       gossip_address.has_value() ? gossip_address->toString() : "",
       ssl_address.has_value() ? ssl_address->toString() : "",
       admin_address.has_value() ? admin_address->toString() : "",
       server_to_server_address.has_value()
           ? server_to_server_address->toString()
           : "",
+      server_thrift_api_address.has_value()
+          ? server_thrift_api_address->toString()
+          : "",
+      client_thrift_api_address.has_value()
+          ? client_thrift_api_address->toString()
+          : "",
+      folly::join(",", addresses_strs),
       location.has_value() ? location->toString() : "",
       logdevice::toString(roles),
-      version);
-}
-
-const Sockaddr& NodeServiceDiscovery::getSockaddr(
-    SocketType socket_type,
-    ConnectionType connection_type,
-    PeerType peer_type,
-    bool use_dedicated_server_to_server_address) const {
-  switch (socket_type) {
-    case SocketType::GOSSIP:
-      return getGossipAddress();
-
-    case SocketType::DATA:
-      if (peer_type == PeerType::NODE &&
-          use_dedicated_server_to_server_address) {
-        if (!server_to_server_address.has_value()) {
-          return Sockaddr::INVALID;
-        }
-        return server_to_server_address.value();
-      }
-
-      if (connection_type == ConnectionType::SSL) {
-        if (!ssl_address.has_value()) {
-          return Sockaddr::INVALID;
-        }
-        return ssl_address.value();
-      }
-      return address;
-
-    default:
-      RATELIMIT_CRITICAL(std::chrono::seconds(1),
-                         2,
-                         "Unexpected Socket Type:%d!",
-                         (int)socket_type);
-      ld_check(false);
-  }
-
-  return Sockaddr::INVALID;
+      version,
+      logdevice::toString(tags));
 }
 
 namespace {
 bool validateAddressUniqueness(ServiceDiscoveryConfig::MapType node_states) {
   std::unordered_map<Sockaddr, node_index_t, Sockaddr::Hash> seen_addresses;
   for (const auto& kv : node_states) {
-    if (!kv.second.address.valid()) {
+    if (!kv.second.default_client_data_address.valid()) {
       // This should have been caught in a better check, but let's avoid
       // crashing in the following lines by returning false here.
       RATELIMIT_CRITICAL(
@@ -185,10 +205,11 @@ bool validateAddressUniqueness(ServiceDiscoveryConfig::MapType node_states) {
           "been caught in an earlier validation on the ServiceDiscoveryConfig "
           "struct.",
           kv.first);
-      ld_assert(kv.second.address.valid());
+      ld_assert(kv.second.default_client_data_address.valid());
       return false;
     }
-    auto res = seen_addresses.emplace(kv.second.address, kv.first);
+    auto res =
+        seen_addresses.emplace(kv.second.default_client_data_address, kv.first);
     if (!res.second) {
       RATELIMIT_ERROR(std::chrono::seconds(10),
                       5,
@@ -230,4 +251,4 @@ bool ServiceDiscoveryConfig::attributeSpecificValidate() const {
       validateNameUniqueness(node_states_);
 }
 
-}}}} // namespace facebook::logdevice::configuration::nodes
+} // namespace facebook::logdevice::configuration::nodes

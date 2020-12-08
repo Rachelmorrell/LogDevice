@@ -14,16 +14,18 @@
 
 #include <folly/IntrusiveList.h>
 #include <folly/Memory.h>
+#include <folly/Overload.h>
 #include <folly/Random.h>
 #include <folly/ScopeGuard.h>
 #include <folly/Varint.h>
 
 #include "logdevice/common/AppendRequest.h"
-#include "logdevice/common/Checksum.h"
+#include "logdevice/common/PayloadGroupCodec.h"
 #include "logdevice/common/Processor.h"
 #include "logdevice/common/SimpleEnumMap.h"
 #include "logdevice/common/Timer.h"
 #include "logdevice/common/Worker.h"
+#include "logdevice/common/buffered_writer/BufferedWriteCodec.h"
 #include "logdevice/common/buffered_writer/BufferedWriteDecoderImpl.h"
 #include "logdevice/common/buffered_writer/BufferedWriterImpl.h"
 #include "logdevice/common/buffered_writer/BufferedWriterShard.h"
@@ -85,28 +87,44 @@ void BufferedWriterSingleLog::append(AppendChunk chunk) {
 
 int BufferedWriterSingleLog::appendImpl(AppendChunk& chunk,
                                         bool defer_client_size_trigger) {
-  // Calculate how many bytes these records will take up in the blob
-  size_t payload_bytes_added = 0;
-  size_t blob_bytes_added = 0;
+  // Calculate how many bytes (approx.) these records will take up in the memory
+  size_t payload_memory_bytes_added = 0;
   for (const BufferedWriter::Append& append : chunk) {
-    const std::string& payload = append.payload;
-    uint8_t buf[folly::kMaxVarintLength64];
-    payload_bytes_added += payload.size();
-    blob_bytes_added +=
-        folly::encodeVarint(payload.size(), buf) + payload.size();
+    const auto& payload = append.payload;
+    payload_memory_bytes_added +=
+        BufferedWriterPayloadMeter::memorySize(payload);
   }
   const size_t max_payload_size = Worker::settings().max_payload_size;
 
-  if (haveBuildingBatch() &&
-      batches_->back()->blob_bytes_total + blob_bytes_added >
-          max_payload_size) {
-    // These records would take us over the payload size limit. Flush the
-    // already buffered records first, then we will create a new batch for
-    // these records.
-    StatsHolder* stats{parent_->parent_->processor()->stats_};
-    STAT_INCR(stats, buffered_writer_max_payload_flush);
-    flushBuildingBatch();
-    ld_check(!haveBuildingBatch());
+  if (haveBuildingBatch()) {
+    auto& batch = batches_->back();
+    // Calculate how many bytes these records will take up in the blob
+    for (const BufferedWriter::Append& append : chunk) {
+      std::visit(folly::overload(
+                     [&](const std::string& payload) {
+                       auto iobuf = folly::IOBuf::wrapBufferAsValue(
+                           payload.data(), payload.size());
+                       batch->blob_size_estimator.append(iobuf);
+                     },
+                     [&](const PayloadGroup& payload_group) {
+                       batch->blob_size_estimator.append(payload_group);
+                     }),
+                 append.payload);
+    }
+    const size_t new_blob_bytes_total =
+        batch->blob_size_estimator.calculateSize(checksumBits());
+    if (new_blob_bytes_total > max_payload_size) {
+      // These records would take us over the payload size limit. Flush the
+      // already buffered records first, then we will create a new batch for
+      // these records.
+      StatsHolder* stats{parent_->parent_->processor()->stats_};
+      STAT_INCR(stats, buffered_writer_max_payload_flush);
+      flushBuildingBatch();
+      ld_check(!haveBuildingBatch());
+    } else {
+      batch->blob_bytes_total = new_blob_bytes_total;
+      batch->blob_format = batch->blob_size_estimator.getFormat();
+    }
   }
 
   // If there is no batch in the BUILDING state, create one now.
@@ -122,15 +140,23 @@ int BufferedWriterSingleLog::appendImpl(AppendChunk& chunk,
     options_ = get_log_options_(log_id_);
 
     auto batch = std::make_unique<Batch>(next_batch_num_++);
+
+    // Calculate how many bytes these records will take up in the blob
+    for (const BufferedWriter::Append& append : chunk) {
+      std::visit(folly::overload(
+                     [&](const std::string& payload) {
+                       auto iobuf = folly::IOBuf::wrapBufferAsValue(
+                           payload.data(), payload.size());
+                       batch->blob_size_estimator.append(iobuf);
+                     },
+                     [&](const PayloadGroup& payload_group) {
+                       batch->blob_size_estimator.append(payload_group);
+                     }),
+                 append.payload);
+    }
     batch->blob_bytes_total =
-        // Any bytes for the checksum.  This goes first since it gets stripped
-        // first on the read path.
-        (checksumBits() / 8) +
-        // 2 bytes for header (magic marker and header)
-        2 +
-        // The batch size.  The number of bytes for this is an overestimate
-        // since the batch size is unknown until we flush the batch.
-        folly::kMaxVarintLength64;
+        batch->blob_size_estimator.calculateSize(checksumBits());
+    batch->blob_format = batch->blob_size_estimator.getFormat();
     batches_->push_back(std::move(batch));
     // Intentionally setting state after pushing to make sure is_flushable_
     // becomes true *during* the setBatchState() call
@@ -142,11 +168,10 @@ int BufferedWriterSingleLog::appendImpl(AppendChunk& chunk,
   }
   Batch& batch = *batches_->back();
   // Add these appends to the BUILDING batch
-  batch.payload_bytes_total += payload_bytes_added;
-  batch.blob_bytes_total += blob_bytes_added;
+  batch.payload_memory_bytes_total += payload_memory_bytes_added;
   ld_check(batch.blob_bytes_total <= MAX_PAYLOAD_SIZE_INTERNAL);
   for (auto& append : chunk) {
-    std::string& payload = append.payload;
+    auto& payload = append.payload;
     BufferedWriter::AppendCallback::Context& context = append.context;
     batch.appends.emplace_back(std::move(context), std::move(payload));
 
@@ -200,7 +225,7 @@ void BufferedWriterSingleLog::flushMeMaybe(bool defer_client_size_trigger) {
   // If client set `Options::size_trigger', check if the sum of payload bytes
   // buffered exceeds it
   if (!defer_client_size_trigger && options_.size_trigger >= 0 &&
-      batch.payload_bytes_total >= options_.size_trigger) {
+      batch.payload_memory_bytes_total >= options_.size_trigger) {
     STAT_INCR(w->getStats(), buffered_writer_size_trigger_flush);
     flushBuildingBatch();
     return;
@@ -279,11 +304,9 @@ void BufferedWriterSingleLog::sendBatch(Batch& batch) {
   if (batch.state == Batch::State::BUILDING) {
     ld_check_eq(batch.blob.length(), 0);
 
-    batch_flags_t flags = Flags::SIZE_INCLUDED |
-        (batch_flags_t(options_.compression) & Flags::COMPRESSION_MASK);
-
     setBatchState(batch, Batch::State::CONSTRUCTING_BLOB);
-    construct_blob(batch, flags, checksumBits(), options_.destroy_payloads);
+    construct_blob(
+        batch, checksumBits(), options_.compression, options_.destroy_payloads);
   } else {
     // This is a retry, so we must have already sent it, so we can skip the
     // purgatory of READY_TO_SEND.
@@ -299,7 +322,7 @@ void BufferedWriterSingleLog::readyToSend(Batch& batch) {
 
   // Collect before&after byte counters to give clients an
   // idea of the compression ratio
-  STAT_ADD(stats, buffered_writer_bytes_in, batch.payload_bytes_total);
+  STAT_ADD(stats, buffered_writer_bytes_in, batch.payload_memory_bytes_total);
   STAT_ADD(stats, buffered_writer_bytes_batched, batch.blob.length());
 
   setBatchState(batch, Batch::State::READY_TO_SEND);
@@ -466,13 +489,12 @@ void BufferedWriterSingleLog::dropBlockedAppends(Status status,
                                                  NodeID redirect) {
   BufferedWriterImpl::AppendCallbackInternal* cb =
       parent_->parent_->getCallback();
-  int64_t payload_bytes = 0;
+  int64_t payload_mem_bytes = 0;
   for (auto& chunk : *blocked_appends_) {
-    std::vector<std::pair<BufferedWriter::AppendCallback::Context, std::string>>
-        context_set;
+    BufferedWriter::AppendCallback::ContextSet context_set;
     for (auto& append : chunk) {
-      std::string& payload = append.payload;
-      payload_bytes += payload.size();
+      auto& payload = append.payload;
+      payload_mem_bytes += BufferedWriterPayloadMeter::memorySize(payload);
       BufferedWriter::AppendCallback::Context& context = append.context;
       context_set.emplace_back(std::move(context), std::move(payload));
     }
@@ -484,7 +506,7 @@ void BufferedWriterSingleLog::dropBlockedAppends(Status status,
   blocked_appends_.compact();
   blocked_appends_flush_deferred_count_ = 0;
   // Return the memory budget
-  parent_->parent_->releaseMemory(payload_bytes);
+  parent_->parent_->releaseMemory(payload_mem_bytes);
 
   flushableMayHaveChanged();
 }
@@ -584,7 +606,7 @@ void BufferedWriterSingleLog::finishBatch(Batch& batch) {
   // Free/unlink the buffer.
   batch.blob = folly::IOBuf();
   // Return the memory budget
-  parent_->parent_->releaseMemory(batch.payload_bytes_total);
+  parent_->parent_->releaseMemory(batch.payload_memory_bytes_total);
 }
 
 void BufferedWriterSingleLog::setBatchState(Batch& batch, Batch::State state) {
@@ -598,185 +620,105 @@ int BufferedWriterSingleLog::checksumBits() const {
       : 0;
 }
 
-void BufferedWriterSingleLog::Impl::construct_uncompressed_blob(
-    BufferedWriterSingleLog::Batch& batch,
-    batch_flags_t flags,
-    int checksum_bits,
-    bool destroy_payloads) {
+namespace {
+template <typename PayloadsEncoder>
+void encode_batch(BufferedWriterSingleLog::Batch& batch,
+                  int checksum_bits,
+                  Compression compression,
+                  int zstd_level,
+                  bool destroy_payloads) {
   ld_check(batch.total_size_freed == 0);
-  // Note that due to the variable-sized header, blob_bytes_total is usually
-  // slightly larger than the size of the constructed blob.
-  folly::IOBuf blob_buf(folly::IOBuf::CREATE, batch.blob_bytes_total);
-  uint8_t* out = blob_buf.writableTail();
-  uint8_t* const end = out + batch.blob_bytes_total;
-  ld_check(out < end);
-  // Format of the header:
-  // * 0-8 bytes reserved for checksum -- this is not really part of the
-  //   BufferedWriter format, see BufferedWriterImpl::prependChecksums()
-  // * 1 magic marker byte
-  // * 1 flags byte
-  // * 0-9 bytes varint batch size (optional, depending on flags)
-  batch.blob_header_size = 0;
 
-  if (checksum_bits > 0) {
-    // construct_blob() expects the checksum to go at the beginning
-    ld_check(out == blob_buf.data());
-    size_t nbytes = checksum_bits / 8;
-    ld_check(out + nbytes < end);
-    std::memset(out, 0, nbytes);
-    out += nbytes;
-    batch.blob_header_size += nbytes;
-  }
-
-  batch.blob_header_size += 2;
-  *out++ = 0xb1;
-  ld_check(out < end);
-  // Adjust flags to indicate no compression for now; maybe_compress_blob() will
-  // overwrite it if it decides to compress.
-  *out++ = (batch_flags_t)BufferedWriter::Options::Compression::NONE |
-      (flags & ~Flags::COMPRESSION_MASK);
-  size_t batch_size_varint_len = 0;
-  if (flags & Flags::SIZE_INCLUDED) {
-    // Append the number of records in this batch.
-    batch_size_varint_len = folly::encodeVarint(batch.appends.size(), out);
-    out += batch_size_varint_len;
-    batch.blob_header_size += batch_size_varint_len;
-    ld_check(out <= end);
-  }
+  BufferedWriteCodec::Encoder<PayloadsEncoder> encoder(
+      checksum_bits, batch.appends.size(), batch.blob_bytes_total);
   for (auto& append : batch.appends) {
-    const std::string& client_payload = append.second;
-    size_t len = folly::encodeVarint(client_payload.size(), out);
-    out += len;
-    ld_check(out <= end);
-    ld_check((ssize_t)(end - out) >= (ssize_t)client_payload.size());
-    memcpy(out, client_payload.data(), client_payload.size());
-    out += client_payload.size();
     if (destroy_payloads) {
-      batch.total_size_freed += append.second.size();
-      // Can't do append.second.clear() because that usually doesn't free
-      // memory.
-      append.second.clear();
-      append.second.shrink_to_fit();
-    }
-  }
-  // Assert that the running count (batch.blob_bytes_total) was accurate, taking
-  // into account that we didn't use all the bytes we'd reserved for the varint.
-  ld_check(out + (folly::kMaxVarintLength64 - batch_size_varint_len) == end);
-  blob_buf.append(out - blob_buf.writableTail());
-  batch.blob = std::move(blob_buf);
-}
+      batch.total_size_freed +=
+          BufferedWriterPayloadMeter::memorySize(append.second);
 
-void BufferedWriterSingleLog::Impl::maybe_compress_blob(
-    BufferedWriterSingleLog::Batch& batch,
-    Compression compression,
-    int checksum_bits,
-    const int zstd_level) {
-  if (compression == Compression::NONE) {
-    // Nothing to do.
-    return;
-  }
-  ld_check(compression == Compression::ZSTD ||
-           compression == Compression::LZ4 ||
-           compression == Compression::LZ4_HC);
+      std::visit(
+          folly::overload(
+              [&](std::string& payload) {
+                // Payload should be destroyed, so pass ownership to the encoder
+                std::string* client_payload =
+                    new std::string(std::move(payload));
+                folly::IOBuf iobuf = folly::IOBuf(
+                    folly::IOBuf::TAKE_OWNERSHIP,
+                    client_payload->data(),
+                    client_payload->size(),
+                    +[](void* /* buf */, void* userData) {
+                      delete reinterpret_cast<std::string*>(userData);
+                    },
+                    /* userData */ reinterpret_cast<void*>(client_payload));
+                encoder.append(std::move(iobuf));
 
-  // Skip the uncompressed blob header.
-  ld_check(batch.blob_header_size > 0);
-  ld_check(batch.blob.length() > batch.blob_header_size);
-  const Slice to_compress(batch.blob.data() + batch.blob_header_size,
-                          batch.blob.length() - batch.blob_header_size);
+                // Can't do payload.clear() because that usually doesn't free
+                // memory.
+                payload.clear();
+                payload.shrink_to_fit();
+              },
+              [&](PayloadGroup& payload_group) {
+                encoder.append(payload_group);
 
-  const size_t compressed_data_bound = compression == Compression::ZSTD
-      ? ZSTD_compressBound(to_compress.size)
-      : LZ4_compressBound(to_compress.size);
-
-  const size_t compressed_buf_size = batch.blob_header_size + // header
-      folly::kMaxVarintLength64 + // uncompressed length
-      compressed_data_bound       // compressed bytes
-      ;
-  folly::IOBuf compress_buf(folly::IOBuf::CREATE, compressed_buf_size);
-  uint8_t* out = compress_buf.writableTail();
-  uint8_t* const end = out + compressed_buf_size;
-
-  // Copy the header from batch.blob and set the compression flag
-  memcpy(out, batch.blob.data(), batch.blob_header_size);
-  out[checksum_bits / 8 + 1] |= (uint8_t)compression & Flags::COMPRESSION_MASK;
-  out += batch.blob_header_size;
-
-  // Append uncompressed size so that the decoding path knows how much memory
-  // to allocate
-  out += folly::encodeVarint(to_compress.size, out);
-
-  size_t compressed_size;
-  if (compression == Compression::ZSTD) {
-    compressed_size = ZSTD_compress(out,              // dst
-                                    end - out,        // dstCapacity
-                                    to_compress.data, // src
-                                    to_compress.size, // srcSize
-                                    zstd_level);      // level
-    if (ZSTD_isError(compressed_size)) {
-      ld_critical(
-          "ZSTD_compress() failed: %s", ZSTD_getErrorName(compressed_size));
-      ld_check(false);
-      return;
-    }
-  } else {
-    // LZ4
-    int rv;
-    if (compression == Compression::LZ4) {
-      rv = LZ4_compress_default(
-          (char*)to_compress.data, (char*)out, to_compress.size, end - out);
+                payload_group.clear();
+              }),
+          append.second);
     } else {
-      rv = LZ4_compress_HC(
-          (char*)to_compress.data, (char*)out, to_compress.size, end - out, 0);
+      std::visit(folly::overload(
+                     [&](const std::string& client_payload) {
+                       // It's safe to wrap buffer, since payloads are preserved
+                       // in batch.
+                       encoder.append(folly::IOBuf::wrapBufferAsValue(
+                           client_payload.data(), client_payload.size()));
+                     },
+                     [&](const PayloadGroup& payload_group) {
+                       encoder.append(payload_group);
+                     }),
+                 append.second);
     }
-    ld_spew("LZ4_compress() returned %d", rv);
-    ld_check(rv > 0);
-    compressed_size = rv;
   }
-  out += compressed_size;
-  ld_check(out <= end);
+  folly::IOBufQueue encoded;
+  encoder.encode(encoded, compression, zstd_level);
+  batch.blob = encoded.moveAsValue();
+}
+} // namespace
 
-  const size_t compressed_len = out - compress_buf.data();
-  ld_spew("original size is %zu, compressed %zu",
-          batch.blob.length(),
-          compressed_len);
-  if (compressed_len < batch.blob.length()) {
-    // Compression was a win.  Replace the uncompressed blob.
-    compress_buf.append(compressed_len);
-    batch.blob = std::move(compress_buf);
+void BufferedWriterSingleLog::Impl::construct_compressed_blob(
+    BufferedWriterSingleLog::Batch& batch,
+    int checksum_bits,
+    Compression compression,
+    int zstd_level,
+    bool destroy_payloads) {
+  switch (batch.blob_format) {
+    case BufferedWriteCodec::Format::SINGLE_PAYLOADS: {
+      encode_batch<BufferedWriteSinglePayloadsCodec::Encoder>(
+          batch, checksum_bits, compression, zstd_level, destroy_payloads);
+      break;
+    }
+    case BufferedWriteCodec::Format::PAYLOAD_GROUPS: {
+      encode_batch<PayloadGroupCodec::Encoder>(
+          batch, checksum_bits, compression, zstd_level, destroy_payloads);
+      break;
+    }
   }
 }
 
 void BufferedWriterSingleLog::Impl::construct_blob_long_running(
     BufferedWriterSingleLog::Batch& batch,
-    batch_flags_t flags,
     int checksum_bits,
-    bool destroy_payloads,
-    const int zstd_level) {
+    Compression compression,
+    const int zstd_level,
+    bool destroy_payloads) {
   ld_check(batch.state == Batch::State::CONSTRUCTING_BLOB);
 
-  construct_uncompressed_blob(batch, flags, checksum_bits, destroy_payloads);
-  maybe_compress_blob(batch,
-                      (Compression)(flags & Flags::COMPRESSION_MASK),
-                      checksum_bits,
-                      zstd_level);
-
-  if (checksum_bits > 0) {
-    // construct_uncompressed_blob() left this many bytes at the front to put
-    // the checksum into.  It couldn't have done so itself because the
-    // checksum needs to cover the compressed blob, if we compressed.
-    size_t nbytes = checksum_bits / 8;
-    Slice checksummed(batch.blob.data() + nbytes, batch.blob.length() - nbytes);
-    checksum_bytes(checksummed,
-                   checksum_bits,
-                   reinterpret_cast<char*>(batch.blob.writableData()));
-  }
+  construct_compressed_blob(
+      batch, checksum_bits, compression, zstd_level, destroy_payloads);
 }
 
 void BufferedWriterSingleLog::construct_blob(
     BufferedWriterSingleLog::Batch& batch,
-    batch_flags_t flags,
     int checksum_bits,
+    Compression compression,
     bool destroy_payloads) {
   ld_check(batch.state == Batch::State::CONSTRUCTING_BLOB);
 
@@ -795,7 +737,7 @@ void BufferedWriterSingleLog::construct_blob(
   if (batch.blob_bytes_total <
       Worker::settings().buffered_writer_bg_thread_bytes_threshold) {
     Impl::construct_blob_long_running(
-        batch, flags, checksum_bits, destroy_payloads, zstd_level);
+        batch, checksum_bits, compression, zstd_level, destroy_payloads);
     readyToSend(batch);
   } else {
     ProcessorProxy* processor_proxy = parent_->parent_->processorProxy();
@@ -808,16 +750,16 @@ void BufferedWriterSingleLog::construct_blob(
 
     processor_proxy->processor()->enqueueToBackgroundBlocking(
         [&batch,
-         flags,
          checksum_bits,
          destroy_payloads,
          processor_proxy,
          trigger = parent_->parent_->getBackgroundTaskCountHolder(),
          thread_affinity = Worker::onThisThread()->idx_.val(),
+         compression,
          zstd_level,
          this]() mutable {
           BufferedWriterSingleLog::Impl::construct_blob_long_running(
-              batch, flags, checksum_bits, destroy_payloads, zstd_level);
+              batch, checksum_bits, compression, zstd_level, destroy_payloads);
           std::unique_ptr<Request> request =
               std::make_unique<ContinueBlobSendRequest>(
                   this, batch, thread_affinity);

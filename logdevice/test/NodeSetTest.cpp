@@ -16,7 +16,6 @@
 #include "logdevice/common/EpochMetaDataMap.h"
 #include "logdevice/common/EpochMetaDataUpdater.h"
 #include "logdevice/common/EpochStore.h"
-#include "logdevice/common/FileEpochStore.h"
 #include "logdevice/common/LocalLogStoreRecordFormat.h"
 #include "logdevice/common/MetaDataLog.h"
 #include "logdevice/common/Metadata.h"
@@ -31,7 +30,9 @@
 #include "logdevice/include/Client.h"
 #include "logdevice/include/ClientSettings.h"
 #include "logdevice/lib/ClientImpl.h"
+#include "logdevice/server/epoch_store/FileEpochStore.h"
 #include "logdevice/server/locallogstore/test/StoreUtil.h"
+#include "logdevice/test/utils/AdminAPITestUtils.h"
 #include "logdevice/test/utils/IntegrationTestBase.h"
 #include "logdevice/test/utils/IntegrationTestUtils.h"
 
@@ -42,10 +43,12 @@
 #define N4 ShardID(4, 0)
 #define N5 ShardID(5, 0)
 
-using namespace facebook::logdevice;
-using IntegrationTestUtils::markShardUnrecoverable;
-using IntegrationTestUtils::requestShardRebuilding;
+// Kill test process after this many seconds. These tests are complex and take
+// around 25s to execute so giving them a longer timeout.
+const std::chrono::seconds
+    TEST_TIMEOUT(facebook::logdevice::DEFAULT_TEST_TIMEOUT * 2);
 
+using namespace facebook::logdevice;
 /*
  * @file: A set of Integration tests that involves changing epoch metadata
  * (i.e., nodeset, replication factor).
@@ -58,6 +61,8 @@ const int NLOGS{1};
 
 class NodeSetTest : public IntegrationTestBase {
  public:
+  NodeSetTest() : IntegrationTestBase(TEST_TIMEOUT) {}
+  ~NodeSetTest() override {}
   // initializes a Cluster object with the desired log config
   void init();
 
@@ -74,7 +79,6 @@ class NodeSetTest : public IntegrationTestBase {
   // Log properties
   size_t nodes_ = 5; // 0 sequencer, 1 - 4 valid storage nodes
   size_t replication_ = 2;
-  size_t extra_ = 0;
   size_t synced_ = 0;
 
   // current nodeset
@@ -105,7 +109,6 @@ void NodeSetTest::init() {
                        .with_maxWritesInFlight(256)
                        .with_singleWriter(false)
                        .with_replicationFactor(replication_)
-                       .with_extraCopies(extra_)
                        .with_syncedCopies(synced_);
 
   auto factory =
@@ -118,9 +121,18 @@ void NodeSetTest::init() {
           .doNotLetSequencersProvisionEpochMetaData()
           // If some reactivations are delayed they still complete quickly
           .setParam("--sequencer-reactivation-delay-secs", "1s..2s")
+          .setParam("--disable-event-log-trimming", "true")
           .setParam("--disable-rebuilding", "false")
           .setParam("--bridge-record-in-empty-epoch",
                     bridge_empty_epoch_ ? "true" : "false")
+          .useStandaloneAdminServer(true)
+          .setParam("--enable-cluster-maintenance-state-machine", "true")
+          .setParam(
+              "--maintenance-manager-metadata-nodeset-update-period", "100min")
+          .setParam("--gossip-enabled", "true")
+          .setParam("--nodes-configuration-manager-intermediary-shard-state-"
+                    "timeout",
+                    "1s")
           .setNumDBShards(1);
 
   cluster_ = factory.create(nodes_);
@@ -160,11 +172,12 @@ void NodeSetTest::updateMetaDataInEpochStore(logid_t log) {
               log,
               std::make_shared<CustomEpochMetaDataUpdater>(
                   config,
-                  config->getNodesConfigurationFromServerConfigSource(),
+                  cluster_->getConfig()->getNodesConfiguration(),
                   selector,
-                  true,
-                  true /* provision_if_empty */,
-                  true /* update_if_exists */),
+                  EpochMetaData::Updater::Options()
+                      .setUseStorageSetFormat()
+                      .setProvisionIfEmpty()
+                      .setUpdateIfExists()),
               [this](Status st,
                      logid_t logid,
                      std::unique_ptr<EpochMetaData> info,
@@ -214,8 +227,10 @@ void NodeSetTest::writeMetaDataLog() {
   auto count_activations = [&]() {
     size_t count = 0;
     for (size_t i = 0; i < nodes_; ++i) {
-      auto config = cluster_->getConfig()->get()->serverConfig();
-      if (!config->getNode(i) || !config->getNode(i)->isSequencingEnabled()) {
+      if (!cluster_->getConfig()
+               ->getNodesConfiguration()
+               ->getSequencerMembership()
+               ->isSequencingEnabled(i)) {
         continue;
       }
       auto stats = cluster_->getNode(i).stats();
@@ -254,12 +269,10 @@ void NodeSetTest::writeMetaDataLog() {
     reader->setRecordCallback(
         [expected, &sem, this, log](std::unique_ptr<DataRecord>& record) {
           EpochMetaData info;
-          int rv = info.fromPayload(
-              record->payload,
-              log,
-              *cluster_->getConfig()
-                   ->getServerConfig()
-                   ->getNodesConfigurationFromServerConfigSource());
+          int rv =
+              info.fromPayload(record->payload,
+                               log,
+                               *cluster_->getConfig()->getNodesConfiguration());
           EXPECT_EQ(0, rv);
           EXPECT_EQ(info.h.epoch, info.h.effective_since);
           if (info.h.epoch == expected) {
@@ -736,6 +749,8 @@ TEST_F(NodeSetTest, DeferReleasesUntilMetaDataRead) {
   START_CLUSTER();
   cluster_->waitForRecovery();
   std::shared_ptr<Client> client = cluster_->createClient();
+  cluster_->getAdminServer()->waitUntilFullyLoaded();
+  auto admin_client = cluster_->getAdminServer()->createAdminClient();
   std::map<lsn_t, std::string> lsn_map;
   lsn_t first_lsn = write_test_records(client, LOG_ID, 10, lsn_map);
 
@@ -752,11 +767,11 @@ TEST_F(NodeSetTest, DeferReleasesUntilMetaDataRead) {
   // write the new epoch metadata only to epochstore but not metadata log
   updateMetaDataInEpochStore();
   // restart the sequencer to pick up the new epoch metadata, write some data
-  cluster_->replace(0);
+  cluster_->replaceViaAdminServer(*admin_client, 0);
   lsn_t second_lsn = write_test_records(client, LOG_ID, 10, lsn_map);
 
   // restart the sequencer again and write some data in the third epoch
-  cluster_->replace(0);
+  cluster_->replaceViaAdminServer(*admin_client, 0);
   lsn_t third_lsn = write_test_records(client, LOG_ID, 10, lsn_map);
 
   ASSERT_GT(lsn_to_epoch(second_lsn), lsn_to_epoch(first_lsn));
@@ -805,6 +820,8 @@ TEST_F(NodeSetTest, DeferReleasesUntilMetaDataRead) {
 TEST_F(NodeSetTest, RebuildMultipleEpochs) {
   START_CLUSTER();
   std::shared_ptr<Client> client = cluster_->createClient();
+  cluster_->getAdminServer()->waitUntilFullyLoaded();
+  auto admin_client = cluster_->getAdminServer()->createAdminClient();
   std::map<lsn_t, std::string> lsn_map;
   const size_t records_per_epoch = 10;
 
@@ -822,13 +839,15 @@ TEST_F(NodeSetTest, RebuildMultipleEpochs) {
   // do a rolling replacement of storage nodes
   for (int i = 0; i < nodes_; ++i) {
     if (cluster_->getConfig()
-            ->get()
-            ->serverConfig()
-            ->getNode(i)
-            ->isReadableStorageNode()) {
-      ASSERT_EQ(0, cluster_->replace(i));
-      ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, i, SHARD_IDX));
-      // Wait until all shards finish rebuilding.
+            ->getNodesConfiguration()
+            ->getStorageMembership()
+            ->hasShardShouldReadFrom(i)) {
+      cluster_->applyInternalMaintenance(
+          *client, i, SHARD_IDX, "Requesting rebuilding from the test case");
+      ASSERT_EQ(0, cluster_->replaceViaAdminServer(*admin_client, i));
+
+      ASSERT_TRUE(
+          wait_until_shards_enabled_and_healthy(*cluster_, i, {SHARD_IDX}));
       cluster_->getNode(i).waitUntilAllShardsFullyAuthoritative(client);
     }
   }
@@ -889,7 +908,6 @@ TEST_F(NodeSetTest, EpochMetaDataCache) {
                        .with_maxWritesInFlight(256)
                        .with_singleWriter(false)
                        .with_replicationFactor(replication_)
-                       .with_extraCopies(extra_)
                        .with_syncedCopies(synced_);
 
   // we have a specific setup:

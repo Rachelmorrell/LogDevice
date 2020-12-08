@@ -79,8 +79,14 @@ bool ShardedRocksDBLocalLogStore::createOrValidatePaths() {
 
   shard_paths_.resize(nshards_);
   for (shard_index_t shard_idx = 0; shard_idx < nshards_; ++shard_idx) {
-    shard_paths_.at(shard_idx) =
+    fs::path shard_path =
         fs::path(base_path_) / fs::path("shard" + std::to_string(shard_idx));
+
+    if (!customiser_->validateShardPath(shard_path.string())) {
+      return false;
+    }
+
+    shard_paths_.at(shard_idx) = shard_path;
   }
 
   return true;
@@ -110,7 +116,7 @@ void ShardedRocksDBLocalLogStore::init(
 
   std::vector<IOTracing*> tracing_ptrs;
   for (shard_index_t i = 0; i < nshards_; ++i) {
-    io_tracing_by_shard_.push_back(std::make_unique<IOTracing>(i));
+    io_tracing_by_shard_.push_back(std::make_unique<IOTracing>(i, stats_));
     tracing_ptrs.push_back(io_tracing_by_shard_[i].get());
   }
   // If tracing is enabled in settings, enable it before opening the DBs.
@@ -206,6 +212,7 @@ void ShardedRocksDBLocalLogStore::init(
           std::count(
               disabled_shards_.begin(), disabled_shards_.end(), shard_idx) == 0;
 
+      auto tstart = std::chrono::steady_clock::now();
       if (should_open_shard) {
         shard_store = factory.create(shard_idx,
                                      nshards_,
@@ -213,14 +220,24 @@ void ShardedRocksDBLocalLogStore::init(
                                      io_tracing_by_shard_[shard_idx].get());
       }
 
+      auto tend = std::chrono::steady_clock::now();
+      uint64_t open_duration_ms =
+          std::chrono::duration_cast<std::chrono::milliseconds>(tend - tstart)
+              .count();
       if (shard_store) {
-        ld_info("Opened RocksDB instance at %s", shard_path.c_str());
+        PER_SHARD_STAT_SET(
+            stats_, rocksdb_open_duration_ms, shard_idx, open_duration_ms);
+        ld_info("Opened RocksDB instance at %s in %ld ms",
+                shard_path.c_str(),
+                open_duration_ms);
         ld_check(dynamic_cast<RocksDBLogStoreBase*>(shard_store.get()) !=
                  nullptr);
       } else {
         PER_SHARD_STAT_INCR(stats_, failing_log_stores, shard_idx);
         shard_store = std::make_unique<FailingLocalLogStore>();
-        ld_info("Opened FailingLocalLogStore instance for shard %d", shard_idx);
+        ld_info("Opened FailingLocalLogStore instance for shard %d in %ld ms",
+                shard_idx,
+                open_duration_ms);
       }
 
       return std::make_pair(std::move(shard_store), std::move(filter_factory));
@@ -266,53 +283,6 @@ void ShardedRocksDBLocalLogStore::init(
   ld_info("Initialized sharded RocksDB instance at %s with %d shards",
           base_path_.c_str(),
           nshards_);
-}
-
-bool ShardedRocksDBLocalLogStore::wipe(
-    const std::vector<shard_index_t>& shard_indexes) {
-  ld_check(!initialized_);
-  if (initialized_) {
-    ld_critical("Wipe called after RocksDB initialisation. Ignoring.");
-    return false;
-  }
-
-  if (!is_db_local_) {
-    ld_critical("Wipe not supported for remote storage");
-    // The caller is supposed to make sure the DB is local.
-    ld_check(false);
-    return false;
-  }
-
-  if (!createOrValidatePaths()) {
-    return false;
-  }
-
-  for (shard_index_t shard_idx : shard_indexes) {
-    fs::path shard_path = shard_paths_.at(shard_idx);
-
-    try {
-      // Do not wipe "disabled" shards
-      if (fs::exists(shard_path) && !fs::is_directory(shard_path)) {
-        ld_info("%s exists but is not a directory. Not wiping shard %d",
-                shard_path.string().c_str(),
-                shard_idx);
-        continue;
-      }
-
-      // Recursively delete the directory contents (but not directory itself)
-      ld_info("Wiping shard %d at %s", shard_idx, shard_path.string().c_str());
-      for (fs::directory_iterator end_dir_it, dir_it(shard_path);
-           dir_it != end_dir_it;
-           ++dir_it) {
-        fs::remove_all(dir_it->path());
-      }
-    } catch (const fs::filesystem_error& e) {
-      ld_critical("Failed to wipe/validate %s. Failing safe and aborting",
-                  shard_path.string().c_str());
-      return false;
-    }
-  }
-  return true;
 }
 
 ShardedRocksDBLocalLogStore::~ShardedRocksDBLocalLogStore() {
@@ -724,7 +694,6 @@ void ShardedRocksDBLocalLogStore::printDiskShardMapping() {
 void ShardedRocksDBLocalLogStore::refreshIOTracingSettings() {
   auto settings = db_settings_.get();
   auto shards = settings->io_tracing_shards;
-  std::chrono::milliseconds threshold = settings->io_tracing_threshold;
 
   std::vector<bool> enabled_by_shard(io_tracing_by_shard_.size());
   if (shards.all_shards) {
@@ -744,8 +713,10 @@ void ShardedRocksDBLocalLogStore::refreshIOTracingSettings() {
   }
 
   for (shard_index_t i = 0; i < enabled_by_shard.size(); ++i) {
-    io_tracing_by_shard_[i]->setEnabled(enabled_by_shard[i]);
-    io_tracing_by_shard_[i]->setThreshold(threshold);
+    io_tracing_by_shard_[i]->updateOptions(
+        enabled_by_shard[i],
+        settings->io_tracing_threshold,
+        settings->io_tracing_stall_threshold);
   }
 }
 

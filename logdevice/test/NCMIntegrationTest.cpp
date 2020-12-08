@@ -10,7 +10,6 @@
 #include <thread>
 
 #include <folly/Random.h>
-#include <folly/hash/Checksum.h>
 #include <folly/synchronization/Baton.h>
 #include <gtest/gtest.h>
 
@@ -28,7 +27,6 @@
 using namespace facebook::logdevice;
 using namespace facebook::logdevice::configuration::nodes;
 using namespace facebook::logdevice::membership;
-using namespace facebook::logdevice::NodesConfigurationTestUtil;
 using NCAPI = facebook::logdevice::configuration::NodesConfigurationAPI;
 
 namespace {
@@ -51,7 +49,7 @@ NodesConfiguration::Update buildSimpleUpdate() {
   NodesConfiguration::Update update{};
   update.sequencer_config_update = std::make_unique<SequencerConfig::Update>();
   update.sequencer_config_update->membership_update =
-      std::make_unique<SequencerMembership::Update>(MembershipVersion::Type(1));
+      std::make_unique<SequencerMembership::Update>(MembershipVersion::Type(2));
   update.sequencer_config_update->membership_update->addNode(
       0,
       {SequencerMembershipTransition::SET_WEIGHT,
@@ -117,38 +115,4 @@ TEST_F(NCMIntegrationTest, ToolingClientBasic) {
 
   auto nc_client2 = getNCAPI(admin_client2)->getConfig();
   ASSERT_TRUE(nc_expected->equalWithTimestampIgnored(*nc_client2));
-}
-
-// Test the behavior of servers and clients when the NCM is enabled but the
-// source-of-truth switch is still ServerConfig (and thus the NC in Zookeeper
-// may not be up-to-date). This is only relevant as we roll out NCM.
-TEST_F(NCMIntegrationTest, InRollout) {
-  auto cluster =
-      IntegrationTestUtils::ClusterFactory()
-          .setNodesConfigurationSourceOfTruth(
-              IntegrationTestUtils::NodesConfigurationSourceOfTruth::
-                  SERVER_CONFIG)
-          .setParam("--nodes-configuration-manager-store-polling-interval",
-                    "1s",
-                    IntegrationTestUtils::ParamScope::ALL)
-          .setParam("--fd-limit", "9999", IntegrationTestUtils::ParamScope::ALL)
-          .setParam("--num-reserved-fds",
-                    "999",
-                    IntegrationTestUtils::ParamScope::ALL)
-          .doNotSyncServerConfigToNodesConfiguration()
-          .deferStart()
-          .create(3);
-  // Write the current config to NCS
-  auto sc = cluster->getConfig()->getServerConfig();
-  auto orig_version =
-      sc->getNodesConfigurationFromServerConfigSource()->getVersion();
-  cluster->updateNodesConfigurationFromServerConfig(sc.get());
-  EXPECT_EQ(0, cluster->bumpGeneration(node_index_t{1}));
-  EXPECT_EQ(0, cluster->bumpGeneration(node_index_t{2}));
-  auto new_version = cluster->getConfig()
-                         ->getServerConfig()
-                         ->getNodesConfigurationFromServerConfigSource()
-                         ->getVersion();
-  EXPECT_GT(new_version, orig_version);
-  EXPECT_EQ(0, cluster->start());
 }

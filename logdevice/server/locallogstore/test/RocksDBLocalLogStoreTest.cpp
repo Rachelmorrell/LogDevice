@@ -107,6 +107,15 @@ class RocksDBLocalLogStoreTest : public ::testing::Test {
     dbg::currentLevel = getLogLevelFromEnv().value_or(dbg::Level::INFO);
   }
 
+  Slice getCSIEntry() {
+    static std::string buffer;
+    std::vector<ShardID> vec{
+        ShardID(node_index_t(1), 0), ShardID(node_index_t(2), 0)};
+
+    return LocalLogStoreRecordFormat::formCopySetIndexEntry(
+        0, vec.data(), 2, LSN_INVALID, 0, &buffer);
+  }
+
   std::unique_ptr<LocalLogStore> createRocksDBLocalLogStore() {
     return std::make_unique<TemporaryLogStore>([&](std::string path) {
       return std::make_unique<RocksDBLocalLogStore>(
@@ -183,26 +192,30 @@ Slice getHeader() {
  * Write a record and check rocksdb contents directly.
  */
 TEST_F(RocksDBLocalLogStoreTest, WriteTest) {
-  TemporaryRocksDBStore store;
+  auto store = createRocksDBLocalLogStore();
+  auto store_ptr = dynamic_cast<TemporaryLogStore*>(store.get());
 
   // Write a record to the store and close it
+  std::string buffer;
+  Slice header = getHeader();
+  Slice csi_entry = getCSIEntry();
   PutWriteOp op{logid_t(123),
                 511,
-                getHeader(),
+                header,
                 Slice("abc1", 4),
                 /*coordinator*/ folly::none,
-                folly::none,
-                Slice(nullptr, 0),
-                {},
+                LSN_INVALID,
+                csi_entry,
+                std::vector<std::pair<char, std::string>>(),
                 Durability::ASYNC_WRITE,
                 false};
-  ASSERT_EQ(0, store.writeMulti(std::vector<const WriteOp*>{&op}));
-  store.close();
+  ASSERT_EQ(0, store_ptr->writeMulti(std::vector<const WriteOp*>{&op}));
+  store_ptr->close();
 
   // Open rocksdb database directly and check contents
   rocksdb::DB* db;
   rocksdb::Status status =
-      rocksdb::DB::Open(rocksdb_config_.options_, store.getPath(), &db);
+      rocksdb::DB::Open(rocksdb_config_.options_, store_ptr->getPath(), &db);
   ASSERT_TRUE(status.ok()) << status.ToString();
 
   SCOPE_EXIT {
@@ -219,23 +232,41 @@ TEST_F(RocksDBLocalLogStoreTest, WriteTest) {
       continue;
     }
 
-    // clang-format off
-    unsigned char expected_key[] = {
-        'd',                                  // header
-        0,    0,    0,    0,    0, 0, 0, 123, // log id
-        0,    0,    0,    0,    0, 0, 1, 255, // lsn
-    };
-    // clang-format on
-    static_assert(sizeof expected_key == 17, "must be 17 bytes");
-    EXPECT_EQ(17, it->key().size());
-    EXPECT_EQ(0, memcmp(it->key().data(), expected_key, sizeof expected_key));
-    EXPECT_EQ(getHeader().size + strlen("abc1"), it->value().size());
-    EXPECT_EQ(
-        0, memcmp(it->value().data(), getHeader().data, getHeader().size));
+    if (keys_seen == 0) {
+      // clang-format off
+      unsigned char expected_key[] = {
+          67,                                   // header
+          0,    0,    0,    0,    0, 0, 0, 123, // log id
+          0,    0,    0,    0,    0, 0, 1, 255, // lsn
+          83,                                   // CSI mark
+      };
+      // clang-format on
+      static_assert(sizeof expected_key == 18, "must be 18 bytes");
+      EXPECT_EQ(18, it->key().size());
+      EXPECT_EQ(0, memcmp(it->key().data(), expected_key, sizeof expected_key));
+      EXPECT_EQ(csi_entry.size, it->value().size());
+      EXPECT_EQ(0, memcmp(it->value().data(), csi_entry.data, csi_entry.size));
+    } else if (keys_seen == 1) {
+      // clang-format off
+      unsigned char expected_key[] = {
+          'd',                                  // header
+          0,    0,    0,    0,    0, 0, 0, 123, // log id
+          0,    0,    0,    0,    0, 0, 1, 255, // lsn
+      };
+      // clang-format on
+      static_assert(sizeof expected_key == 17, "must be 17 bytes");
+      EXPECT_EQ(17, it->key().size());
+      EXPECT_EQ(0, memcmp(it->key().data(), expected_key, sizeof expected_key));
+      EXPECT_EQ(header.size + strlen("abc1"), it->value().size());
+      EXPECT_EQ(0, memcmp(it->value().data(), header.data, header.size));
+    } else {
+      FAIL();
+    }
+
     ++keys_seen;
   }
   EXPECT_TRUE(it->status().ok());
-  EXPECT_EQ(1, keys_seen);
+  EXPECT_EQ(2, keys_seen);
 }
 
 static void
@@ -249,18 +280,16 @@ verifyRecord(const char* expected,
             std::string(ptr + header_size, ptr + it->getRecord().size));
 }
 
-/**
- * Test iterators over all logs.
- */
 STORE_TEST(RocksDBLocalLogStoreTest, AllLogsIterators, store) {
+  std::vector<std::string> buffers(6);
   std::vector<PutWriteOp> put_ops{
       PutWriteOp{configuration::InternalLogs::CONFIG_LOG_SNAPSHOTS,
                  1,
                  getHeader(),
                  Slice("abccls1", 5),
                  folly::none,
-                 folly::none,
-                 Slice(nullptr, 0),
+                 LSN_INVALID,
+                 getCSIEntry(),
                  {},
                  Durability::ASYNC_WRITE,
                  false},
@@ -269,8 +298,8 @@ STORE_TEST(RocksDBLocalLogStoreTest, AllLogsIterators, store) {
                  getHeader(),
                  Slice("abcm11", 5),
                  folly::none,
-                 folly::none,
-                 Slice(nullptr, 0),
+                 LSN_INVALID,
+                 getCSIEntry(),
                  {},
                  Durability::ASYNC_WRITE,
                  false},
@@ -279,8 +308,8 @@ STORE_TEST(RocksDBLocalLogStoreTest, AllLogsIterators, store) {
                  getHeader(),
                  Slice("abc21", 5),
                  folly::none,
-                 folly::none,
-                 Slice(nullptr, 0),
+                 LSN_INVALID,
+                 getCSIEntry(),
                  {},
                  Durability::ASYNC_WRITE,
                  false},
@@ -289,8 +318,8 @@ STORE_TEST(RocksDBLocalLogStoreTest, AllLogsIterators, store) {
                  getHeader(),
                  Slice("abc25", 5),
                  folly::none,
-                 folly::none,
-                 Slice(nullptr, 0),
+                 LSN_INVALID,
+                 getCSIEntry(),
                  {},
                  Durability::ASYNC_WRITE,
                  false},
@@ -299,8 +328,8 @@ STORE_TEST(RocksDBLocalLogStoreTest, AllLogsIterators, store) {
                  getHeader(),
                  Slice("abc16", 5),
                  folly::none,
-                 folly::none,
-                 Slice(nullptr, 0),
+                 LSN_INVALID,
+                 getCSIEntry(),
                  {},
                  Durability::ASYNC_WRITE,
                  false},
@@ -309,8 +338,8 @@ STORE_TEST(RocksDBLocalLogStoreTest, AllLogsIterators, store) {
                  getHeader(),
                  Slice("abc24", 5),
                  folly::none,
-                 folly::none,
-                 Slice(nullptr, 0),
+                 LSN_INVALID,
+                 getCSIEntry(),
                  {},
                  Durability::ASYNC_WRITE,
                  false},
@@ -370,7 +399,8 @@ STORE_TEST(RocksDBLocalLogStoreTest, AllLogsIterators, store) {
  * Write a few records and read them back.  This verifies that ReadIterator
  * works as advertised and that records come back in the right order.
  */
-STORE_TEST(RocksDBLocalLogStoreTest, WriteReadBackTest, store) {
+TEST_F(RocksDBLocalLogStoreTest, WriteReadBackTest) {
+  auto store = createRocksDBLocalLogStore();
   std::vector<PutWriteOp> put_ops{
       PutWriteOp{logid_t(2),
                  1,
@@ -417,12 +447,12 @@ STORE_TEST(RocksDBLocalLogStoreTest, WriteReadBackTest, store) {
   std::vector<const WriteOp*> ops1{&put_ops[0], &put_ops[1]};
   std::vector<const WriteOp*> ops2{&put_ops[2], &put_ops[3]};
 
-  ASSERT_EQ(0, store.writeMulti(ops1));
-  ASSERT_EQ(0, store.writeMulti(ops2));
+  ASSERT_EQ(0, store->writeMulti(ops1));
+  ASSERT_EQ(0, store->writeMulti(ops2));
 
   {
-    std::unique_ptr<LocalLogStore::ReadIterator> it =
-        store.read(logid_t(1), LocalLogStore::ReadOptions("WriteReadBackTest"));
+    std::unique_ptr<LocalLogStore::ReadIterator> it = store->read(
+        logid_t(1), LocalLogStore::ReadOptions("WriteReadBackTest"));
     it->seek(0);
     int nread = 0;
     for (nread = 0; it->state() == IteratorState::AT_RECORD;
@@ -437,8 +467,8 @@ STORE_TEST(RocksDBLocalLogStoreTest, WriteReadBackTest, store) {
 
   {
     // Test that we can get records for log 2, starting from LSN 1 (inclusive)
-    std::unique_ptr<LocalLogStore::ReadIterator> it =
-        store.read(logid_t(2), LocalLogStore::ReadOptions("WriteReadBackTest"));
+    std::unique_ptr<LocalLogStore::ReadIterator> it = store->read(
+        logid_t(2), LocalLogStore::ReadOptions("WriteReadBackTest"));
     it->seek(1);
     int nread = 0;
     for (nread = 0; it->state() == IteratorState::AT_RECORD;
@@ -459,8 +489,8 @@ STORE_TEST(RocksDBLocalLogStoreTest, WriteReadBackTest, store) {
 
   {
     // Test that starting at LSN 2 skips the first record
-    std::unique_ptr<LocalLogStore::ReadIterator> it =
-        store.read(logid_t(2), LocalLogStore::ReadOptions("WriteReadBackTest"));
+    std::unique_ptr<LocalLogStore::ReadIterator> it = store->read(
+        logid_t(2), LocalLogStore::ReadOptions("WriteReadBackTest"));
     it->seek(2);
     int nread = 0;
     for (nread = 0; it->state() == IteratorState::AT_RECORD;
@@ -477,7 +507,8 @@ STORE_TEST(RocksDBLocalLogStoreTest, WriteReadBackTest, store) {
   }
 }
 
-STORE_TEST(RocksDBLocalLogStoreTest, BatchWithDelete, store) {
+TEST_F(RocksDBLocalLogStoreTest, BatchWithDelete) {
+  auto store = createRocksDBLocalLogStore();
   std::vector<std::unique_ptr<WriteOp>> ops;
   ops.push_back(
       std::make_unique<PutWriteOp>(logid_t(1),
@@ -508,11 +539,11 @@ STORE_TEST(RocksDBLocalLogStoreTest, BatchWithDelete, store) {
     op_ptrs.push_back(x.get());
   }
 
-  ASSERT_EQ(0, store.writeMulti(op_ptrs));
+  ASSERT_EQ(0, store->writeMulti(op_ptrs));
 
   {
     std::unique_ptr<LocalLogStore::ReadIterator> it =
-        store.read(logid_t(1), LocalLogStore::ReadOptions("BatchWithDelete"));
+        store->read(logid_t(1), LocalLogStore::ReadOptions("BatchWithDelete"));
     it->seek(0);
     int nread = 0;
     for (nread = 0; it->state() == IteratorState::AT_RECORD;
@@ -523,7 +554,7 @@ STORE_TEST(RocksDBLocalLogStoreTest, BatchWithDelete, store) {
 
   {
     std::unique_ptr<LocalLogStore::ReadIterator> it =
-        store.read(logid_t(2), LocalLogStore::ReadOptions("BatchWithDelete"));
+        store->read(logid_t(2), LocalLogStore::ReadOptions("BatchWithDelete"));
     it->seek(0);
     int nread = 0;
     for (nread = 0; it->state() == IteratorState::AT_RECORD;
@@ -677,7 +708,8 @@ STORE_TEST(RocksDBLocalLogStoreTest, WriteInvalidMetadata, store) {
   }
 }
 
-STORE_TEST(RocksDBLocalLogStoreTest, Seek, store) {
+TEST_F(RocksDBLocalLogStoreTest, Seek) {
+  auto store = createRocksDBLocalLogStore();
   Slice data("foo", 3);
   lsn_t lsns[] = {
       compose_lsn(epoch_t(1), esn_t(1)),
@@ -686,9 +718,10 @@ STORE_TEST(RocksDBLocalLogStoreTest, Seek, store) {
   };
 
   std::vector<PutWriteOp> put_ops;
-  for (lsn_t lsn : lsns) {
+  std::vector<std::string> buffers(3);
+  for (int i = 0; i < 3; i++) {
     put_ops.emplace_back(logid_t(1),
-                         lsn,
+                         lsns[i],
                          getHeader(),
                          data,
                          folly::none,
@@ -698,12 +731,12 @@ STORE_TEST(RocksDBLocalLogStoreTest, Seek, store) {
                          Durability::ASYNC_WRITE,
                          false);
     put_ops.emplace_back(LOGID_MAX_INTERNAL,
-                         lsn,
+                         lsns[i],
                          getHeader(),
                          data,
                          folly::none,
-                         folly::none,
-                         Slice(nullptr, 0),
+                         LSN_INVALID,
+                         getCSIEntry(),
                          std::vector<std::pair<char, std::string>>(),
                          Durability::ASYNC_WRITE,
                          false);
@@ -714,13 +747,13 @@ STORE_TEST(RocksDBLocalLogStoreTest, Seek, store) {
     ops.push_back(&x);
   }
 
-  ASSERT_EQ(0, store.writeMulti(ops));
+  ASSERT_EQ(0, store->writeMulti(ops));
 
   LocalLogStore::ReadOptions options("Seek");
   options.tailing = false;
 
   std::unique_ptr<LocalLogStore::ReadIterator> it =
-      store.read(logid_t(1), options);
+      store->read(logid_t(1), options);
 
   it->seek(lsns[1]);
   ASSERT_EQ(IteratorState::AT_RECORD, it->state());
@@ -734,11 +767,11 @@ STORE_TEST(RocksDBLocalLogStoreTest, Seek, store) {
   ASSERT_EQ(IteratorState::AT_RECORD, it->state());
   EXPECT_EQ(lsns[2], it->getLSN());
 
-  it = store.read(logid_t(2), options);
+  it = store->read(logid_t(2), options);
   it->seekForPrev(LSN_MAX);
   ASSERT_EQ(IteratorState::AT_END, it->state());
 
-  it = store.read(LOGID_MAX_INTERNAL, options);
+  it = store->read(LOGID_MAX_INTERNAL, options);
   it->seekForPrev(LSN_MAX);
   ASSERT_EQ(IteratorState::AT_RECORD, it->state());
   EXPECT_EQ(lsns[2], it->getLSN());

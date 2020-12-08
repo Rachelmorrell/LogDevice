@@ -41,7 +41,6 @@ TEST_F(AdminAPILowLevelTest, LogTreeReplicationInfo) {
   auto internal_log_attrs = logsconfig::LogAttributes()
                                 .with_singleWriter(false)
                                 .with_replicationFactor(2)
-                                .with_extraCopies(0)
                                 .with_syncedCopies(0);
   auto cluster = IntegrationTestUtils::ClusterFactory()
                      .setConfigLogAttributes(internal_log_attrs)
@@ -120,7 +119,6 @@ TEST_F(AdminAPILowLevelTest, TakeLogTreeSnapshot) {
   auto internal_log_attrs = logsconfig::LogAttributes()
                                 .with_singleWriter(false)
                                 .with_replicationFactor(2)
-                                .with_extraCopies(0)
                                 .with_syncedCopies(0);
   auto cluster = IntegrationTestUtils::ClusterFactory()
                      .setConfigLogAttributes(internal_log_attrs)
@@ -169,7 +167,6 @@ TEST_F(AdminAPILowLevelTest, TakeMaintenanceLogSnapshot) {
   auto internal_log_attrs = logsconfig::LogAttributes()
                                 .with_singleWriter(false)
                                 .with_replicationFactor(2)
-                                .with_extraCopies(0)
                                 .with_syncedCopies(0);
   auto cluster =
       IntegrationTestUtils::ClusterFactory()
@@ -207,7 +204,6 @@ TEST_F(AdminAPILowLevelTest, SettingsAPITest) {
                      .setParam("--store-timeout", "1s..12s")
                      .useHashBasedSequencerAssignment()
                      .create(2);
-
   cluster->waitUntilAllAvailable();
   auto admin_client = cluster->getNode(0).createAdminClient();
   ASSERT_NE(nullptr, admin_client);
@@ -217,26 +213,25 @@ TEST_F(AdminAPILowLevelTest, SettingsAPITest) {
 
   thrift::SettingsResponse response;
   admin_client->sync_getSettings(response, thrift::SettingsRequest());
-  ASSERT_NE(nullptr, admin_client);
 
-  // For LogsConfig manager, we pass this as both a CLI argument and in CONFIG
-  auto& logsconfig_setting = response.settings["enable-logsconfig-manager"];
-  ASSERT_EQ("false", logsconfig_setting.currentValue);
-  ASSERT_EQ("true", logsconfig_setting.defaultValue);
-  ASSERT_EQ(
-      "false",
-      logsconfig_setting.sources.find(thrift::SettingSource::CONFIG)->second);
-  ASSERT_EQ(
-      "false",
-      logsconfig_setting.sources.find(thrift::SettingSource::CLI)->second);
-  ASSERT_TRUE(
-      logsconfig_setting.sources.end() ==
-      logsconfig_setting.sources.find(thrift::SettingSource::ADMIN_OVERRIDE));
+  // For LogsConfig manager, we pass this in the CONFIG
+  auto& logsconfig_setting =
+      response.settings_ref()["enable-logsconfig-manager"];
+  ASSERT_EQ("false", *logsconfig_setting.currentValue_ref());
+  ASSERT_EQ("true", *logsconfig_setting.defaultValue_ref());
+  ASSERT_EQ("false",
+            logsconfig_setting.sources_ref()
+                ->find(thrift::SettingSource::CONFIG)
+                ->second);
+  ASSERT_TRUE(logsconfig_setting.sources_ref()->end() ==
+              logsconfig_setting.sources_ref()->find(
+                  thrift::SettingSource::ADMIN_OVERRIDE));
 
-  auto& store_timeout_setting = response.settings["store-timeout"];
-  ASSERT_EQ(
-      "1s..12s",
-      store_timeout_setting.sources.find(thrift::SettingSource::CLI)->second);
+  auto& store_timeout_setting = response.settings_ref()["store-timeout"];
+  ASSERT_EQ("1s..12s",
+            store_timeout_setting.sources_ref()
+                ->find(thrift::SettingSource::CONFIG)
+                ->second);
 
   // Check setting filtering
   auto filtered_request = thrift::SettingsRequest();
@@ -249,15 +244,149 @@ TEST_F(AdminAPILowLevelTest, SettingsAPITest) {
   admin_client->sync_getSettings(filtered_response, filtered_request);
 
   // Check that not all settings are in the response
-  ASSERT_TRUE(filtered_response.settings.find("enable-logsconfig-manager") ==
-              filtered_response.settings.end());
+  ASSERT_TRUE(
+      filtered_response.settings_ref()->find("enable-logsconfig-manager") ==
+      filtered_response.settings_ref()->end());
 
   // Check that requested settings are in there
   auto& rebuilding_window_setting =
-      filtered_response.settings["rebuilding-local-window"];
-  ASSERT_EQ("60min", rebuilding_window_setting.currentValue);
-  store_timeout_setting = filtered_response.settings["store-timeout"];
-  ASSERT_EQ("1s..12s", store_timeout_setting.currentValue);
+      filtered_response.settings_ref()["rebuilding-local-window"];
+  ASSERT_EQ("60min", *rebuilding_window_setting.currentValue_ref());
+  store_timeout_setting = filtered_response.settings_ref()["store-timeout"];
+  ASSERT_EQ("1s..12s", *store_timeout_setting.currentValue_ref());
+}
+
+TEST_F(AdminAPILowLevelTest, ApplySettingOverrideAPITest) {
+  auto cluster = IntegrationTestUtils::ClusterFactory()
+                     .setParam("--rebuilding-local-window", "60min")
+                     .useHashBasedSequencerAssignment()
+                     .create(2);
+
+  cluster->waitUntilAllAvailable();
+  auto admin_client = cluster->getNode(0).createAdminClient();
+  ASSERT_NE(nullptr, admin_client);
+
+  auto fbStatus = admin_client->sync_getStatus();
+  ASSERT_EQ(facebook::fb303::cpp2::fb_status::ALIVE, fbStatus);
+
+  // Apply a temporary override
+  auto apply_setting_override_request = thrift::ApplySettingOverrideRequest();
+  *apply_setting_override_request.name_ref() = "rebuilding-local-window";
+  *apply_setting_override_request.value_ref() = "30min";
+  *apply_setting_override_request.ttl_seconds_ref() = 3;
+  admin_client->sync_applySettingOverride(apply_setting_override_request);
+
+  thrift::SettingsResponse response;
+  // Check that overridden setting is in there
+  admin_client->sync_getSettings(response, thrift::SettingsRequest());
+  auto& rebuilding_window_setting =
+      response.settings_ref()["rebuilding-local-window"];
+  ASSERT_EQ("30min", *rebuilding_window_setting.currentValue_ref());
+
+  // Wait for the TTL to expire and the setting to get removed
+  auto setting_applied = wait_until(
+      [&]() {
+        thrift::SettingsResponse response2;
+        admin_client->sync_getSettings(response2, thrift::SettingsRequest());
+        rebuilding_window_setting =
+            response2.settings_ref()["rebuilding-local-window"];
+        return *rebuilding_window_setting.currentValue_ref() == "60min";
+      },
+      std::chrono::steady_clock::now() + std::chrono::seconds(30));
+  ASSERT_EQ(0, setting_applied);
+}
+
+TEST_F(AdminAPILowLevelTest, ApplySettingOverrideAPITestValidation) {
+  auto cluster = IntegrationTestUtils::ClusterFactory()
+                     .useHashBasedSequencerAssignment()
+                     .create(2);
+
+  cluster->waitUntilAllAvailable();
+  auto admin_client = cluster->getNode(0).createAdminClient();
+  ASSERT_NE(nullptr, admin_client);
+
+  auto fbStatus = admin_client->sync_getStatus();
+  ASSERT_EQ(facebook::fb303::cpp2::fb_status::ALIVE, fbStatus);
+
+  // Zero TTL isn't allowed
+  auto request1 = thrift::ApplySettingOverrideRequest();
+  *request1.name_ref() = "rebuilding-local-window";
+  *request1.value_ref() = "30min";
+  *request1.ttl_seconds_ref() = 0;
+  ASSERT_THROW(admin_client->sync_applySettingOverride(request1),
+               thrift::InvalidRequest);
+
+  // Negative TTL isn't allowed
+  auto request2 = thrift::ApplySettingOverrideRequest();
+  *request2.name_ref() = "rebuilding-local-window";
+  *request2.value_ref() = "30min";
+  *request2.ttl_seconds_ref() = -1;
+  ASSERT_THROW(admin_client->sync_applySettingOverride(request2),
+               thrift::InvalidRequest);
+
+  // Invalid setting name
+  auto request3 = thrift::ApplySettingOverrideRequest();
+  *request3.name_ref() = "foo";
+  *request3.value_ref() = "30min";
+  *request3.ttl_seconds_ref() = 1;
+  ASSERT_THROW(admin_client->sync_applySettingOverride(request2),
+               thrift::InvalidRequest);
+}
+
+TEST_F(AdminAPILowLevelTest, RemoveSettingOverrideAPITest) {
+  auto cluster = IntegrationTestUtils::ClusterFactory()
+                     .setParam("--rebuilding-local-window", "60min")
+                     .useHashBasedSequencerAssignment()
+                     .create(2);
+
+  cluster->waitUntilAllAvailable();
+  auto admin_client = cluster->getNode(0).createAdminClient();
+  ASSERT_NE(nullptr, admin_client);
+
+  auto fbStatus = admin_client->sync_getStatus();
+  ASSERT_EQ(facebook::fb303::cpp2::fb_status::ALIVE, fbStatus);
+
+  // Apply a temporary override
+  auto apply_setting_override_request = thrift::ApplySettingOverrideRequest();
+  *apply_setting_override_request.name_ref() = "rebuilding-local-window";
+  *apply_setting_override_request.value_ref() = "30min";
+  *apply_setting_override_request.ttl_seconds_ref() = 3600;
+  admin_client->sync_applySettingOverride(apply_setting_override_request);
+
+  thrift::SettingsResponse response;
+  // Check that overridden setting is in there
+  admin_client->sync_getSettings(response, thrift::SettingsRequest());
+  auto& rebuilding_window_setting =
+      response.settings_ref()["rebuilding-local-window"];
+  ASSERT_EQ("30min", *rebuilding_window_setting.currentValue_ref());
+
+  // Remove the temporary override
+  auto remove_setting_override_request = thrift::RemoveSettingOverrideRequest();
+  *remove_setting_override_request.name_ref() = "rebuilding-local-window";
+  admin_client->sync_removeSettingOverride(remove_setting_override_request);
+
+  // Wait for the setting to get removed
+  auto setting_removed = wait_until(
+      [&]() {
+        thrift::SettingsResponse response2;
+        admin_client->sync_getSettings(response2, thrift::SettingsRequest());
+        rebuilding_window_setting =
+            response2.settings_ref()["rebuilding-local-window"];
+        return *rebuilding_window_setting.currentValue_ref() == "60min";
+      },
+      std::chrono::steady_clock::now() + std::chrono::seconds(30));
+  ASSERT_EQ(0, setting_removed);
+
+  // Remove the temporary override again to ensure it's a noop
+  auto remove_setting_override_request2 =
+      thrift::RemoveSettingOverrideRequest();
+  *remove_setting_override_request2.name_ref() = "rebuilding-local-window";
+  admin_client->sync_removeSettingOverride(remove_setting_override_request2);
+  thrift::SettingsResponse response3;
+  admin_client->sync_getSettings(response3, thrift::SettingsRequest());
+  rebuilding_window_setting =
+      response3.settings_ref()["rebuilding-local-window"];
+  ASSERT_EQ("60min", *rebuilding_window_setting.currentValue_ref());
 }
 
 TEST_F(AdminAPILowLevelTest, LogGroupThroughputAPITest) {
@@ -437,11 +566,11 @@ TEST_F(AdminAPILowLevelTest, LogGroupCustomCountersAPITest) {
   }
   auto keys = counters["/log1"];
 
-  ASSERT_EQ(keys[0].key, 0);
-  ASSERT_EQ(keys[1].key, 1);
+  ASSERT_EQ(*keys[0].key_ref(), 0);
+  ASSERT_EQ(*keys[1].key_ref(), 1);
 
-  ASSERT_TRUE(keys[0].val > 0);
-  ASSERT_TRUE(keys[1].val > 0);
+  ASSERT_TRUE(*keys[0].val_ref() > 0);
+  ASSERT_TRUE(*keys[1].val_ref() > 0);
 
   thrift::LogGroupCustomCountersRequest log2Request;
   thrift::LogGroupCustomCountersResponse log2Response;
@@ -453,11 +582,11 @@ TEST_F(AdminAPILowLevelTest, LogGroupCustomCountersAPITest) {
   ASSERT_EQ(log2Counters.size(), 1);
 
   auto log2Keys = counters["/log2"];
-  ASSERT_EQ(log2Keys[0].key, 5);
-  ASSERT_EQ(log2Keys[1].key, 6);
+  ASSERT_EQ(*log2Keys[0].key_ref(), 5);
+  ASSERT_EQ(*log2Keys[1].key_ref(), 6);
 
-  ASSERT_TRUE(log2Keys[0].val > 0);
-  ASSERT_TRUE(log2Keys[1].val > 0);
+  ASSERT_TRUE(*log2Keys[0].val_ref() > 0);
+  ASSERT_TRUE(*log2Keys[1].val_ref() > 0);
 
   LogGroupCustomCountersRequest keyFilteredReq;
   LogGroupCustomCountersResponse keyFilteredRes;
@@ -468,6 +597,6 @@ TEST_F(AdminAPILowLevelTest, LogGroupCustomCountersAPITest) {
   auto keyFilteredCounters = keyFilteredRes.get_counters();
   auto keyFilteredKeys = keyFilteredCounters["/log1"];
   ASSERT_EQ(keyFilteredKeys.size(), 1);
-  ASSERT_EQ(keyFilteredKeys[0].key, 0);
-  ASSERT_TRUE(keyFilteredKeys[0].val > 0);
+  ASSERT_EQ(*keyFilteredKeys[0].key_ref(), 0);
+  ASSERT_TRUE(*keyFilteredKeys[0].val_ref() > 0);
 }

@@ -25,7 +25,6 @@
 #include "logdevice/common/configuration/LogsConfig.h"
 #include "logdevice/common/configuration/MetaDataLogsConfig.h"
 #include "logdevice/common/configuration/Node.h"
-#include "logdevice/common/configuration/NodesConfig.h"
 #include "logdevice/common/configuration/PrincipalsConfig.h"
 #include "logdevice/common/configuration/SecurityConfig.h"
 #include "logdevice/common/configuration/SequencersConfig.h"
@@ -54,7 +53,6 @@ class ServerConfig {
       facebook::logdevice::configuration::MetaDataLogsConfig;
   using Node = facebook::logdevice::configuration::Node;
   using Nodes = facebook::logdevice::configuration::Nodes;
-  using NodesConfig = facebook::logdevice::configuration::NodesConfig;
   using NodesConfiguration = configuration::nodes::NodesConfiguration;
   using PrincipalsConfig = facebook::logdevice::configuration::PrincipalsConfig;
   using SecurityConfig = facebook::logdevice::configuration::SecurityConfig;
@@ -137,63 +135,11 @@ class ServerConfig {
     version_ = version;
   }
 
-  void setNodesConfigurationVersion(config_version_t version) {
-    nodesConfig_.setNodesConfigurationVersion(version);
-  }
-
   /**
    * Returns the version of this config
    */
   config_version_t getVersion() const {
     return version_;
-  }
-
-  /**
-   * Gets all nodes.
-   */
-  const Nodes& getNodes() const {
-    return nodesConfig_.getNodes();
-  }
-
-  /**
-   * Returns a description of sequencer nodes in the cluster.
-   * NOTE: being DEPRECATED. Use NodesConfiguration::getSequencersConfig()
-   * instead.
-   */
-  const SequencersConfig& getSequencers_DEPRECATED() const {
-    return sequencersConfig_;
-  }
-
-  /**
-   * Looks up a node by index.
-   *
-   * @return On success, returns a pointer to a Node object contained in
-   *         this config.  On failure, returns nullptr and sets err to:
-   *           NOTFOUND       no node with given index appears in config
-   */
-  const Node* getNode(node_index_t index) const;
-
-  /**
-   * Looks up a node by NodeID. If id.generation() == 0, ignores generation in
-   * config, i.e. equivalent to getNode(id.index()).
-   *
-   * @return On success, returns a pointer to a Node object contained in
-   *         this config.  On failure, returns nullptr and sets err to:
-   *           INVALID_PARAM  node ID was invalid
-   *           NOTFOUND       no node with given ID appears in config
-   */
-  const Node* getNode(const NodeID& id) const;
-
-  /**
-   * Returns the NodeID of the server that this config was received from.
-   * Returns an invalid NodeID if the config did not originate from a server.
-   */
-  NodeID getServerOrigin() const {
-    return server_origin_;
-  }
-
-  void setServerOrigin(const NodeID& id) {
-    server_origin_ = id;
   }
 
   /**
@@ -215,26 +161,6 @@ class ServerConfig {
     std::string hash;
     std::chrono::milliseconds modified_time;
     std::chrono::milliseconds loaded_time;
-
-    // This is a hacky fix for a race condition in config synchronization.
-    //
-    // If this flag is true, it means we're updated the main config to the
-    // version corresponding to `hash`, but left logs config at a potentially
-    // older version (even if `hash` is a hash of a string that contains the
-    // new logs config!). This happens when config synchronization updates
-    // main config using data+hash received from a peer; such data doesn't
-    // include logs config, even if the `hash` bundled with it does.
-    //
-    // When we get a config update from the main config source (as opposed to
-    // configu synchronization messages), this flag will tell us that we need
-    // to update logs config even if hash matches.
-    //
-    // This is a hack because this flag is not really a property of the server
-    // config, but rather tells whether logs config (which is not part of server
-    // config) has been updated. The source of this abstraction leak (at least
-    // in part) is the fact that `hash` also doesn't describe just server config
-    // but both server and logs config. This is all a mess.
-    bool logs_config_may_be_outdated = false;
   };
 
   void setMainConfigMetadata(const ConfigMetadata& metadata) {
@@ -293,33 +219,14 @@ class ServerConfig {
     return metaDataLogsConfig_;
   }
 
-  const NodesConfig& getNodesConfig() const {
-    return nodesConfig_;
-  }
-
   /**
-   * Get the new representation of cluster nodes (i.e. NodesConfiguration
-   * class). reiterate the _FromServerConfigSource_ part to avoid confusion
-   * during NodesConfiguration migration.
-   */
-  const std::shared_ptr<const NodesConfiguration>&
-  getNodesConfigurationFromServerConfigSource() const {
-    return nodesConfig_.getNodesConfiguration();
-  }
-
-  /**
-   * Creates a ServerConfig object from existing cluster name,
-   * NodesConfig, LogsConfig, SecurityConfig instances.
-   *
-   * Note that it regenerates the new NodesConfiguration format from the
-   * existing NodesConfig and MetaDataLogsConfig. returns nullptr if the
-   * conversion failed.
+   * Creates a ServerConfig object from existing cluster name, LogsConfig,
+   * SecurityConfig instances.
    *
    * Public for testing.
    */
   static std::unique_ptr<ServerConfig> fromDataTest(
       std::string cluster_name,
-      NodesConfig nodes,
       MetaDataLogsConfig metadata_logs = MetaDataLogsConfig(),
       PrincipalsConfig = PrincipalsConfig(),
       SecurityConfig securityConfig = SecurityConfig(),
@@ -341,12 +248,6 @@ class ServerConfig {
   std::unique_ptr<ServerConfig> copy() const;
 
   /**
-   * Returns a clone of the ServerConfig object with the nodes section
-   * replaced by the parameter.
-   */
-  std::shared_ptr<ServerConfig> withNodes(NodesConfig) const;
-
-  /**
    * Returns a clone of the ServerConfig object with the MetadataLogsConfig
    * section replaced by the parameter.
    */
@@ -365,6 +266,18 @@ class ServerConfig {
   std::shared_ptr<ServerConfig> withIncrementedVersion() const {
     return withVersion(config_version_t(getVersion().val_ + 1));
   }
+
+  /**
+   * Returns a clone of the ServerConfig object with new server settings.
+   */
+  std::shared_ptr<ServerConfig>
+  withServerSettings(SettingsConfig server_settings) const;
+
+  /**
+   * Returns a clone of the ServerConfig object with new client settings.
+   */
+  std::shared_ptr<ServerConfig>
+  withClientSettings(SettingsConfig client_settings) const;
 
   /**
    * Returns the maximum finite backlog duration of a log.
@@ -464,7 +377,6 @@ class ServerConfig {
   // and move facilities.
   //
   ServerConfig(std::string cluster_name,
-               NodesConfig nodesConfig,
                MetaDataLogsConfig metaDataLogsConfig,
                PrincipalsConfig principalConfig,
                SecurityConfig securityConfig,
@@ -482,11 +394,10 @@ class ServerConfig {
   ServerConfig& operator=(ServerConfig&&) = delete;
 
   // Creates a ServerConfig object from existing cluster name,
-  // NodesConfig, LogsConfig, SecurityConfig and an optional ZookeeperConfig
+  // LogsConfig, SecurityConfig and an optional ZookeeperConfig
   // instances.
   static std::unique_ptr<ServerConfig> fromData(
       std::string cluster_name,
-      NodesConfig nodes,
       MetaDataLogsConfig metadata_logs = MetaDataLogsConfig(),
       PrincipalsConfig = PrincipalsConfig(),
       SecurityConfig securityConfig = SecurityConfig(),
@@ -505,11 +416,9 @@ class ServerConfig {
   std::string clusterName_;
   OptionalTimestamp clusterCreationTime_;
 
-  NodesConfig nodesConfig_;
   MetaDataLogsConfig metaDataLogsConfig_;
   PrincipalsConfig principalsConfig_;
   SecurityConfig securityConfig_;
-  SequencersConfig sequencersConfig_;
   TrafficShapingConfig trafficShapingConfig_;
   ShapingConfig readIOShapingConfig_;
   SettingsConfig serverSettingsConfig_;
@@ -520,12 +429,6 @@ class ServerConfig {
 
   // version of this config
   config_version_t version_{1};
-
-  NodeID my_node_id_;
-
-  // The server this config was received from. This will be an invalid NodeID if
-  // the config did not originate at a server.
-  NodeID server_origin_;
 
   /**
    * Arbitrary fields that logdevice does not recognize

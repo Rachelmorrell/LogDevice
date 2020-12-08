@@ -11,8 +11,6 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 import specs.fizz as fizz
 import specs.fmt as fmt
 import specs.folly as folly
-import specs.rocksdb as rocksdb
-import specs.rsocket as rsocket
 import specs.sodium as sodium
 import specs.wangle as wangle
 import specs.zstd as zstd
@@ -40,6 +38,24 @@ Which outputs a legocastle job to stdout; to be fed into scutil create ...
 """
 
 
+class FakeClangModule:
+    """
+    fbcode_builder doesn't allow us to inject build stuff before building
+    dependencies. This is a hack to point set the compiler to clang by injecting
+    it as a fake module that runs before any other dependency.
+    """
+
+    @staticmethod
+    def fbcode_builder_spec(builder):
+        return {
+            "depends_on": [],
+            "steps": [
+                builder.set_env("CC", "clang-9"),
+                builder.set_env("CXX", "clang++-9"),
+            ],
+        }
+
+
 def fbcode_builder_spec(builder):
     # This API should change rarely, so build the latest tag instead of master.
     builder.add_option(
@@ -49,8 +65,12 @@ def fbcode_builder_spec(builder):
     builder.add_option(
         "LogDevice/logdevice/_build:cmake_defines", {"BUILD_SUBMODULES": "OFF"}
     )
+    builder.add_option(
+        "facebook/folly:cmake_defines",
+        {"BUILD_SHARED_LIBS": "ON", "BUILD_TESTS": "OFF", "FOLLY_USE_JEMALLOC": "OFF"},
+    )
     return {
-        "depends_on": [zstd, fmt, folly, fizz, wangle, sodium, rsocket],
+        "depends_on": [FakeClangModule, zstd, fmt, folly, fizz, wangle, sodium],
         "steps": [
             # This isn't a separete spec, since only fbthrift uses mstch.
             builder.github_project_workdir("no1msd/mstch", "build"),

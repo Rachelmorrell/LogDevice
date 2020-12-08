@@ -15,7 +15,6 @@
 #include "../Table.h"
 #include "../Utils.h"
 #include "logdevice/admin/safety/LogMetaDataFetcher.h"
-#include "logdevice/common/FileEpochStore.h"
 #include "logdevice/common/Semaphore.h"
 #include "logdevice/common/ZookeeperClient.h"
 #include "logdevice/common/configuration/Configuration.h"
@@ -26,8 +25,8 @@
 #include "logdevice/common/plugin/ZookeeperClientFactory.h"
 #include "logdevice/lib/ClientImpl.h"
 #include "logdevice/ops/ldquery/Errors.h"
-#include "logdevice/server/ZookeeperEpochStore.h"
-
+#include "logdevice/server/epoch_store/FileEpochStore.h"
+#include "logdevice/server/epoch_store/ZookeeperEpochStore.h"
 
 namespace facebook {
   namespace logdevice {
@@ -123,7 +122,8 @@ std::shared_ptr<TableData> EpochStore::getData(QueryContext& ctx) {
     std::string epoch_store_path = config_path.str() + "/epoch_store";
     epoch_store = std::make_shared<FileEpochStore>(
         epoch_store_path,
-        &(client_impl->getProcessor()),
+        client_impl->getProcessor().getRequestExecutor(),
+        client_impl->getProcessor().getOptionalMyNodeID(),
         client_impl->getConfig()->updateableNodesConfiguration());
   } else {
     try {
@@ -135,11 +135,13 @@ std::shared_ptr<TableData> EpochStore::getData(QueryContext& ctx) {
                   PluginType::ZOOKEEPER_CLIENT_FACTORY);
       epoch_store = std::make_shared<ZookeeperEpochStore>(
           config->serverConfig()->getClusterName(),
-          &processor,
-          upd_config->updateableZookeeperConfig(),
+          processor.getRequestExecutor(),
+          zookeeper_client_factory->getClient(
+              *upd_config->updateableZookeeperConfig()->get()),
           upd_config->updateableNodesConfiguration(),
           processor.updateableSettings(),
-          zookeeper_client_factory);
+          processor.getOptionalMyNodeID(),
+          processor.stats_);
     } catch (const ConstructorFailed&) {
       std::string error =
           folly::format("Failed to construct a Zookeeper client for [{}]: {}",

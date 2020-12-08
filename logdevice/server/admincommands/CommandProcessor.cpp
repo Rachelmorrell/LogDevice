@@ -7,17 +7,6 @@
  */
 #include <sstream>
 
-// clang-format off
-/**
- * Order matters!
- * Without this include token functions will not compile in boost 1.65 which
- * ubuntu is using now.
- * https://github.com/boostorg/tokenizer/pull/10 (internal task T53218151)
- */
-#include <boost/type_traits/is_pointer.hpp>
-#include <boost/token_functions.hpp>
-// clang-format on
-
 #include "logdevice/common/Processor.h"
 #include "logdevice/common/RequestType.h"
 #include "logdevice/common/Semaphore.h"
@@ -52,15 +41,23 @@ CommandProcessor::CommandProcessor(Server* server)
 std::unique_ptr<folly::IOBuf>
 CommandProcessor::processCommand(const char* command_line,
                                  const folly::SocketAddress& address) {
+  auto buffer = std::make_unique<folly::IOBuf>();
+  folly::io::Appender output(buffer.get(), 1024);
+  if (server_->isShuttingDown()) {
+    ld_warning("Dropping command from %s due to shutdown: %s",
+               address.describe().c_str(),
+               sanitize_string(command_line).c_str());
+    output.printf("Command not executed: server is being shut down\r\nEND\r\n");
+    return buffer;
+  }
+
   auto start_time = std::chrono::steady_clock::now();
   ld_debug("Processing command: %s", sanitize_string(command_line).c_str());
 
-  auto buffer = std::make_unique<folly::IOBuf>();
-  folly::io::Appender output(buffer.get(), 1024);
   std::vector<std::string> args;
   try {
     args = boost::program_options::split_unix(command_line);
-  } catch (boost::escaped_list_error& e) {
+  } catch (const std::exception& e) {
     output.printf("Failed to split: %s\r\nEND\r\n", e.what());
     RATELIMIT_INFO(std::chrono::seconds(10),
                    2,

@@ -17,7 +17,6 @@
 #include "logdevice/common/Digest.h"
 #include "logdevice/common/EpochMetaDataUpdater.h"
 #include "logdevice/common/EpochStore.h"
-#include "logdevice/common/FileEpochStore.h"
 #include "logdevice/common/LegacyLogToShard.h"
 #include "logdevice/common/LocalLogStoreRecordFormat.h"
 #include "logdevice/common/Metadata.h"
@@ -35,14 +34,14 @@
 #include "logdevice/server/EpochRecordCacheEntry.h"
 #include "logdevice/server/RecordCache.h"
 #include "logdevice/server/RecordCacheDependencies.h"
+#include "logdevice/server/epoch_store/FileEpochStore.h"
 #include "logdevice/server/locallogstore/test/StoreUtil.h"
+#include "logdevice/test/utils/AdminAPITestUtils.h"
 #include "logdevice/test/utils/IntegrationTestUtils.h"
 
 // TODO 11866467: convert all tests to support immutable consensus
 
 using namespace facebook::logdevice;
-using IntegrationTestUtils::markShardUnrecoverable;
-using IntegrationTestUtils::requestShardRebuilding;
 
 const logid_t LOG_ID{1};
 const int SHARD_IDX{1}; // log 1 maps to shard 1
@@ -190,14 +189,14 @@ class RecoveryTest : public ::testing::TestWithParam<PopulateRecordCache> {
   // Log properties
   size_t nodes_ = 3;
   size_t replication_ = 2;
-  size_t extra_ = 0;
   size_t synced_ = 0;
   size_t max_writes_in_flight_ = 256;
   bool tail_optimized_{false};
   bool bridge_empty_epoch_{false};
+  bool disable_check_seals_{false};
 
   NodeLocationScope sync_replication_scope_{NodeLocationScope::NODE};
-  folly::Optional<Configuration::Nodes> node_configs_;
+  std::shared_ptr<const NodesConfiguration> node_configs_;
   folly::Optional<Configuration::MetaDataLogsConfig> metadata_config_;
 
   // number of data logs in the config
@@ -312,7 +311,6 @@ void RecoveryTest::init(bool can_tail_optimize) {
                        .with_maxWritesInFlight(max_writes_in_flight_)
                        .with_singleWriter(false)
                        .with_replicationFactor(replication_)
-                       .with_extraCopies(extra_)
                        .with_syncedCopies(synced_)
                        .with_syncReplicationScope(sync_replication_scope_)
                        .with_stickyCopySets(true)
@@ -324,7 +322,6 @@ void RecoveryTest::init(bool can_tail_optimize) {
           .with_maxWritesInFlight(256)
           .with_singleWriter(false)
           .with_replicationFactor(std::min(nodes_ - (nodes_ > 1), 3ul))
-          .with_extraCopies(0)
           .with_syncedCopies(0)
           .with_syncReplicationScope(sync_replication_scope_);
 
@@ -335,7 +332,6 @@ void RecoveryTest::init(bool can_tail_optimize) {
           .with_maxWritesInFlight(256)
           .with_singleWriter(false)
           .with_replicationFactor(std::min(nodes_ - (nodes_ > 1), 3ul))
-          .with_extraCopies(0)
           .with_syncedCopies(0)
           .with_syncReplicationScope(sync_replication_scope_);
 
@@ -344,7 +340,6 @@ void RecoveryTest::init(bool can_tail_optimize) {
           .with_maxWritesInFlight(256)
           .with_singleWriter(false)
           .with_replicationFactor(std::min(nodes_ - (nodes_ > 1), 3ul))
-          .with_extraCopies(0)
           .with_syncedCopies(0)
           .with_syncReplicationScope(sync_replication_scope_);
 
@@ -369,10 +364,21 @@ void RecoveryTest::init(bool can_tail_optimize) {
           // allow 1000 reactivations per seconds
           .setParam("--reactivation-limit", "1000/1s")
           // fall back to non-authoritative quickly
-          .setParam("--event-log-grace-period", "10ms");
+          .setParam("--event-log-grace-period", "10ms")
+          .setParam(
+              "--disable-check-seals", disable_check_seals_ ? "true" : "false");
 
   if (enable_rebuilding_) {
-    factory.setParam("--disable-rebuilding", "false");
+    factory.setParam("--disable-rebuilding", "false")
+        .setParam("--disable-event-log-trimming", "true")
+        .setParam("--gossip-enabled", "true")
+        .setParam("--ignore-isolation", "true")
+        .setParam("--min-gossips-for-stable-state", "1")
+        .setParam("--enable-cluster-maintenance-state-machine", "true")
+        .setParam("--nodes-configuration-manager-intermediary-shard-state-"
+                  "timeout",
+                  "1s")
+        .useStandaloneAdminServer(true);
   }
 
   factory.setParam(
@@ -408,9 +414,9 @@ void RecoveryTest::init(bool can_tail_optimize) {
     factory.setNumLogs(num_logs_.value());
   }
 
-  if (node_configs_.has_value()) {
-    ASSERT_EQ(nodes_, node_configs_.value().size());
-    factory.setNodes(node_configs_.value());
+  if (node_configs_) {
+    ASSERT_EQ(nodes_, node_configs_->clusterSize());
+    factory.setNodes(node_configs_);
   }
 
   if (metadata_config_.has_value()) {
@@ -627,10 +633,9 @@ void RecoveryTest::verifyEpochRecoveryMetadata(
   // examine the local log store for the per-epoch log metadata
   for (int i = 0; i < nodes_; ++i) {
     if (!cluster_->getConfig()
-             ->get()
-             ->serverConfig()
-             ->getNode(i)
-             ->isReadableStorageNode()) {
+             ->getNodesConfiguration()
+             ->getStorageMembership()
+             ->hasShardShouldReadFrom(i)) {
       continue;
     }
 
@@ -745,19 +750,18 @@ RecoveryTest::buildDigest(epoch_t epoch,
                           epoch_t expect_seal_epoch) {
   ld_check(cluster_ != nullptr);
 
-  std::shared_ptr<Configuration> config = cluster_->getConfig()->get();
+  auto nodes_cfg = cluster_->getConfig()->getNodesConfiguration();
   auto digest = std::make_unique<Digest>(
       LOG_ID,
       epoch,
       EpochMetaData(
           shards, ReplicationProperty(replication, sync_replication_scope)),
       expect_seal_epoch,
-      config->serverConfig()->getNodesConfigurationFromServerConfigSource(),
+      nodes_cfg,
       Digest::Options({bridge_empty_epoch_}));
 
   for (ShardID shard : shards) {
-    auto* n = config->serverConfig()->getNode(shard.node());
-    if (!n || !n->isReadableStorageNode()) {
+    if (!nodes_cfg->getStorageMembership()->shouldReadFromShard(shard)) {
       continue;
     }
 
@@ -825,7 +829,7 @@ RecoveryTest::buildDigest(epoch_t epoch,
         record_flags |= RECORD_Header::INCLUDE_OFFSET_WITHIN_EPOCH;
       }
 
-      auto record = std::make_unique<DataRecordOwnsPayload>(
+      auto record = std::make_unique<RawDataRecord>(
           LOG_ID,
           PayloadHolder(PayloadHolder::COPY_BUFFER, payload),
           lsn,
@@ -890,7 +894,6 @@ INSTANTIATE_TEST_CASE_P(RecoveryTest,
 TEST_P(RecoveryTest, MutationsWithImmutableConsensus) {
   nodes_ = 4;
   replication_ = 3;
-  extra_ = 0;
 
   init();
 
@@ -1128,7 +1131,6 @@ TEST_P(RecoveryTest, MutationsWithImmutableConsensus) {
 TEST_P(RecoveryTest, NonAuthoritativeRecovery) {
   nodes_ = 6;
   replication_ = 2;
-  extra_ = 0;
   enable_rebuilding_ = true;
 
   // pre-provisioning metadata not to break the "num_holes_plugged" math with
@@ -1211,8 +1213,12 @@ TEST_P(RecoveryTest, NonAuthoritativeRecovery) {
 
   ld_info("Requesting shard rebuildings.");
   auto client = cluster_->createClient();
-  ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, 4, SHARD_IDX));
-  ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, 5, SHARD_IDX));
+  cluster_->getAdminServer()->waitUntilFullyLoaded();
+  auto admin_client = cluster_->getAdminServer()->createAdminClient();
+  cluster_->applyInternalMaintenance(
+      *client, 4, SHARD_IDX, "Requesting rebuilding from the test case");
+  cluster_->applyInternalMaintenance(
+      *client, 5, SHARD_IDX, "Requesting rebuilding from the test case");
 
   ld_info("Waiting for recovery.");
   cluster_->getNode(0).waitForRecovery(LOG_ID);
@@ -1261,7 +1267,6 @@ TEST_P(RecoveryTest, NonAuthoritativeRecovery) {
 TEST_P(RecoveryTest, Purging) {
   nodes_ = 5; // four storage nodes
   replication_ = 2;
-  extra_ = 0;
   init();
 
   const copyset_t copyset = {N1, N2};
@@ -1323,16 +1328,8 @@ TEST_P(RecoveryTest, Purging) {
 // should be in a consistent state after they are all done.
 TEST_P(RecoveryTest, MultipleSequencers) {
   // four nodes, all of them store records and run sequencers
-  Configuration::Nodes node_configs;
-  for (node_index_t i = 0; i < 4; ++i) {
-    auto& node = node_configs[i];
-    node.generation = 1;
-    node.addSequencerRole();
-    node.addStorageRole(/*num_shards*/ 2);
-  }
-
-  node_configs_ = node_configs;
-  nodes_ = node_configs_.value().size();
+  node_configs_ = createSimpleNodesConfig(4, 2);
+  nodes_ = node_configs_->clusterSize();
   replication_ = 2;
   // prepopulating metadata to avoid throwing off the epoch math below
   pre_provision_epoch_metadata_ = true;
@@ -1547,7 +1544,6 @@ TEST_P(RecoveryTest, MetadatalogPreempted) {
 TEST_P(RecoveryTest, AuthoritativeRecoveryWithNodeSet) {
   nodes_ = 5;
   replication_ = 3; // replication factor of the starting epoch
-  extra_ = 0;
   pre_provision_epoch_metadata_ = false; // do not provision metadata
   let_sequencers_provision_metadata_ = false;
   init();
@@ -1752,7 +1748,6 @@ TEST_P(RecoveryTest, AuthoritativeRecoveryWithNodeSet) {
 TEST_P(RecoveryTest, FailureDomainAuthoritative) {
   nodes_ = 6;
   replication_ = 3;
-  extra_ = 0;
   sync_replication_scope_ = NodeLocationScope::REGION;
 
   // Region 1:  {0, 1, 2}
@@ -1777,15 +1772,17 @@ TEST_P(RecoveryTest, FailureDomainAuthoritative) {
     location.fromDomainString(domain_string);
     node_configs[i].location = location;
   }
-  node_configs_ = node_configs;
-
   // metadata logs are replicated cross-region
   // use a smaller, cross-region nodeset to ensure all records must be
   // cross-region no matter how their copysets are selected. this is
   // a workaround since we just select copyset randomly in MetaDataProvisioner.
-  Configuration::MetaDataLogsConfig meta_config = createMetaDataLogsConfig(
-      /*nodeset=*/{0, 3, 5}, /*replication=*/2, NodeLocationScope::REGION);
-  metadata_config_ = meta_config;
+  node_configs[0].metadata_node = true;
+  node_configs[3].metadata_node = true;
+  node_configs[5].metadata_node = true;
+
+  node_configs_ = NodesConfigurationTestUtil::provisionNodes(
+      std::move(node_configs),
+      ReplicationProperty{{NodeLocationScope::REGION, 2}});
 
   pre_provision_epoch_metadata_ = true;
 
@@ -1902,11 +1899,13 @@ TEST_P(RecoveryTest, FailureDomainAuthoritative) {
 TEST_P(RecoveryTest, NonAuthoritativePurging) {
   nodes_ = 6;
   replication_ = 2;
-  extra_ = 0;
   enable_rebuilding_ = true;
   // two logs are used in this test
   num_logs_ = 2;
   single_empty_erm_ = true;
+  // The test will not work if check seals is enabled since the entire nodeset
+  // will not be available.
+  disable_check_seals_ = true;
   init();
 
   const copyset_t copyset = {N1, N2};
@@ -1945,8 +1944,30 @@ TEST_P(RecoveryTest, NonAuthoritativePurging) {
 
   ld_info("Requesting shard rebuildings.");
   auto client = cluster_->createClient();
-  ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, 4, SHARD_IDX));
-  ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, 5, SHARD_IDX));
+  cluster_->getAdminServer()->waitUntilFullyLoaded();
+  auto admin_client = cluster_->getAdminServer()->createAdminClient();
+  ASSERT_TRUE(cluster_->applyInternalMaintenance(
+      *client, 4, SHARD_IDX, "Requesting rebuilding from the test case"));
+  ASSERT_TRUE(cluster_->applyInternalMaintenance(
+      *client, 5, SHARD_IDX, "Requesting rebuilding from the test case"));
+  cluster_->getNode(4).waitUntilShardState(
+      *admin_client,
+      SHARD_IDX,
+      [](const thrift::ShardState& shard) {
+        return shard.get_storage_state() ==
+            membership::thrift::StorageState::DATA_MIGRATION ||
+            shard.get_storage_state() == membership::thrift::StorageState::NONE;
+      },
+      "Shard must be in DATA_MIGRATION || NONE");
+  cluster_->getNode(5).waitUntilShardState(
+      *admin_client,
+      SHARD_IDX,
+      [](const thrift::ShardState& shard) {
+        return shard.get_storage_state() ==
+            membership::thrift::StorageState::DATA_MIGRATION ||
+            shard.get_storage_state() == membership::thrift::StorageState::NONE;
+      },
+      "Shard must be in DATA_MIGRATION || NONE");
 
   // after sequencer sends a RELEASE for e3n0,
   // node 1 should delete record (1, 2)
@@ -1997,7 +2018,6 @@ TEST_P(RecoveryTest, NonAuthoritativePurging) {
 TEST_P(RecoveryTest, PerEpochLogMetadata) {
   nodes_ = 5; // four storage nodes
   replication_ = 2;
-  extra_ = 0;
   // prepopulate metadata logs to be able to do exact epoch math
   pre_provision_epoch_metadata_ = true;
   init();
@@ -2063,10 +2083,9 @@ TEST_P(RecoveryTest, PerEpochLogMetadata) {
   // examine the local log store for the per-epoch log metadata
   for (int i = 0; i < nodes_; ++i) {
     if (!cluster_->getConfig()
-             ->get()
-             ->serverConfig()
-             ->getNode(i)
-             ->isReadableStorageNode()) {
+             ->getNodesConfiguration()
+             ->getStorageMembership()
+             ->hasShardShouldReadFrom(i)) {
       continue;
     }
 
@@ -2153,7 +2172,6 @@ TEST_P(RecoveryTest, PerEpochLogMetadata) {
 TEST_P(RecoveryTest, AuthoritativeRecoveryAndPurgingWithRNodesEmpty) {
   nodes_ = 10;
   replication_ = 2;
-  extra_ = 0;
   enable_rebuilding_ = true;
   pre_provision_epoch_metadata_ = false; // do not provision metadata
   let_sequencers_provision_metadata_ = false;
@@ -2237,10 +2255,23 @@ TEST_P(RecoveryTest, AuthoritativeRecoveryAndPurgingWithRNodesEmpty) {
   ASSERT_EQ(0, cluster_->start({0, 1, 2, 3, 4, 5, 6, 7}));
   ld_info("Requesting shard rebuildings.");
   auto client = cluster_->createClient();
-  ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, 8, SHARD_IDX));
-  ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, 9, SHARD_IDX));
-  ASSERT_NE(LSN_INVALID, markShardUnrecoverable(*client, 8, SHARD_IDX));
-  ASSERT_NE(LSN_INVALID, markShardUnrecoverable(*client, 9, SHARD_IDX));
+  cluster_->getAdminServer()->waitUntilFullyLoaded();
+  auto admin_client = cluster_->getAdminServer()->createAdminClient();
+  ASSERT_TRUE(cluster_->applyInternalMaintenance(
+      *client, 8, SHARD_IDX, "Requesting rebuilding from the test case"));
+  ASSERT_TRUE(cluster_->applyInternalMaintenance(
+      *client, 9, SHARD_IDX, "Requesting rebuilding from the test case"));
+  IntegrationTestUtils::waitUntilShardsHaveEventLogState(
+      client,
+      {ShardID(8, SHARD_IDX), ShardID(9, SHARD_IDX)},
+      AuthoritativeStatus::UNAVAILABLE,
+      true);
+
+  thrift::MarkAllShardsUnrecoverableRequest request;
+  request.set_user("test");
+  request.set_reason("test");
+  thrift::MarkAllShardsUnrecoverableResponse response;
+  admin_client->sync_markAllShardsUnrecoverable(response, request);
 
   ld_info("Waiting for rebuilding to complete");
   IntegrationTestUtils::waitUntilShardsHaveEventLogState(
@@ -2357,7 +2388,6 @@ TEST_P(RecoveryTest, AuthoritativeRecoveryAndPurgingWithRNodesEmpty) {
 TEST_P(RecoveryTest, RecoveryCannotFullyReplicate) {
   nodes_ = 10;
   replication_ = 3;
-  extra_ = 0;
   enable_rebuilding_ = true;
   pre_provision_epoch_metadata_ = false; // do not provision metadata
   let_sequencers_provision_metadata_ = false;
@@ -2500,12 +2530,48 @@ TEST_P(RecoveryTest, RecoveryCannotFullyReplicate) {
 
   ld_info("Requesting shard rebuildings.");
   auto client = cluster_->createClient();
-  ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, 7, SHARD_IDX));
-  ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, 8, SHARD_IDX));
-  ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, 9, SHARD_IDX));
-  ASSERT_NE(LSN_INVALID, markShardUnrecoverable(*client, 7, SHARD_IDX));
-  ASSERT_NE(LSN_INVALID, markShardUnrecoverable(*client, 8, SHARD_IDX));
-  ASSERT_NE(LSN_INVALID, markShardUnrecoverable(*client, 9, SHARD_IDX));
+  cluster_->getAdminServer()->waitUntilFullyLoaded();
+  auto admin_client = cluster_->getAdminServer()->createAdminClient();
+  ASSERT_TRUE(cluster_->applyInternalMaintenance(
+      *client, 7, SHARD_IDX, "Requesting rebuilding from the test case"));
+  ASSERT_TRUE(cluster_->applyInternalMaintenance(
+      *client, 8, SHARD_IDX, "Requesting rebuilding from the test case"));
+  ASSERT_TRUE(cluster_->applyInternalMaintenance(
+      *client, 9, SHARD_IDX, "Requesting rebuilding from the test case"));
+
+  cluster_->getNode(7).waitUntilShardState(
+      *admin_client,
+      SHARD_IDX,
+      [](const thrift::ShardState& shard) {
+        return shard.get_storage_state() ==
+            membership::thrift::StorageState::DATA_MIGRATION ||
+            shard.get_storage_state() == membership::thrift::StorageState::NONE;
+      },
+      "Shard must be in DATA_MIGRATION || NONE");
+  cluster_->getNode(8).waitUntilShardState(
+      *admin_client,
+      SHARD_IDX,
+      [](const thrift::ShardState& shard) {
+        return shard.get_storage_state() ==
+            membership::thrift::StorageState::DATA_MIGRATION ||
+            shard.get_storage_state() == membership::thrift::StorageState::NONE;
+      },
+      "Shard must be in DATA_MIGRATION || NONE");
+  cluster_->getNode(9).waitUntilShardState(
+      *admin_client,
+      SHARD_IDX,
+      [](const thrift::ShardState& shard) {
+        return shard.get_storage_state() ==
+            membership::thrift::StorageState::DATA_MIGRATION ||
+            shard.get_storage_state() == membership::thrift::StorageState::NONE;
+      },
+      "Shard must be in DATA_MIGRATION || NONE");
+
+  thrift::MarkAllShardsUnrecoverableRequest request;
+  request.set_user("test");
+  request.set_reason("test");
+  thrift::MarkAllShardsUnrecoverableResponse response;
+  admin_client->sync_markAllShardsUnrecoverable(response, request);
 
   ld_info("Waiting for recovery.");
   cluster_->getNode(0).waitForRecovery(LOG_ID);
@@ -2567,7 +2633,6 @@ TEST_P(RecoveryTest, RecoveryCannotFullyReplicate) {
 TEST_P(RecoveryTest, PurgingAvailabilityTest) {
   nodes_ = 6;
   replication_ = 2; // replication factor of the starting epoch
-  extra_ = 0;
   pre_provision_epoch_metadata_ = false; // do not provision metadata
   let_sequencers_provision_metadata_ = false;
   single_empty_erm_ = true;
@@ -2819,7 +2884,6 @@ TEST_P(RecoveryTest, PurgingAvailabilityTest) {
 TEST_P(RecoveryTest, IncompleteDigest) {
   nodes_ = 5; // 5 nodes, N0 is sequencer only, N4 is absent from recovery
   replication_ = 3;
-  extra_ = 0;
   // prepopulate metadata logs to be able to keep track of the exact number of
   // mutations
   pre_provision_epoch_metadata_ = true;
@@ -2920,7 +2984,6 @@ TEST_P(RecoveryTest, IncompleteDigest) {
 TEST_P(RecoveryTest, D4187744) {
   nodes_ = 5; // four storage nodes
   replication_ = 2;
-  extra_ = 0;
   // prepopulate metadata logs to avoid spontaneous sequencer reactivations
   pre_provision_epoch_metadata_ = true;
   init();
@@ -3042,7 +3105,6 @@ TEST_P(RecoveryTest, D4187744) {
 TEST_P(RecoveryTest, BridgeRecords) {
   nodes_ = 4;
   replication_ = 3;
-  extra_ = 0;
 
   init();
 
@@ -3182,12 +3244,14 @@ TEST_P(RecoveryTest, BridgeRecords) {
 TEST_P(RecoveryTest, PurgingAfterSkippedNonAuthoritativeRecovery) {
   nodes_ = 7;
   replication_ = 2;
-  extra_ = 0;
   enable_rebuilding_ = true;
   // only one data log
   num_logs_ = 1;
   pre_provision_epoch_metadata_ = false;
   single_empty_erm_ = false;
+  // The test will not work if check seals is enabled since the entire nodeset
+  // will not be available.
+  disable_check_seals_ = true;
 
   // metadata log is only stored in N6
   Configuration::MetaDataLogsConfig meta_config =
@@ -3323,11 +3387,18 @@ TEST_P(RecoveryTest, PurgingAfterSkippedNonAuthoritativeRecovery) {
   ASSERT_EQ(0, cluster_->start({0, 6}));
   ld_info("Requesting shard rebuildings.");
   auto client = cluster_->createClient();
-  ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, 1, SHARD_IDX));
-  ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, 2, SHARD_IDX));
-  ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, 3, SHARD_IDX));
-  ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, 4, SHARD_IDX));
-  ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, 5, SHARD_IDX));
+  cluster_->getAdminServer()->waitUntilFullyLoaded();
+  auto admin_client = cluster_->getAdminServer()->createAdminClient();
+  ASSERT_TRUE(cluster_->applyInternalMaintenance(
+      *client, 1, SHARD_IDX, "Requesting rebuilding from the test case"));
+  ASSERT_TRUE(cluster_->applyInternalMaintenance(
+      *client, 2, SHARD_IDX, "Requesting rebuilding from the test case"));
+  ASSERT_TRUE(cluster_->applyInternalMaintenance(
+      *client, 3, SHARD_IDX, "Requesting rebuilding from the test case"));
+  ASSERT_TRUE(cluster_->applyInternalMaintenance(
+      *client, 4, SHARD_IDX, "Requesting rebuilding from the test case"));
+  ASSERT_TRUE(cluster_->applyInternalMaintenance(
+      *client, 5, SHARD_IDX, "Requesting rebuilding from the test case"));
 
   ld_info("Waiting for the first non-authoritative recovery.");
   cluster_->waitForRecovery();
@@ -3366,7 +3437,6 @@ TEST_P(RecoveryTest, PurgingAfterSkippedNonAuthoritativeRecovery) {
 TEST_P(RecoveryTest, LNGNearESNMAX) {
   nodes_ = 4; // four storage nodes
   replication_ = 2;
-  extra_ = 0;
   init();
 
   const copyset_t copyset = {N1, N2};
@@ -3408,7 +3478,6 @@ TEST_P(RecoveryTest, LNGNearESNMAX) {
 TEST_P(RecoveryTest, TailRecordAtLNG) {
   nodes_ = 4;
   replication_ = 3;
-  extra_ = 0;
 
   init();
   const copyset_t copyset = {N1, N2, N3};
@@ -3468,7 +3537,6 @@ TEST_P(RecoveryTest, TailRecordAtLNG) {
 TEST_P(RecoveryTest, TailRecordAtLNGDataLoss) {
   nodes_ = 4;
   replication_ = 3;
-  extra_ = 0;
 
   init();
   const copyset_t copyset = {N1, N2, N3};
@@ -3522,7 +3590,6 @@ TEST_P(RecoveryTest, TailRecordAtLNGDataLoss) {
 TEST_P(RecoveryTest, ComputeTailRecord) {
   nodes_ = 4;
   replication_ = 2;
-  extra_ = 0;
 
   // allow quick reactivations in this test
   seq_reactivation_limit_ = "100/1s";
@@ -3720,7 +3787,6 @@ TEST_P(RecoveryTest, ComputeTailRecord) {
 TEST_P(RecoveryTest, BridgeRecordForEmptyEpochs) {
   nodes_ = 4;
   replication_ = 3;
-  extra_ = 0;
   bridge_empty_epoch_ = true;
 
   init();
@@ -3796,12 +3862,11 @@ TEST_P(RecoveryTest, BridgeRecordForEmptyEpochs) {
   }
 }
 
-// 1) digest should respect nodes in draining and include them into f-majority;
-// 2) mutation should not happen on draining nodes
-TEST_P(RecoveryTest, AuthoritativeRecoveryWithDrainingNodes) {
+// 1) digest should respect READ_ONLY nodes and include them into f-majority;
+// 2) mutation should not happen on READ_ONLY nodes
+TEST_P(RecoveryTest, AuthoritativeRecoveryWithReadOnlyNodes) {
   nodes_ = 6;
   replication_ = 2;
-  extra_ = 0;
   enable_rebuilding_ = true;
   // shorten the mutation timeout for faster retries
   recovery_timeout_ = std::chrono::milliseconds(5000);
@@ -3968,17 +4033,39 @@ TEST_P(RecoveryTest, AuthoritativeRecoveryWithDrainingNodes) {
   // start N0, N1, and N5. These nodes are enough to operate
   // event log but not enough to let LOG_ID have f-majority
   ASSERT_EQ(0, cluster_->start({0, 1, 2, 5}));
-  // request draining for N1 and N2
-  ld_info("Requesting draining for shard N1 and N2.");
-  auto client = cluster_->createClient();
-  auto flags =
-      SHARD_NEEDS_REBUILD_Header::RELOCATE | SHARD_NEEDS_REBUILD_Header::DRAIN;
-  ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, 1, SHARD_IDX, flags));
-  const lsn_t to_sync = requestShardRebuilding(*client, 2, SHARD_IDX, flags);
-  ASSERT_NE(LSN_INVALID, to_sync);
 
-  // wait for N0 and N1 to pick up the up-to-date event log version.
-  cluster_->waitUntilEventLogSynced(to_sync, {0, 1, 2});
+  {
+    cluster_->getAdminServer()->waitUntilFullyLoaded();
+    auto admin_client = cluster_->getAdminServer()->createAdminClient();
+    // Mark N1 & N2 as READ_ONLY
+    ld_info("Marking N1 and N2 as READ_ONLY");
+    cluster_->applyMaintenance(*admin_client,
+                               1,
+                               SHARD_IDX,
+                               /* user = */ "testing",
+                               /* drain = */ false);
+    cluster_->applyMaintenance(*admin_client,
+                               2,
+                               SHARD_IDX,
+                               /* user = */ "testing",
+                               /* drain = */ false);
+    cluster_->getNode(1).waitUntilShardState(
+        *admin_client,
+        SHARD_IDX,
+        [](const thrift::ShardState& shard) {
+          return shard.get_storage_state() ==
+              membership::thrift::StorageState::READ_ONLY;
+        },
+        "Shard must be READ_ONLY");
+    cluster_->getNode(2).waitUntilShardState(
+        *admin_client,
+        SHARD_IDX,
+        [](const thrift::ShardState& shard) {
+          return shard.get_storage_state() ==
+              membership::thrift::StorageState::READ_ONLY;
+        },
+        "Shard must be READ_ONLY");
+  }
 
   // half of the time, kill sequencer so that it does not have up-to-date
   // event log and we may fallback to intersection check
@@ -4061,7 +4148,6 @@ TEST_P(RecoveryTest, AuthoritativeRecoveryWithDrainingNodes) {
 TEST_P(RecoveryTest, BasicWriteStream) {
   nodes_ = 4;
   replication_ = 3;
-  extra_ = 0;
 
   init();
 

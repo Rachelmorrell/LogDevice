@@ -291,6 +291,9 @@ class RocksDBSettings : public SettingsBundle {
   // See cpp file for doc.
   rate_limit_t compaction_rate_limit_;
 
+  // if true, all records will have the copyset index written for them
+  bool write_copyset_index_;
+
   enum class FlushBlockPolicyType {
     DEFAULT,
     EACH_LOG,
@@ -358,6 +361,8 @@ class RocksDBSettings : public SettingsBundle {
   // as corrupted.
   bool test_corrupt_stores{false};
 
+  bool test_stall_sst_reads{false};
+
   // Various settings related to the rocksdb flush policy.
 
   // Total size limit for all memtables in the system.
@@ -378,6 +383,8 @@ class RocksDBSettings : public SettingsBundle {
   IOTracingShards io_tracing_shards;
 
   std::chrono::milliseconds io_tracing_threshold;
+
+  std::chrono::milliseconds io_tracing_stall_threshold;
 
   // When ld manages flushes, memory limit for the node and memtable
   // within rocksdb set to a very high value. rocksdb should never be
@@ -415,6 +422,9 @@ class RocksDBSettings : public SettingsBundle {
   int bloom_bits_per_key_;
   int metadata_bloom_bits_per_key_;
   bool bloom_block_based_;
+
+  // Use new rocksdb option to exclude block cache in core dumps
+  bool use_nocachedump_memory_allocator;
 
   uint32_t table_format_version_;
 

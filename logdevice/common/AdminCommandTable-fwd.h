@@ -91,7 +91,6 @@ typedef AdminCommandTable<std::string, /* State */
                           float,       /* SNDBuf Limited % */
                           int,         /* Proto */
                           size_t,      /* Send buf-sz */
-                          uint32_t,    /* Peer Config Version */
                           bool,        /* Is ssl */
                           int          /* FD of the underlying socket */
                           >
@@ -171,7 +170,8 @@ typedef AdminCommandTable<int,                       /* Shard */
                           std::string,               /* Append Dirtied By */
                           std::string,               /* Rebuild Dirtied By */
                           bool,                      /* Under Replicated */
-                          uint64_t /* Approx. Obsolete Bytes */
+                          uint64_t, /* Approx. Obsolete Bytes */
+                          bool      /* Copyset Index Enabled */
                           >
     InfoPartitionsTable;
 
@@ -251,7 +251,8 @@ typedef AdminCommandTable<logid_t,                    /* Log id */
                           std::chrono::milliseconds,  /* last_time_stuck */
                           std::string,                /* last_reported_state */
                           std::string,                /* last_tail_info */
-                          std::string                 /* time_lag_record */
+                          std::string,                /* time_lag_record */
+                          std::string                 /* reader_name */
                           >
     InfoClientReadStreamsTable;
 

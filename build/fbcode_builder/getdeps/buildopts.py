@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 
+from .copytree import containing_repo_type
 from .envfuncs import Env, add_path_entry
 from .fetcher import get_fbsource_repo_data
 from .manifest import ContextGenerator
@@ -23,19 +24,6 @@ try:
     import typing  # noqa: F401
 except ImportError:
     pass
-
-
-def containing_repo_type(path):
-    while True:
-        if os.path.exists(os.path.join(path, ".git")):
-            return ("git", path)
-        if os.path.exists(os.path.join(path, ".hg")):
-            return ("hg", path)
-
-        parent = os.path.dirname(path)
-        if parent == path:
-            return None, None
-        path = parent
 
 
 def detect_project(path):
@@ -66,19 +54,20 @@ class BuildOptions(object):
         num_jobs=0,
         use_shipit=False,
         vcvars_path=None,
+        allow_system_packages=False,
     ):
-        """ fbcode_builder_dir - the path to either the in-fbsource fbcode_builder dir,
-                                 or for shipit-transformed repos, the build dir that
-                                 has been mapped into that dir.
-            scratch_dir - a place where we can store repos and build bits.
-                          This path should be stable across runs and ideally
-                          should not be in the repo of the project being built,
-                          but that is ultimately where we generally fall back
-                          for builds outside of FB
-            install_dir - where the project will ultimately be installed
-            num_jobs - the level of concurrency to use while building
-            use_shipit - use real shipit instead of the simple shipit transformer
-            vcvars_path - Path to external VS toolchain's vsvarsall.bat
+        """fbcode_builder_dir - the path to either the in-fbsource fbcode_builder dir,
+                             or for shipit-transformed repos, the build dir that
+                             has been mapped into that dir.
+        scratch_dir - a place where we can store repos and build bits.
+                      This path should be stable across runs and ideally
+                      should not be in the repo of the project being built,
+                      but that is ultimately where we generally fall back
+                      for builds outside of FB
+        install_dir - where the project will ultimately be installed
+        num_jobs - the level of concurrency to use while building
+        use_shipit - use real shipit instead of the simple shipit transformer
+        vcvars_path - Path to external VS toolchain's vsvarsall.bat
         """
         if not num_jobs:
             import multiprocessing
@@ -119,6 +108,7 @@ class BuildOptions(object):
         self.fbcode_builder_dir = fbcode_builder_dir
         self.host_type = host_type
         self.use_shipit = use_shipit
+        self.allow_system_packages = allow_system_packages
         if vcvars_path is None and is_windows():
 
             # On Windows, the compiler is not available in the PATH by
@@ -188,11 +178,20 @@ class BuildOptions(object):
             }
         )
 
-    def compute_env_for_install_dirs(self, install_dirs, env=None):
+    def compute_env_for_install_dirs(self, install_dirs, env=None, manifest=None):
         if env is not None:
             env = env.copy()
         else:
             env = Env()
+
+        env["GETDEPS_BUILD_DIR"] = os.path.join(self.scratch_dir, "build")
+        env["GETDEPS_INSTALL_DIR"] = self.install_dir
+
+        # On macOS we need to set `SDKROOT` when we use clang for system
+        # header files.
+        if self.is_darwin() and "SDKROOT" not in env:
+            sdkroot = subprocess.check_output(["xcrun", "--show-sdk-path"])
+            env["SDKROOT"] = sdkroot.decode().strip()
 
         if self.fbsource_dir:
             env["YARN_YARN_OFFLINE_MIRROR"] = os.path.join(
@@ -205,6 +204,9 @@ class BuildOptions(object):
             node_exe = "node-win-x64.exe" if self.is_windows() else "node"
             env["NODE_BIN"] = os.path.join(
                 self.fbsource_dir, "xplat/third-party/node/bin/", node_exe
+            )
+            env["RUST_VENDORED_CRATES_DIR"] = os.path.join(
+                self.fbsource_dir, "third-party/rust/vendor"
             )
             hash_data = get_fbsource_repo_data(self)
             env["FBSOURCE_HASH"] = hash_data.hash
@@ -221,43 +223,59 @@ class BuildOptions(object):
             lib_path = None
 
         for d in install_dirs:
-            add_path_entry(env, "CMAKE_PREFIX_PATH", d)
-
-            pkgconfig = os.path.join(d, "lib/pkgconfig")
-            if os.path.exists(pkgconfig):
-                add_path_entry(env, "PKG_CONFIG_PATH", pkgconfig)
-
-            pkgconfig = os.path.join(d, "lib64/pkgconfig")
-            if os.path.exists(pkgconfig):
-                add_path_entry(env, "PKG_CONFIG_PATH", pkgconfig)
-
-            # Allow resolving shared objects built earlier (eg: zstd
-            # doesn't include the full path to the dylib in its linkage
-            # so we need to give it an assist)
-            if lib_path:
-                for lib in ["lib", "lib64"]:
-                    libdir = os.path.join(d, lib)
-                    if os.path.exists(libdir):
-                        add_path_entry(env, lib_path, libdir)
-
-            # Allow resolving binaries (eg: cmake, ninja) and dlls
-            # built by earlier steps
             bindir = os.path.join(d, "bin")
-            if os.path.exists(bindir):
-                add_path_entry(env, "PATH", bindir, append=False)
+
+            if not (
+                manifest and manifest.get("build", "disable_env_override_pkgconfig")
+            ):
+                pkgconfig = os.path.join(d, "lib/pkgconfig")
+                if os.path.exists(pkgconfig):
+                    add_path_entry(env, "PKG_CONFIG_PATH", pkgconfig)
+
+                pkgconfig = os.path.join(d, "lib64/pkgconfig")
+                if os.path.exists(pkgconfig):
+                    add_path_entry(env, "PKG_CONFIG_PATH", pkgconfig)
+
+            if not (manifest and manifest.get("build", "disable_env_override_path")):
+                add_path_entry(env, "CMAKE_PREFIX_PATH", d)
+
+                # Allow resolving shared objects built earlier (eg: zstd
+                # doesn't include the full path to the dylib in its linkage
+                # so we need to give it an assist)
+                if lib_path:
+                    for lib in ["lib", "lib64"]:
+                        libdir = os.path.join(d, lib)
+                        if os.path.exists(libdir):
+                            add_path_entry(env, lib_path, libdir)
+
+                # Allow resolving binaries (eg: cmake, ninja) and dlls
+                # built by earlier steps
+                if os.path.exists(bindir):
+                    add_path_entry(env, "PATH", bindir, append=False)
 
             # If rustc is present in the `bin` directory, set RUSTC to prevent
             # cargo uses the rustc installed in the system.
             if self.is_windows():
-                rustc_path = os.path.join(bindir, "rustc.bat")
-                rustdoc_path = os.path.join(bindir, "rustdoc.bat")
+                cargo_path = os.path.join(bindir, "cargo.exe")
+                rustc_path = os.path.join(bindir, "rustc.exe")
+                rustdoc_path = os.path.join(bindir, "rustdoc.exe")
             else:
+                cargo_path = os.path.join(bindir, "cargo")
                 rustc_path = os.path.join(bindir, "rustc")
                 rustdoc_path = os.path.join(bindir, "rustdoc")
 
             if os.path.isfile(rustc_path):
+                env["CARGO_BIN"] = cargo_path
                 env["RUSTC"] = rustc_path
                 env["RUSTDOC"] = rustdoc_path
+
+            openssl_include = os.path.join(d, "include/openssl")
+            if os.path.isdir(openssl_include) and any(
+                os.path.isfile(os.path.join(d, "lib", libcrypto))
+                for libcrypto in ("libcrypto.lib", "libcrypto.so", "libcrypto.a")
+            ):
+                # This must be the openssl library, let Rust know about it
+                env["OPENSSL_DIR"] = d
 
         return env
 
@@ -395,6 +413,13 @@ def setup_build_options(args, host_type=None):
                     temp = tempfile.gettempdir()
 
                 scratch_dir = os.path.join(temp, "fbcode_builder_getdeps-%s" % munged)
+                if not is_windows() and os.geteuid() == 0:
+                    # Running as root; in the case where someone runs
+                    # sudo getdeps.py install-system-deps
+                    # and then runs as build without privs, we want to avoid creating
+                    # a scratch dir that the second stage cannot write to.
+                    # So we generate a different path if we are root.
+                    scratch_dir += "-root"
 
         if not os.path.exists(scratch_dir):
             os.makedirs(scratch_dir)
@@ -412,7 +437,10 @@ def setup_build_options(args, host_type=None):
     # Make sure we normalize the scratch path.  This path is used as part of the hash
     # computation for detecting if projects have been updated, so we need to always
     # use the exact same string to refer to a given directory.
-    scratch_dir = os.path.realpath(scratch_dir)
+    # But! realpath in some combinations of Windows/Python3 versions can expand the
+    # drive substitutions on Windows, so avoid that!
+    if not is_windows():
+        scratch_dir = os.path.realpath(scratch_dir)
 
     host_type = _check_host_type(args, host_type)
 
@@ -424,4 +452,5 @@ def setup_build_options(args, host_type=None):
         num_jobs=args.num_jobs,
         use_shipit=args.use_shipit,
         vcvars_path=args.vcvars_path,
+        allow_system_packages=args.allow_system_packages,
     )

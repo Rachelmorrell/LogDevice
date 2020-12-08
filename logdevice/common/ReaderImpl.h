@@ -50,7 +50,7 @@ class ReaderImpl : public Reader {
                std::vector<std::unique_ptr<DataRecord>>* data_out,
                GapRecord* gap_out) override;
   void waitOnlyWhenNoData() override;
-  void setMonitoringTier(MonitoringTier tier) override;
+  void addMonitoringTag(std::string) override;
   void withoutPayload() override;
   void payloadHashOnly();
   void includeByteOffset() override;
@@ -58,6 +58,10 @@ class ReaderImpl : public Reader {
   int isConnectionHealthy(logid_t) const override;
   std::chrono::milliseconds getTimeout() const {
     return timeout_;
+  }
+
+  void setReaderName(const std::string& reader_name) override {
+    reader_name_ = reader_name;
   }
 
  public: // LogDevice-internally-public interface
@@ -364,7 +368,7 @@ class ReaderImpl : public Reader {
   // because we want every gap to wake blocking reads.
   std::atomic<int64_t> gap_count_{0};
 
-  MonitoringTier monitoring_tier_{MonitoringTier::MEDIUM_PRI};
+  std::set<std::string> monitoring_tags_{};
 
   // Maintain a few tidbids for each log being read from
   struct LogState {
@@ -418,6 +422,8 @@ class ReaderImpl : public Reader {
   std::chrono::steady_clock::time_point until_;
   size_t nrecords_;
   size_t nread_;
+
+  std::string reader_name_;
 
   // Initializes may_wait_ and until_.
   void read_initWaitParams();

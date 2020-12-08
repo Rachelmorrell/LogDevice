@@ -17,7 +17,7 @@ Implements cluster-specific operations.
 import asyncio
 import operator
 from collections import defaultdict
-from typing import Dict, FrozenSet, Optional, Tuple
+from typing import Dict, FrozenSet, Optional, Sequence, Set, Tuple, Union
 
 from ldops import admin_api
 from ldops.exceptions import NodeNotFoundError
@@ -37,11 +37,11 @@ from logdevice.admin.nodes.types import (
 from logdevice.common.types import LocationScope, NodeID
 
 
-DEFAULT_THRIFT_PORT = 6440
+DEFAULT_ADMIN_API_PORT = 6440
 
 
 async def get_cluster_by_hostname(
-    hostname: str, port: int = DEFAULT_THRIFT_PORT
+    hostname: str, port: int = DEFAULT_ADMIN_API_PORT
 ) -> Cluster:
     """
     Convenience method which automatically resolves given hostname and returns
@@ -164,6 +164,7 @@ async def get_cluster_view(client: AdminAPI) -> ClusterView:
     elif isinstance(maintenances_resp, Exception):
         raise maintenances_resp
     else:
+        # pyre-fixme[16]: `BaseException` has no attribute `maintenances`.
         maintenances = maintenances_resp.maintenances
 
     if isinstance(nodes_config_resp, Exception):
@@ -173,28 +174,54 @@ async def get_cluster_view(client: AdminAPI) -> ClusterView:
         raise nodes_state_resp
 
     return ClusterView(
+        # pyre-fixme[16]: `BaseException` has no attribute `nodes`.
         nodes_config=nodes_config_resp.nodes,
+        # pyre-fixme[16]: `BaseException` has no attribute `states`.
         nodes_state=nodes_state_resp.states,
         maintenances=maintenances,
     )
 
 
-async def group_nodes_by_scope(client: AdminAPI) -> Tuple[Tuple[NodeID, ...], ...]:
-    (replication_info, nodes_config) = await asyncio.gather(
-        admin_api.get_replication_info(client), admin_api.get_nodes_config(client)
-    )
-    scope = replication_info.tolerable_failure_domains.domain
+async def map_nodes_by_scope(
+    client: AdminAPI,
+    node_configs: Optional[Sequence[NodeConfig]] = None,
+    scope: Optional[LocationScope] = None,
+) -> Dict[str, Set[NodeID]]:
+    """Map NodeIDs by their location scopes.
+
+    Keys are an int if the location scope is set to NODE, otherwise string.
+
+    Args:
+        client (AdminAPI): AdminAPI instance.
+        node_configs (Optional[Sequence[NodeConfig]], optional): Node configs of
+            the tier. Defaults to None which means it will use admin_api.get_nodes_config.
+        scope (Optional[LocationScope], optional): LocationScope to group by.
+            Defaults to None eaning that the tier's ReplicationInfo.tolerable_failure_domains.domain
+            will be used.
+    """
+    if node_configs is None:
+        response = await admin_api.get_nodes_config(client)
+        node_configs = response.nodes
+    if scope is None:
+        rep_info = await admin_api.get_replication_info(client)
+        scope = rep_info.tolerable_failure_domains.domain
     ret = defaultdict(set)
 
-    for node_config in nodes_config.nodes:
+    for node_config in node_configs:
         # location_per_scope doesn't have NODE as a key, so we insert a
         # dummy value for the location, which is different for each node.
         # This is okay because we omit the name of the location from the
         # return value.
         if scope != LocationScope.NODE:
-            location = node_config.location_per_scope[scope]
+            location = ".".join(
+                node_config.location_per_scope.get(scope_kind, "")
+                for scope_kind in sorted(
+                    LocationScope, key=lambda x: x.value, reverse=True
+                )
+                if scope_kind.value >= scope.value
+            )
         else:
-            location = node_config.node_index
+            location = str(node_config.node_index)
 
         ret[location].add(
             NodeID(
@@ -204,12 +231,29 @@ async def group_nodes_by_scope(client: AdminAPI) -> Tuple[Tuple[NodeID, ...], ..
             )
         )
 
+    return ret
+
+
+async def group_nodes_by_scope(
+    client: AdminAPI,
+    node_configs: Optional[Sequence[NodeConfig]] = None,
+    scope: Optional[LocationScope] = None,
+) -> Tuple[Tuple[NodeID, ...], ...]:
+    """Deprecated wrapper for `map_nodes_by_scope`.
+
+    Returns results from `map_nodes_by_scope` as a tuple of tuples instead
+    without scope information and sorted by node index.
+    """
     return tuple(
         sorted(
             (
-                tuple(sorted(v, key=operator.attrgetter("node_index")))
-                for k, v in ret.items()
+                tuple(sorted(node_ids, key=operator.attrgetter("node_index")))
+                for node_ids in (
+                    await map_nodes_by_scope(
+                        client=client, node_configs=node_configs, scope=scope
+                    )
+                ).values()
             ),
-            key=lambda x: x[0].node_index,
+            key=lambda node_ids: node_ids[0].node_index,
         )
     )

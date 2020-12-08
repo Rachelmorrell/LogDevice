@@ -7,6 +7,9 @@
  */
 #include "logdevice/server/ServerSettings.h"
 
+#include <regex>
+#include <utility>
+
 #include <boost/program_options.hpp>
 #include <folly/String.h>
 
@@ -17,10 +20,42 @@ using namespace facebook::logdevice::setting_validators;
 
 namespace facebook { namespace logdevice {
 
+using ClientNetworkPriority =
+    configuration::nodes::NodeServiceDiscovery::ClientNetworkPriority;
+
 // maximum allowed number of storage threads to run
 #define STORAGE_THREADS_MAX 10000
 
+ServerSettings::NodesConfigTagMapT
+ServerSettings::parse_tags(const std::string& tags_string) {
+  if (tags_string.empty()) {
+    return {};
+  }
+
+  if (!std::regex_match(
+          tags_string, std::regex("[^,]+:[^,]*(,[^,]+:[^,]*)*"))) {
+    throw boost::program_options::error(
+        "Invalid tags list format. Expected list of key-value pairs, separated "
+        "by commas. Keys must not contain colons or commas and values can "
+        "contain anything but commas. Values can be empty, but keys must not. "
+        "Key-value pairs are specified as \"key:value\". Example: "
+        "key_1:value_1,key_2:,key_3:value_3");
+  }
+
+  NodesConfigTagMapT tags;
+  folly::StringPiece splitter(tags_string);
+
+  while (!splitter.empty()) {
+    folly::StringPiece key = splitter.split_step(':');
+    folly::StringPiece value = splitter.split_step(',');
+    tags[key.toString()] = value.toString();
+  }
+
+  return tags;
+}
+
 namespace {
+
 static void validate_storage_threads(const char* name, int value, int min) {
   if (value < min || value > STORAGE_THREADS_MAX) {
     char buf[1024];
@@ -68,6 +103,37 @@ static configuration::nodes::RoleSet parse_roles(const std::string& value) {
   return roles;
 }
 
+template <typename T, typename F>
+decltype(auto) parse_values_per_network_priority(const std::string& value,
+                                                 F func) {
+  std::map<ClientNetworkPriority, T> result;
+
+  if (value.empty()) {
+    return result;
+  }
+
+  std::vector<std::string> mapping_strs;
+  folly::split(",", value, mapping_strs);
+
+  for (const auto& mapping_str : mapping_strs) {
+    std::vector<std::string> kv_str;
+    folly::split(":", mapping_str, kv_str);
+
+    if (kv_str.size() != 2) {
+      throw boost::program_options::error(folly::sformat(
+          "Invalid network priority definition: {}", mapping_str));
+    }
+
+    auto priority = parse_network_priority(kv_str[0]);
+    if (!priority.has_value()) {
+      throw boost::program_options::error(
+          folly::sformat("Invalid network priority definition: {}", kv_str[0]));
+    }
+    result[priority.value()] = func(kv_str[1]);
+  }
+  return result;
+}
+
 static NodeLocation parse_location(const std::string& value) {
   auto loc = NodeLocation{};
   if (value.empty()) {
@@ -85,6 +151,25 @@ static NodeLocation parse_location(const std::string& value) {
 }
 
 } // namespace
+
+std::map<ClientNetworkPriority, int>
+ServerSettings::parse_ports_per_net_priority(const std::string& value) {
+  return parse_values_per_network_priority<int>(
+      value, [](const std::string& v) {
+        int port = std::stoi(v);
+        validate_port(port);
+        return port;
+      });
+}
+
+std::map<ClientNetworkPriority, std::string>
+ServerSettings::parse_unix_sockets_per_net_priority(const std::string& value) {
+  return parse_values_per_network_priority<std::string>(
+      value, [](const std::string& v) {
+        validate_unix_socket(v);
+        return v;
+      });
+}
 
 void ServerSettings::defineSettings(SettingEasyInit& init) {
   using namespace SettingFlag;
@@ -387,7 +472,7 @@ void ServerSettings::defineSettings(SettingEasyInit& init) {
      "Path for log file storing information about all trim point changes. "
      "For log rotation using logrotate send SIGHUP to process after rotation "
      "to reopen the log.",
-     SERVER | REQUIRES_RESTART,
+     SERVER | REQUIRES_RESTART | DEPRECATED,
      SettingsCategory::Security)
 
     ("connection-backlog", &connection_backlog, "2000",
@@ -514,6 +599,30 @@ void ServerSettings::defineSettings(SettingEasyInit& init) {
      SERVER | REQUIRES_RESTART,
      SettingsCategory::NodeRegistration)
 
+     ("client-thrift-api-unix-socket", &client_thrift_api_unix_socket, "", validate_unix_socket,
+     "[Only used when node self registration is enabled] Path to the Unix domain socket "
+     "the server will use to listen for incoming Thrift API requests from clients.",
+     SERVER | REQUIRES_RESTART | CLI_ONLY,
+     SettingsCategory::NodeRegistration)
+
+    ("client-thrift-api-port", &client_thrift_api_port, "0", validate_optional_port,
+     "[Only used when node self registration is enabled] TCP port the server will use to listen "
+     "for incoming Thrift API requests from clients. A value of zero disables client Thrift API.",
+     SERVER | REQUIRES_RESTART,
+     SettingsCategory::NodeRegistration)
+
+     ("server-thrift-api-unix-socket", &server_thrift_api_unix_socket, "", validate_unix_socket,
+     "[Only used when node self registration is enabled] Path to the Unix domain socket "
+     "the server will use to listen for incoming Thrift API requests from other servers.",
+     SERVER | REQUIRES_RESTART | CLI_ONLY,
+     SettingsCategory::NodeRegistration)
+
+    ("server-thrift-api-port", &server_thrift_api_port, "0", validate_optional_port,
+     "[Only used when node self registration is enabled] TCP port the server will use to listen "
+     "for incoming Thrift API requests from servers. A value of zero disables server Thrift API.",
+     SERVER | REQUIRES_RESTART,
+     SettingsCategory::NodeRegistration)
+
     ("roles", &roles, "sequencer,storage",
      parse_roles,
      "[Only used when node self registration is enabled] Defines whether the "
@@ -554,14 +663,52 @@ void ServerSettings::defineSettings(SettingEasyInit& init) {
      SERVER | REQUIRES_RESTART,
      SettingsCategory::NodeRegistration)
 
+    ("tags", &tags, "",
+     parse_tags,
+     "[Only used when node self registration is enabled] Tags to be associated with "
+     "this node. Tags are specified as a list of key-value pairs, separated by commas. "
+     "Keys must not contain colons or commas and values can contain anything but "
+     "commas. Values can be empty, but keys must not. Key-value pairs are specified "
+     "as \"key:value\". Example: key_1:value_1,key_2:,key_3:value_3.",
+     SERVER | REQUIRES_RESTART,
+     SettingsCategory::NodeRegistration)
+
     ("wipe-storage-when-storage-state-none",
      &wipe_storage_when_storage_state_none,
      "false",
      nullptr,
      "Allow wiping the local RocksDB store when its storage state is none",
+     SERVER | REQUIRES_RESTART | DEPRECATED,
+     SettingsCategory::Configuration)
+
+    ("use-tls-ticket-seeds",
+     &use_tls_ticket_seeds,
+     "false",
+     nullptr,
+     "If enabled, TLS tickets seed will be read and used to initiate TLS ticket encryption "
+     "keys. Once enabled, and all the servers share the same seeds file, they will all use the "
+     "same ticket encrpytion key, and they all can decrypt each others generated tickets "
+     "enabling clients to resume TLS sessions between all the servers in the same cluster.",
      SERVER | REQUIRES_RESTART,
      SettingsCategory::Configuration)
 
+    ("tls-ticket-seeds-path",
+     &tls_ticket_seeds_path,
+     "",
+     nullptr,
+     "The path to the TLS ticket seed file, only useful when use-tls-ticket-seeds is set. Read "
+     "TLSCredProcessor::processTLSTickets to understand the format of the seed.",
+     SERVER | REQUIRES_RESTART,
+     SettingsCategory::Configuration)
+
+    ("enable-dscp-reflection",
+     &enable_dscp_reflection,
+     "true",
+     nullptr,
+     "If enabled, server will use DSCP TypeOfService used by client for communicationo"
+     "If disabled, server will use default DSCP value ",
+     SERVER | REQUIRES_RESTART,
+     SettingsCategory::Network)
     ;
   // clang-format on
 
@@ -573,6 +720,30 @@ void ServerSettings::defineSettings(SettingEasyInit& init) {
        "commands that are only enabled for testing purposes.",
        SERVER | CLI_ONLY | REQUIRES_RESTART,
        SettingsCategory::Execution);
-}
 
+  init("unix-addresses-per-network-priority",
+       &unix_addresses_per_network_priority,
+       "",
+       ServerSettings::parse_unix_sockets_per_net_priority,
+       "[Only used when node self registration is enabled] Unix socket "
+       "addresses ports for each network priority. Format is: "
+       "\"<priorityA>:<path-to-socket>,<priorityB>:<path-to-socket>,...\" "
+       "where <priorityX> is "
+       "one of \"low\", \"medium\" and \"high\". Example: "
+       "\"low:/tmp/socket_A,medium:/tmp/socket_B\"",
+       SERVER | REQUIRES_RESTART,
+       SettingsCategory::NodeRegistration);
+
+  init("ports-per-network-priority",
+       &ports_per_network_priority,
+       "",
+       ServerSettings::parse_ports_per_net_priority,
+       "[Only used when node self registration is enabled] TCP ports for each "
+       "network priority. Format is: "
+       "\"<priorityA>:<portA>,<priorityB>:<portB>,...\" where <priorityX> is "
+       "one of "
+       "\"low\", \"medium\" and \"high\". Example: \"low:7440,medium:5440\"",
+       SERVER | REQUIRES_RESTART,
+       SettingsCategory::NodeRegistration);
+}
 }} // namespace facebook::logdevice

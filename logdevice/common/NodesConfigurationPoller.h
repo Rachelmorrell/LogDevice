@@ -12,6 +12,7 @@
 #include <folly/Optional.h>
 
 #include "logdevice/common/ObjectPoller.h"
+#include "logdevice/common/RandomNodeSelector.h"
 #include "logdevice/common/WorkerCallbackHelper.h"
 #include "logdevice/common/configuration/nodes/NodesConfiguration.h"
 #include "logdevice/common/configuration/nodes/NodesConfigurationStore.h"
@@ -21,7 +22,11 @@ namespace facebook { namespace logdevice {
 class ClusterState;
 
 // an instantiation of ObjectPoller which can be used to poll NodesConfiguration
-// updates from existing server nodes in NodesConfiguration
+// updates from existing server nodes in NodesConfiguration.
+// If the same seed is provided to the NodesConfigurationPoller, the same set of
+// servers will be picked for the polling round. This can be used to implement
+// stickiness in the polling set.
+
 class NodesConfigurationPoller {
  public:
   struct NodeResponse {
@@ -49,6 +54,7 @@ class NodesConfigurationPoller {
       Poller::Options options,
       VersionExtFn version_fn,
       Callback cb,
+      folly::Optional<u_int32_t> node_order_seed,
       folly::Optional<Version> conditional_base_version = {});
   virtual ~NodesConfigurationPoller() {}
 
@@ -78,6 +84,14 @@ class NodesConfigurationPoller {
   // (e.g., NodesConfigurationInit). If so, conditional polling will be disabled
   virtual bool isBootstrapping() const;
 
+  virtual RandomNodeSelector::NodeSourceSet
+  buildPollingSet(const NodeSourceSet& candidates,
+                  const NodeSourceSet& existing,
+                  const NodeSourceSet& blacklist,
+                  const NodeSourceSet& graylist,
+                  size_t num_required,
+                  size_t num_extras);
+
  private:
   Poller::Options options_;
   VersionExtFn version_fn_;
@@ -89,6 +103,10 @@ class NodesConfigurationPoller {
 
   // used to re-route the ConfigurationFetchRequest result callback
   WorkerCallbackHelper<NodesConfigurationPoller> callback_helper_;
+
+  // We have one seed per ServerBasedNodesConfigurationManager instance to
+  // ensure total ordering among nodes to be picked for fetching config
+  folly::Optional<u_int32_t> node_order_seed_;
 
   std::unique_ptr<Poller> createPoller();
 

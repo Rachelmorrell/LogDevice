@@ -11,6 +11,7 @@
 #include <string>
 
 #include <folly/Optional.h>
+#include <folly/container/F14Map.h>
 
 #include "logdevice/common/AuthoritativeStatus.h"
 #include "logdevice/common/SCDCopysetReordering.h"
@@ -18,6 +19,7 @@
 #include "logdevice/common/Sockaddr.h"
 #include "logdevice/common/StorageTask-enums.h"
 #include "logdevice/common/configuration/NodeLocation.h"
+#include "logdevice/common/if/gen-cpp2/common_types.h"
 #include "logdevice/common/protocol/MessageType.h"
 #include "logdevice/common/settings/ClientReadStreamFailureDetectorSettings.h"
 #include "logdevice/common/settings/Durability.h"
@@ -58,6 +60,7 @@ struct StorageTaskShare {
 };
 
 struct Settings : public SettingsBundle {
+  using ClientNetworkPriority = logdevice::thrift::ClientNetworkPriority;
   const char* getName() const override {
     return "ProcessorSettings";
   }
@@ -217,6 +220,12 @@ struct Settings : public SettingsBundle {
   // per socket-health-check-period because their throughput dropped below
   // expected value.
   size_t rate_limit_socket_closed;
+
+  // How long client will keep inactive connection to the server. If zero it
+  // will not attempt to close automatically.
+  std::chrono::milliseconds idle_connection_keep_alive;
+  // Limits the number of idle connections closed during single check
+  size_t rate_limit_idle_connection_closed;
 
   // How many kilobytes of RECORD messages the delivery code tries to push
   // to the client at once.  If -1, use the TCP sendbuf size.
@@ -672,6 +681,13 @@ struct Settings : public SettingsBundle {
   // publishing samples (for improved debuggability).
   double client_readers_flow_tracer_unhealthy_publish_weight;
 
+  // (client-only settting) Map that establishes the maximum acceptable time lag
+  // for each monitoring tag. A reader that passes the maximum acceptable time
+  // lag will be considered unhealthy for the purpose of increasing weight when
+  // pushing samples.
+  folly::F14FastMap<std::string, std::chrono::milliseconds>
+      client_readers_flow_max_acceptable_time_lag_per_tag;
+
   // (client-only setting) If set, skips remote preemption checks (aka CHECK
   // SEALs) on GSSs issued by ClientReadersFlowTracer.
   // TODO (T62032903): Remove this setting once we validate
@@ -724,7 +740,7 @@ struct Settings : public SettingsBundle {
   bool enable_sticky_copysets;
 
   // if true, all records will have the copyset index written for them
-  bool write_copyset_index;
+  bool write_copyset_index_DEPRECATED;
 
   // CopySetSelector manager - sticky copyset block size
   size_t sticky_copysets_block_size;
@@ -831,6 +847,11 @@ struct Settings : public SettingsBundle {
   // the root znodes should be created by external tooling.
   bool zk_create_root_znodes;
 
+  // If set, epoch stores will double write any data it modifies to its
+  // corresponding znode and the data serialized with the new serialization
+  // format to the parent znode.
+  bool epoch_store_double_write_new_serialization_format;
+
   // Maximum amount of memory that can be allocated by read storage tasks.
   size_t read_storage_tasks_max_mem_bytes;
 
@@ -850,6 +871,10 @@ struct Settings : public SettingsBundle {
 
   // TTL for the cert loaded from file
   std::chrono::seconds ssl_cert_refresh_interval;
+
+  // If enabled, new SSL connections will attempt to resume previously cached
+  // sessions.
+  bool ssl_use_session_resumption;
 
   // Sets the boundary which triggers enabling SSL. Communication that crosses
   // this boundary will be encrypted; communication that doesn't will not.
@@ -890,10 +915,6 @@ struct Settings : public SettingsBundle {
   // guarantee eventual delivery even when suffering from very unlikely issues,
   // it is reasonable to keep it as high as 5min.
   std::chrono::milliseconds scd_all_send_all_timeout;
-
-  // (client-only setting) Default namespace to use on the client. This will
-  // be used for any client functions that take log group name as a parameter.
-  std::string default_log_namespace;
 
   // Time interval that ConfigurationUpdatedRequest would retry sending
   // CONFIG_CHANGED messages after it got NOBUFS.
@@ -1005,6 +1026,8 @@ struct Settings : public SettingsBundle {
   // Sequencer batching flushes buffered appends for a log when the oldest
   // buffered append is this old.  See BufferedWriter::Options.
   std::chrono::milliseconds sequencer_batching_time_trigger;
+
+  std::chrono::milliseconds socket_batching_time_trigger;
 
   // DEPRECATED! Corresponding log attribute should be used instead.
   // Sequencer batching flushes buffered appends for a log when the total
@@ -1149,6 +1172,17 @@ struct Settings : public SettingsBundle {
 
   // Default DSCP value for client sockets at the Sender.
   uint8_t client_dscp_default;
+
+  // Sets the default client network priority. This setting might cause clients
+  // to connect to alternative server ports associated with particular network
+  // priorities. Value must be one of 'low','medium', or 'high.
+  folly::Optional<ClientNetworkPriority> client_default_network_priority;
+
+  // Feature gate setting for allowing port-based QoS / connections per network
+  // priority. If disabled, all addresses will resolve to the
+  // default_data_address listed in nodes configuration. Note that this feature
+  // does not apply to connections between servers, only client to server.
+  bool enable_port_based_qos;
 
   // Disable trimming the event log.
   bool disable_event_log_trimming;
@@ -1469,6 +1503,13 @@ struct Settings : public SettingsBundle {
   std::chrono::milliseconds metadata_log_trim_interval;
   // Time interval after which trim request is considered to be timed out
   std::chrono::milliseconds metadata_log_trim_timeout;
+
+  // Number of transient error retries for the zookeeper versioned config store.
+  int zk_vcs_max_retries;
+
+  // Used for isolation testing. Only nodes in this set will be addressable
+  // from this node.
+  std::vector<node_index_t> test_same_partition_nodes;
 
  protected:
   // Only UpdateableSettings can create this bundle to ensure defaults are

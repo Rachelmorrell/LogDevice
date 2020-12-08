@@ -7,6 +7,7 @@
  */
 
 namespace cpp2 facebook.logdevice.thrift
+namespace go logdevice.admin.if.settings
 namespace py3 logdevice.admin
 namespace php LogDevice
 namespace wiki Thriftdoc.LogDevice.Settings
@@ -48,4 +49,28 @@ struct SettingsRequest {
    * Get all settings if left empty
    */
   1: optional set<string> settings;
+}
+
+struct ApplySettingOverrideRequest {
+  /*
+   * The setting name. See https://logdevice.io/docs/Settings.html for a list
+   * of available settings.
+   */
+  1: string name,
+  /*
+   * The setting value
+   */
+  2: string value,
+  /*
+   * The TTL for the setting expiration
+   */
+  3: i32 ttl_seconds,
+}
+
+struct RemoveSettingOverrideRequest {
+  /*
+   * The setting name. See https://logdevice.io/docs/Settings.html for a list
+   * of available settings.
+   */
+  1: string name,
 }

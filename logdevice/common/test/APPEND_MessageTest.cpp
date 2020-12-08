@@ -90,13 +90,6 @@ class APPEND_MessageTest : public ::testing::Test {
       : settings_(create_default_settings<Settings>()),
         processor_(make_test_processor(settings_)) {
     // build a Configuration object and use it to initialize a Sequencer
-    Configuration::Node node;
-    node.address = Sockaddr("127.0.0.1", "20034");
-    node.gossip_address = Sockaddr("127.0.0.1", "20035");
-    node.generation = 1;
-    node.addStorageRole();
-    Configuration::NodesConfig nodes({{0, std::move(node)}});
-
     auto log_attrs = logsconfig::LogAttributes().with_replicationFactor(1);
     auto logs_config = std::make_unique<configuration::LocalLogsConfig>();
     logs_config->insert(boost::icl::right_open_interval<logid_t::raw_type>(
@@ -109,8 +102,9 @@ class APPEND_MessageTest : public ::testing::Test {
     ml_config.sequencers_provision_epoch_store = false;
     ml_config.sequencers_write_metadata_logs = false;
     config_ = std::make_shared<Configuration>(
-        ServerConfig::fromDataTest(__FILE__, nodes, std::move(ml_config)),
-        std::move(logs_config));
+        ServerConfig::fromDataTest(__FILE__, std::move(ml_config)),
+        std::move(logs_config),
+        createSimpleNodesConfig(1));
 
     settings_.enable_sticky_copysets = true;
 
@@ -216,6 +210,7 @@ class MockAppenderPrep : public AppenderPrep {
   RateLimiter* limiter_{nullptr};
   bool can_activate_{true};
   NodeID my_node_id_;
+  bool is_client_connected_{true};
   // if set, next call to runAppender() returns this value instead of proxying
   // it to Sequencer
   folly::Optional<Status> next_status_;
@@ -337,6 +332,9 @@ class MockAppenderPrep : public AppenderPrep {
   const PrincipalIdentity* getPrincipal() override {
     return &owner_->principal_;
   }
+  bool isClientConnected() const {
+    return is_client_connected_;
+  }
   void isAllowed(std::shared_ptr<PermissionChecker> permission_checker,
                  const PrincipalIdentity& principal,
                  callback_func_t cb) override {
@@ -440,7 +438,8 @@ class APPEND_MessageTest_MockAppender : public Appender {
   STORE_flags_t passthru_flags(STORE_flags_t flags) {
     return flags &
         (APPEND_Header::CHECKSUM | APPEND_Header::CHECKSUM_64BIT |
-         APPEND_Header::CHECKSUM_PARITY | APPEND_Header::BUFFERED_WRITER_BLOB);
+         APPEND_Header::CHECKSUM_PARITY | APPEND_Header::BUFFERED_WRITER_BLOB |
+         APPEND_Header::PAYLOAD_GROUP);
   }
 };
 using MockAppender = APPEND_MessageTest_MockAppender;
@@ -540,6 +539,19 @@ TEST_F(APPEND_MessageTest, Basic) {
     // N2 is boycotted
     prep->execute(std::move(a));
     ASSERT_RUNNING(prep, {raw});
+  }
+  {
+    std::unique_ptr<Appender> a(new MockAppender);
+    auto prep = create(log1);
+    prep->my_node_id_ = N1;
+    prep->setSequencer(log1, N1);
+    prep->setAlive({N1, N2});
+    prep->is_client_connected_ = false;
+
+    // Since client is disconnected, we do not expect
+    // a running appender
+    prep->execute(std::move(a));
+    ASSERT_EQ(0, prep->running_appenders_.size());
   }
 }
 

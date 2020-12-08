@@ -18,6 +18,7 @@
 
 #include <folly/Format.h>
 #include <folly/Singleton.h>
+#include <folly/synchronization/HazptrThreadPoolExecutor.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 
@@ -392,19 +393,6 @@ std::string toString(const KeyType& type) {
   return "UNEXPECTED_KEYTYPE";
 }
 
-std::string toString(MonitoringTier tier) {
-  switch (tier) {
-    case MonitoringTier::HIGH_PRI:
-      return "HIGH_PRI";
-    case MonitoringTier::MEDIUM_PRI:
-      return "MEDIUM_PRI";
-    case MonitoringTier::LOW_PRI:
-      return "LOW_PRI";
-    default:
-      return "UNDEFINED_TIER";
-  }
-}
-
 std::string compressionToString(Compression c) {
   switch (c) {
     case Compression::NONE:
@@ -570,6 +558,8 @@ std::string get_username(bool effective) {
 
 void logdeviceInit() {
   folly::SingletonVault::singleton()->registrationComplete();
+
+  folly::enable_hazptr_thread_pool_executor();
 
   // Ignore SIGPIPE.
   struct sigaction sa;

@@ -100,6 +100,12 @@ class ClientImpl : public Client,
              AppendAttributes attrs = AppendAttributes(),
              std::chrono::milliseconds* timestamp = nullptr) noexcept override;
 
+  lsn_t
+  appendSync(logid_t logid,
+             PayloadGroup&& payload_group,
+             AppendAttributes attrs = AppendAttributes(),
+             std::chrono::milliseconds* timestamp = nullptr) noexcept override;
+
   int append(logid_t logid,
              std::string payload,
              append_callback_t cb,
@@ -107,6 +113,11 @@ class ClientImpl : public Client,
 
   int append(logid_t logid,
              const Payload& payload,
+             append_callback_t cb,
+             AppendAttributes attrs = AppendAttributes()) noexcept override;
+
+  int append(logid_t logid,
+             PayloadGroup&& payload_group,
              append_callback_t cb,
              AppendAttributes attrs = AppendAttributes()) noexcept override;
 
@@ -119,6 +130,13 @@ class ClientImpl : public Client,
 
   int append(logid_t logid,
              const Payload& payload,
+             append_callback_t cb,
+             AppendAttributes attrs,
+             worker_id_t target_worker,
+             std::unique_ptr<std::string> per_request_token);
+
+  int append(logid_t logid,
+             PayloadGroup&& payload_group,
              append_callback_t cb,
              AppendAttributes attrs,
              worker_id_t target_worker,
@@ -444,6 +462,8 @@ class ClientImpl : public Client,
 
   void setAppendErrorInjector(folly::Optional<AppendErrorInjector> injector);
 
+  // Verifies payload and creates request for appending encoded payload.
+  // Returns nullptr in case of failure
   std::unique_ptr<AppendRequest>
   prepareRequest(logid_t logid,
                  PayloadHolder&& payload,
@@ -451,6 +471,23 @@ class ClientImpl : public Client,
                  AppendAttributes attrs,
                  worker_id_t target_worker,
                  std::unique_ptr<std::string> per_request_token);
+  std::unique_ptr<AppendRequest>
+  prepareRequest(logid_t logid,
+                 PayloadGroup&& payload_group,
+                 append_callback_t cb,
+                 AppendAttributes attrs,
+                 worker_id_t target_worker,
+                 std::unique_ptr<std::string> per_request_token);
+
+  // Creates append request with specified payload without performing payload
+  // validation
+  std::unique_ptr<AppendRequest>
+  createRequest(logid_t logid,
+                PayloadHolder&& payload,
+                append_callback_t cb,
+                AppendAttributes attrs,
+                worker_id_t target_worker,
+                std::unique_ptr<std::string> per_request_token);
 
   // Proxy for Processor::postRequest() with careful error handling
   int postAppend(std::unique_ptr<AppendRequest> req);

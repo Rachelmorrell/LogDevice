@@ -22,14 +22,13 @@ ExternalProject_Add(fbthrift
         -Denable_tests=OFF
         -DCXX_STD=gnu++17
         -DCMAKE_CXX_STANDARD=17
-    INSTALL_COMMAND make install DESTDIR=${LOGDEVICE_STAGING_DIR}
+    INSTALL_COMMAND $(MAKE) install DESTDIR=${LOGDEVICE_STAGING_DIR}
     )
 
 ExternalProject_Get_Property(fbthrift SOURCE_DIR)
 ExternalProject_Get_Property(fbthrift BINARY_DIR)
 
-ExternalProject_Add_StepDependencies(fbthrift configure folly wangle
-  rsocket fmt)
+ExternalProject_Add_StepDependencies(fbthrift configure folly wangle fmt)
 
 # The following settings are required by ThriftLibrary.cmake; to create rules
 # for thrift compilation:
@@ -41,18 +40,14 @@ set(THRIFT1 ${BINARY_DIR}/bin/thrift1)
 set(FBTHRIFT_LIBRARIES
     ${BINARY_DIR}/lib/libprotocol.so
     ${BINARY_DIR}/lib/libthriftcpp2.so
-    ${BINARY_DIR}/lib/libcompiler_ast.so
     ${BINARY_DIR}/lib/libtransport.so
     ${BINARY_DIR}/lib/libthriftfrozen2.so
-    ${BINARY_DIR}/lib/libcompiler_generators.so
-    ${BINARY_DIR}/lib/libcompiler_lib.so
-    ${BINARY_DIR}/lib/libmustache_lib.so
     ${BINARY_DIR}/lib/libasync.so
     ${BINARY_DIR}/lib/libthrift-core.so
-    ${BINARY_DIR}/lib/libcompiler_base.so
     ${BINARY_DIR}/lib/libthriftprotocol.so
     ${BINARY_DIR}/lib/libconcurrency.so
     ${BINARY_DIR}/lib/libthriftmetadata.so
+    ${BINARY_DIR}/lib/librpcmetadata.so
 )
 
 set(FBTHRIFT_INCLUDE_DIR

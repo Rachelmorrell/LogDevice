@@ -27,8 +27,9 @@ from logdevice.common.types import SocketAddress, SocketAddressFamily
 from logdevice.ldquery import LDQuery
 from nubia import context, exceptions
 from nubia.internal.io.eventbus import Message
+from nubia.internal.io.session_logger import SessionLogger
 from pygments.token import Token
-from termcolor import colored, cprint
+from termcolor import cprint
 from thrift.py3 import get_client as create_thrift_client
 
 
@@ -39,6 +40,7 @@ class LDShellContext(context.Context):
         self._config_file = None
         self._temp_config_path = None
         self._cluster_name = None
+        self._session_logger = None
         # Reset all cache variables
         self._reset()
 
@@ -80,6 +82,10 @@ class LDShellContext(context.Context):
         else:
             self._admin_server_address = None
         self._set_log_level(args.loglevel)
+        if not args.disable_session_logging:
+            self._session_logger = SessionLogger(
+                tempfile.NamedTemporaryFile(mode="w+", prefix="ldshell-session-")
+            )
 
     def _set_admin_server_socket_address(self, address):
         """
@@ -124,11 +130,8 @@ class LDShellContext(context.Context):
     async def _fetch_config(self) -> None:
         config = await self.get_config_contents()
         self._config_file = tempfile.NamedTemporaryFile()
-        # pyre-ignore
         self._config_file.write(config)
-        # pyre-ignore
         self._config_file.flush()
-        # pyre-ignore
         self._temp_config_path = self._config_file.name
         logging.info("Config downloaded and stored in %s", self._temp_config_path)
 
@@ -137,8 +140,7 @@ class LDShellContext(context.Context):
             self._cluster_name = await client.getClusterName()
 
     def _initialize_after_connected(self) -> None:
-        """
-        """
+        """"""
         loop = asyncio.get_event_loop()
         loop.run_until_complete(self._fetch_config())
         loop.run_until_complete(self._fetch_cluster_name())
@@ -273,3 +275,6 @@ class LDShellContext(context.Context):
             ]
 
         return tokens
+
+    def get_session_logger(self):
+        return self._session_logger

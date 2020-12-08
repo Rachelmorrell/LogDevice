@@ -7,6 +7,8 @@
  */
 #pragma once
 
+#include <string>
+
 #include "logdevice/common/SerializableData.h"
 #include "logdevice/common/Worker.h"
 #include "logdevice/include/Err.h"
@@ -17,7 +19,11 @@ namespace facebook { namespace logdevice {
 
 // Header of a snapshot record.
 struct RSMSnapshotHeader : public SerializableData {
-  enum Version { BASE_VERSION = 0, CONTAINS_DELTA_LOG_READ_PTR_AND_LENGTH = 1 };
+  enum Version {
+    BASE_VERSION = 0,
+    CONTAINS_DELTA_LOG_READ_PTR_AND_LENGTH = 1,
+    CONTAINS_NODE_METADATA = 2
+  };
 
   uint32_t format_version; // current snapshot header version
   uint32_t flags;          // unused, might be handy in the future.
@@ -35,14 +41,17 @@ struct RSMSnapshotHeader : public SerializableData {
                     uint64_t byte_offset,
                     uint64_t offset,
                     lsn_t base_version,
-                    lsn_t delta_log_read_ptr = 0)
+                    lsn_t delta_log_read_ptr = 0,
+                    std::string node_info = "")
       : format_version(format_version),
         flags(flags),
         byte_offset(byte_offset),
         offset(offset),
         base_version(base_version),
-        length(computeLengthInBytes(*this)),
-        delta_log_read_ptr(delta_log_read_ptr) {}
+        delta_log_read_ptr(delta_log_read_ptr),
+        node_info_(std::move(node_info)) {
+    length = computeLengthInBytes(*this);
+  }
 
   // If this flag is set, use ZSTD to compress / decompress the snapshot
   // payload.
@@ -91,6 +100,14 @@ struct RSMSnapshotHeader : public SerializableData {
   bool operator==(const RSMSnapshotHeader&) const;
 
   std::string describe() const;
+
+  void setNodeInfo(std::string node_info);
+  const std::string& getNodeInfo() const;
+
+ private:
+  std::string node_info_; // metadata of the node running the RSM
+                          // made private to control its updation as it affects
+                          // the length of the header field
 };
 
 }} // namespace facebook::logdevice

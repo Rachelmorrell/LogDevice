@@ -8,7 +8,6 @@
 #include "logdevice/common/RecipientSet.h"
 
 #include "logdevice/common/Appender.h"
-#include "logdevice/common/Sender.h"
 #include "logdevice/common/protocol/STORE_Message.h"
 
 namespace facebook { namespace logdevice {
@@ -105,13 +104,6 @@ void RecipientSet::getReleaseSet(copyset_custsz_t<4>& out) {
   out.resize(stored_);
   for (copyset_size_t i = 0; i < stored_; i++) {
     out[i] = recipients_[i].getShardID();
-  }
-}
-
-void RecipientSet::getDeleteSet(copyset_custsz_t<4>& out) {
-  out.resize(recipients_.size() - stored_);
-  for (copyset_size_t i = stored_; i < recipients_.size(); i++) {
-    out[i - stored_] = recipients_[i].getShardID();
   }
 }
 

@@ -8,12 +8,14 @@
 
 #include "logdevice/admin/AdminAPIUtils.h"
 
+#include <folly/container/F14Map.h>
 #include <gtest/gtest.h>
 
 #include "logdevice/admin/Conv.h"
 
-using namespace facebook::logdevice;
 using namespace facebook::logdevice::configuration::nodes;
+
+namespace facebook::logdevice {
 
 namespace {
 
@@ -27,18 +29,30 @@ const std::string kTestDomainString = "test.domain.string.five.scopes";
 const node_index_t kTestNodeIndex = 1337;
 const node_index_t kAnotherTestNodeIndex = 1007;
 const in_port_t kTestDataPort = 4440;
+const in_port_t kTestMediumPriorityPort = 4447;
 const in_port_t kTestGossipPort = 4441;
 const in_port_t kTestServerToServerPort = 4442;
 const in_port_t kTestSslPort = 4443;
+const in_port_t kTestClientThriftApiPort = 7440;
+const in_port_t kTestServerThriftApiPort = 7441;
 const in_port_t kTestAdminPort = 6440;
 const Sockaddr kTestSocketAddress = Sockaddr{kTestAddress, kTestDataPort};
 const Sockaddr kTestGossipSocketAddress =
     Sockaddr{kTestAddress, kTestGossipPort};
 const Sockaddr kTestServerToServerSocketAddress =
     Sockaddr{kTestAddress, kTestServerToServerPort};
+const Sockaddr kTestServerThriftApiSocketAddress =
+    Sockaddr{kTestAddress, kTestServerThriftApiPort};
+const Sockaddr kTestClientThriftApiSocketAddress =
+    Sockaddr{kTestAddress, kTestClientThriftApiPort};
+const folly::F14FastMap<NodeServiceDiscovery::ClientNetworkPriority, Sockaddr>
+    kTestAddressesPerNetworkPriority{
+        {NodeServiceDiscovery::ClientNetworkPriority::MEDIUM,
+         Sockaddr{kTestAddress, kTestMediumPriorityPort}}};
+
 const Sockaddr kTestSslSocketAddress = Sockaddr{kTestAddress, kTestSslPort};
 const Sockaddr kTestAdminSocketAddress = Sockaddr{kTestAddress, kTestAdminPort};
-const uint64_t kTestUpdateVersion = 3147;
+const uint64_t kTestNodeVersion = 3147;
 const NodeLocation kTestNodeLocation =
     locationFromDomainString(kTestDomainString);
 
@@ -87,7 +101,7 @@ TEST(AdminAPIUtilsTest, MatchNodeByIndex) {
 
 TEST(AdminAPIUtilsTest, MatchNodeByAddressIpV4) {
   NodeServiceDiscovery nodeServiceDiscovery;
-  nodeServiceDiscovery.address = kTestSocketAddress;
+  nodeServiceDiscovery.default_client_data_address = kTestSocketAddress;
 
   thrift::NodeID thriftNodeId;
 
@@ -103,7 +117,8 @@ TEST(AdminAPIUtilsTest, MatchNodeByAddressIpV4) {
 TEST(AdminAPIUtilsTest, MatchNodeByAddressIpV6WithCompression) {
   std::string compressedV6Address = "2001:4860:4860::8888";
   NodeServiceDiscovery nodeServiceDiscovery;
-  nodeServiceDiscovery.address = Sockaddr{compressedV6Address, kTestDataPort};
+  nodeServiceDiscovery.default_client_data_address =
+      Sockaddr{compressedV6Address, kTestDataPort};
 
   std::string uncompressedV6Address = "2001:4860:4860:0000:0000:0000:0000:8888";
   thrift::NodeID thriftNodeId;
@@ -116,7 +131,7 @@ TEST(AdminAPIUtilsTest, MatchNodeByAddressIpV6WithCompression) {
 
 TEST(AdminAPIUtilsTest, MatchNodeByAddressUnixSocket) {
   NodeServiceDiscovery nodeServiceDiscovery;
-  nodeServiceDiscovery.address = Sockaddr{kTestUnixPath};
+  nodeServiceDiscovery.default_client_data_address = Sockaddr{kTestUnixPath};
 
   thrift::SocketAddress thriftSocketAddress;
   thriftSocketAddress.set_address(kTestUnixPath);
@@ -143,7 +158,8 @@ TEST(AdminAPIUtilsTest, MatchByNameAndIndex) {
 TEST(AdminAPIUtilsTest, EmptyIDMatchesAnything) {
   NodeServiceDiscovery nodeServiceDiscovery;
   nodeServiceDiscovery.name = kTestNodeName;
-  nodeServiceDiscovery.address = Sockaddr{kTestAddress, kTestDataPort};
+  nodeServiceDiscovery.default_client_data_address =
+      Sockaddr{kTestAddress, kTestDataPort};
 
   thrift::NodeID thriftNodeId;
 
@@ -151,26 +167,36 @@ TEST(AdminAPIUtilsTest, EmptyIDMatchesAnything) {
       nodeMatchesID(kTestNodeIndex, nodeServiceDiscovery, thriftNodeId));
 
   // Also matches any unix path
-  nodeServiceDiscovery.address = Sockaddr{kTestUnixPath};
+  nodeServiceDiscovery.default_client_data_address = Sockaddr{kTestUnixPath};
   EXPECT_TRUE(
       nodeMatchesID(kTestNodeIndex, nodeServiceDiscovery, thriftNodeId));
 }
 
 TEST(AdminAPIUtilsTest, FillNodeConfigPopulatesAllFields) {
+  using ClientNetworkPriority =
+      configuration::nodes::NodeServiceDiscovery::ClientNetworkPriority;
+
   // Build an input NodesConfiguration instance
   RoleSet roleSet;
   roleSet.set(static_cast<uint8_t>(NodeRole::STORAGE));
   roleSet.set(static_cast<uint8_t>(NodeRole::SEQUENCER));
 
+  const NodeServiceDiscovery::TagMap tagMap = {
+      {"test_key_1", "value_1"}, {"key_2", "value_2"}};
+
   NodeServiceDiscovery nodeServiceDiscovery{kTestNodeName,
-                                            kTestUpdateVersion,
+                                            kTestNodeVersion,
                                             kTestSocketAddress,
                                             kTestGossipSocketAddress,
                                             kTestSslSocketAddress,
                                             kTestAdminSocketAddress,
                                             kTestServerToServerSocketAddress,
+                                            kTestServerThriftApiSocketAddress,
+                                            kTestClientThriftApiSocketAddress,
+                                            kTestAddressesPerNetworkPriority,
                                             kTestNodeLocation,
-                                            std::move(roleSet)};
+                                            std::move(roleSet),
+                                            tagMap};
 
   ServiceDiscoveryConfig::NodeUpdate nodeUpdate{
       ServiceDiscoveryConfig::UpdateType::PROVISION,
@@ -198,13 +224,26 @@ TEST(AdminAPIUtilsTest, FillNodeConfigPopulatesAllFields) {
   otherAddresses.set_admin(toThrift(kTestAdminSocketAddress));
   otherAddresses.set_server_to_server(
       toThrift(kTestServerToServerSocketAddress));
+  otherAddresses.set_server_thrift_api(
+      toThrift(kTestServerThriftApiSocketAddress));
+  otherAddresses.set_client_thrift_api(
+      toThrift(kTestClientThriftApiSocketAddress));
+
+  std::map<ClientNetworkPriority, thrift::SocketAddress> addresses_per_priority;
+  for (auto& [priority, address] : kTestAddressesPerNetworkPriority) {
+    addresses_per_priority[priority] = toThrift(address);
+  }
+  otherAddresses.set_addresses_per_priority(std::move(addresses_per_priority));
+
   expected.set_other_addresses(std::move(otherAddresses));
 
   expected.set_location(kTestDomainString);
   expected.set_location_per_scope(
       toThrift<thrift::Location>(folly::make_optional(kTestNodeLocation)));
-  expected.roles.emplace(thrift::Role::STORAGE);
-  expected.roles.emplace(thrift::Role::SEQUENCER);
+
+  expected.roles_ref()->emplace(thrift::Role::STORAGE);
+  expected.roles_ref()->emplace(thrift::Role::SEQUENCER);
+  expected.tags_ref()->insert(tagMap.begin(), tagMap.end());
 
   // Test
   thrift::NodeConfig actual;
@@ -212,3 +251,5 @@ TEST(AdminAPIUtilsTest, FillNodeConfigPopulatesAllFields) {
 
   EXPECT_EQ(expected, actual);
 }
+
+} // namespace facebook::logdevice

@@ -10,6 +10,7 @@
 #include <folly/io/SocketOptionMap.h>
 #include <folly/io/async/AsyncSocket.h>
 #include <folly/io/async/DelayedDestruction.h>
+#include <folly/ssl/SSLSession.h>
 
 #include "logdevice/common/checks.h"
 #include "logdevice/common/debug.h"
@@ -212,9 +213,9 @@ class AsyncSocketAdapter : public SocketAdapter {
   folly::NetworkSocket getNetworkSocket() const override;
 
   /**
-   * Get the peer certificate information if any
+   * Get the SSL object associated with socket if any.
    */
-  const folly::AsyncTransportCertificate* getPeerCertificate() const override;
+  const SSL* getSSL() const override;
 
   size_t getRawBytesWritten() const override;
   size_t getRawBytesReceived() const override;
@@ -276,6 +277,22 @@ class AsyncSocketAdapter : public SocketAdapter {
                         int optname,
                         void const* optval,
                         socklen_t optlen) override;
+
+  /**
+   * Determine if the session specified during setSSLSession was reused
+   * or if the server rejected it and issued a new session.
+   */
+  bool getSSLSessionReused() const override;
+
+  /**
+   * Get a handle to the negotiated SSL session.
+   */
+  std::shared_ptr<folly::ssl::SSLSession> getSSLSession() override;
+
+  /**
+   * Set the SSL session to be used during sslConn.
+   */
+  void setSSLSession(std::shared_ptr<folly::ssl::SSLSession> session) override;
 
  private:
   folly::AsyncSocket::UniquePtr transport_;

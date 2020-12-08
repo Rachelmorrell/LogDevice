@@ -16,8 +16,8 @@
 #include "logdevice/common/AppendProbeController.h"
 #include "logdevice/common/MetaDataLog.h"
 #include "logdevice/common/Processor.h"
-#include "logdevice/common/Sender.h"
 #include "logdevice/common/SequencerLocator.h"
+#include "logdevice/common/SocketSender.h"
 #include "logdevice/common/StreamAppendRequest.h"
 #include "logdevice/common/Worker.h"
 #include "logdevice/common/debug.h"
@@ -96,6 +96,7 @@ AppendRequest::AppendRequest(AppendRequest&& other) noexcept
       append_probe_controller_(std::move(other.append_probe_controller_)),
       tracer_(std::move(other.tracer_)),
       buffered_writer_blob_flag_(std::move(other.buffered_writer_blob_flag_)),
+      payload_group_flag_(std::move(other.payload_group_flag_)),
       bypass_write_token_check_(std::move(other.bypass_write_token_check_)),
       append_redirected_to_dead_node_(
           std::move(other.append_redirected_to_dead_node_)) {
@@ -693,7 +694,10 @@ void AppendRequest::onTimeout() {
 }
 
 void AppendRequest::resetServerSocketConnectThrottle(NodeID node_id) {
-  Worker::onThisThread()->sender().resetServerSocketConnectThrottle(node_id);
+  auto* socket_sender = Worker::onThisThread()->socketSender();
+  if (socket_sender) {
+    socket_sender->resetServerSocketConnectThrottle(node_id.index());
+  }
 }
 
 bool AppendRequest::checkPayloadSize(size_t payload_size,
@@ -718,6 +722,9 @@ APPEND_flags_t AppendRequest::getAppendFlags() {
   append_flags |= appendFlagsForChecksum(getSettings().checksum_bits);
   if (buffered_writer_blob_flag_) {
     append_flags |= APPEND_Header::BUFFERED_WRITER_BLOB;
+  }
+  if (payload_group_flag_) {
+    append_flags |= APPEND_Header::PAYLOAD_GROUP;
   }
   if (sequencer_router_flags_ & SequencerRouter::REDIRECT_CYCLE) {
     // `sequencer_node_' is part of a redirection cycle. Include the NO_REDIRECT

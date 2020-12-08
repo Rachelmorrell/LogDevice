@@ -10,7 +10,6 @@
 #include "logdevice/common/AbortAppendersEpochRequest.h"
 #include "logdevice/common/AllSequencers.h"
 #include "logdevice/common/Appender.h"
-#include "logdevice/common/Connection.h"
 #include "logdevice/common/CopySetManager.h"
 #include "logdevice/common/CopySetSelectorFactory.h"
 #include "logdevice/common/EpochMetaData.h"
@@ -53,8 +52,7 @@ operator==(const EpochSequencerImmutableOptions& rhs) {
   static_assert(sizeof(EpochSequencerImmutableOptions) == 32,
                 "Don't forget to update operator==() when adding fields.");
   auto tup = [](const EpochSequencerImmutableOptions& o) {
-    return std::make_tuple(o.extra_copies,
-                           o.synced_copies,
+    return std::make_tuple(o.synced_copies,
                            o.window_size,
                            o.esn_max,
                            o.write_streams_map_max_capacity,
@@ -67,8 +65,7 @@ operator!=(const EpochSequencerImmutableOptions& rhs) {
   return !(*this == rhs);
 }
 std::string EpochSequencerImmutableOptions::toString() const {
-  return folly::sformat("extras: {}, synced: {}, window: {}, esn_max: {}",
-                        extra_copies,
+  return folly::sformat("synced: {}, window: {}, esn_max: {}",
                         synced_copies,
                         window_size,
                         esn_max.val());
@@ -77,7 +74,6 @@ std::string EpochSequencerImmutableOptions::toString() const {
 EpochSequencerImmutableOptions::EpochSequencerImmutableOptions(
     const logsconfig::LogAttributes& log_attrs,
     const Settings& settings) {
-  extra_copies = log_attrs.extraCopies().value();
   synced_copies = log_attrs.syncedCopies().value();
   window_size = log_attrs.maxWritesInFlight().value();
   const size_t ESN_T_BITS = 8 * sizeof(esn_t::raw_type);
@@ -291,30 +287,29 @@ void EpochSequencer::onEpochQuiescent() {
 bool EpochSequencer::noteAppenderReaped(Appender::FullyReplicated replicated,
                                         lsn_t reaped_lsn,
                                         std::shared_ptr<TailRecord> tail_record,
-                                        epoch_t* last_released_epoch_out,
-                                        bool* lng_changed_out) {
+                                        epoch_t* last_released_epoch_out) {
   ld_check(last_released_epoch_out != nullptr);
-  ld_check(lng_changed_out != nullptr);
   ld_check(tail_record != nullptr);
 
   // Step 1: update LNG if necessary
   lsn_t reaped_lsn_minus_one;
+  bool lng_changed_out{false};
   switch (replicated) {
     case Appender::FullyReplicated::YES:
       reaped_lsn_minus_one = reaped_lsn - 1;
       ld_check(lsn_to_epoch(reaped_lsn) == lsn_to_epoch(reaped_lsn_minus_one));
 
-      *lng_changed_out =
+      lng_changed_out =
           lng_.compare_exchange_strong(reaped_lsn_minus_one, reaped_lsn);
       break;
     case Appender::FullyReplicated::NO:
       // the appender was aborted, shouldn't advance LNG
-      *lng_changed_out = false;
+      lng_changed_out = false;
       break;
   }
 
   // Step 1.5: if lng changed, update tail record for the epoch
-  if (*lng_changed_out) {
+  if (lng_changed_out) {
     // no need to do compare and swap here since this function is called
     // sequentially as Appenders are reaped
     tail_record_.store(std::move(tail_record));
@@ -337,7 +332,7 @@ bool EpochSequencer::noteAppenderReaped(Appender::FullyReplicated replicated,
   }
 
   // Step 3: update last released LSN with the parent Sequencer object
-  if (*lng_changed_out) {
+  if (lng_changed_out) {
     return updateLastReleased(reaped_lsn, last_released_epoch_out);
   }
 

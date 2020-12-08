@@ -43,6 +43,7 @@ class BufferedWriteDecoder {
    * This method is meant to be used with data records returned by the Reader
    * API.
    *
+   * Payload overload:
    * Original payloads are appended to `payloads_out' and they point into
    * memory owned by this decoder after the call has returned.  It is only
    * safe to use the returned Payload instances as long as this decoder still
@@ -50,7 +51,10 @@ class BufferedWriteDecoder {
    * assumes ownership of the payloads, which is why `records' is taken by
    * reference.)
    *
-   * If is fine to use the same decoder instance to decode multiple batches of
+   * PayloadGroup overload:
+   * IOBufs in returned PayloadGroups are managed and can outlive the decoder.
+   *
+   * It is fine to use the same decoder instance to decode multiple batches of
    * records read from LogDevice. However, the decoder pins memory so it should
    * typically be short-lived (its lifetime is tied to the Payload instances in
    * payloads_out as explained above).
@@ -60,6 +64,8 @@ class BufferedWriteDecoder {
    */
   int decode(std::vector<std::unique_ptr<DataRecord>>&& records,
              std::vector<Payload>& payloads_out);
+  int decode(std::vector<std::unique_ptr<DataRecord>>&& records,
+             std::vector<PayloadGroup>& payload_groups_out);
 
   /**
    * Same as decode() but for a single record only.
@@ -69,6 +75,21 @@ class BufferedWriteDecoder {
    */
   int decodeOne(std::unique_ptr<DataRecord>&& record,
                 std::vector<Payload>& payloads_out);
+  int decodeOne(std::unique_ptr<DataRecord>&& record,
+                std::vector<PayloadGroup>& payload_groups_out);
+
+  /**
+   * Decodes record without uncompressing any of the payloads. Batch must be
+   * written using PayloadGroups API in BufferedWriter, otherwise decoding will
+   * fail.
+   * Claims ownership of DataRecord on success.
+   *
+   * @returns On success, returns 0.  If the DataRecord failed to decode,
+   *          returns -1.
+   */
+  int decodeOneCompressed(
+      std::unique_ptr<DataRecord>&& record,
+      CompressedPayloadGroups& compressed_payload_groups_out);
 
   virtual ~BufferedWriteDecoder() {}
 

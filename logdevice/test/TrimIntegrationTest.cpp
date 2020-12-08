@@ -178,15 +178,13 @@ TEST_F(TrimIntegrationTest, TrimPastTail) {
 
   // We expect this to be a 1 seqencer + 1 storage node setup
   EXPECT_TRUE(cluster->getConfig()
-                  ->get()
-                  ->serverConfig()
-                  ->getNode(0)
-                  ->isSequencingEnabled());
+                  ->getNodesConfiguration()
+                  ->getSequencerMembership()
+                  ->isSequencingEnabled(0));
   EXPECT_TRUE(cluster->getConfig()
-                  ->get()
-                  ->serverConfig()
-                  ->getNode(1)
-                  ->isReadableStorageNode());
+                  ->getNodesConfiguration()
+                  ->getStorageMembership()
+                  ->hasShardShouldReadFrom(1));
 
   // Waiting for metadata provisioning to complete to avoid spurious sequencer
   // reactivations that can cause the test to fail
@@ -230,7 +228,6 @@ TEST_F(TrimIntegrationTest, AutoLegacy) {
 
   auto log_attrs = logsconfig::LogAttributes()
                        .with_replicationFactor(1)
-                       .with_extraCopies(0)
                        .with_syncedCopies(0)
                        .with_backlogDuration(std::chrono::seconds(2))
                        .with_maxWritesInFlight(NRECORDS);
@@ -309,7 +306,6 @@ TEST_F(TrimIntegrationTest, Auto) {
 
   auto log_attrs = logsconfig::LogAttributes()
                        .with_replicationFactor(1)
-                       .with_extraCopies(0)
                        .with_syncedCopies(0)
                        .with_backlogDuration(std::chrono::seconds(2))
                        .with_maxWritesInFlight(NRECORDS);

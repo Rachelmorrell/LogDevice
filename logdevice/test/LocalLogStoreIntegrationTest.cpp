@@ -71,8 +71,11 @@ TEST_F(LocalLogStoreIntegrationTest, StartWithCorruptDB) {
     nodes_config[i] = std::move(node);
   }
 
+  auto nodes_configuration =
+      NodesConfigurationTestUtil::provisionNodes(std::move(nodes_config));
+
   auto cluster = IntegrationTestUtils::ClusterFactory()
-                     .setNodes(nodes_config)
+                     .setNodes(std::move(nodes_configuration))
                      .setNumDBShards(4)
                      .deferStart()
                      .create(NNODES);
@@ -84,10 +87,9 @@ TEST_F(LocalLogStoreIntegrationTest, StartWithCorruptDB) {
   // process writes for the healthy DBs, the test will fail.
   for (int idx = NNODES - 2; idx < NNODES; ++idx) {
     ld_check(cluster->getConfig()
-                 ->get()
-                 ->serverConfig()
-                 ->getNode(idx)
-                 ->isReadableStorageNode());
+                 ->getNodesConfiguration()
+                 ->getStorageMembership()
+                 ->hasShardShouldReadFrom(idx));
     IntegrationTestUtils::Node& node = cluster->getNode(idx);
 
     std::vector<uint32_t> shards_to_corrupt;
@@ -146,10 +148,9 @@ TEST_F(LocalLogStoreIntegrationTest, StartWithCorruptMetadataValue) {
   // of the metadata keys.
   for (int n = 1; n < NNODES; ++n) {
     ld_check(cluster->getConfig()
-                 ->get()
-                 ->serverConfig()
-                 ->getNode(n)
-                 ->isReadableStorageNode());
+                 ->getNodesConfiguration()
+                 ->getStorageMembership()
+                 ->hasShardShouldReadFrom(n));
     IntegrationTestUtils::Node& node = cluster->getNode(n);
 
     auto sharded_store = node.createLocalLogStore();
@@ -231,62 +232,4 @@ TEST_F(LocalLogStoreIntegrationTest, IOTracingSmokeTest) {
 
   // Read again, expecting to hit disk.
   read();
-}
-
-namespace {
-namespace fs = boost::filesystem;
-void testWipeStorageIfEmpty(bool enabled) {
-  // Start a cluster with NCM enabled
-  const size_t num_nodes = 3;
-  const size_t num_shards = 2;
-  auto cluster =
-      IntegrationTestUtils::ClusterFactory()
-          .setParam("--wipe-storage-when-storage-state-none",
-                    enabled ? "true" : "false")
-          .setNodesConfigurationSourceOfTruth(
-              IntegrationTestUtils::NodesConfigurationSourceOfTruth::NCM)
-          .setParam("--enable-nodes-configuration-manager", "true")
-          .setNumDBShards(num_shards)
-          // switches on gossip
-          .useHashBasedSequencerAssignment()
-          .create(num_nodes);
-
-  cluster->waitUntilAllStartedAndPropagatedInGossip();
-
-  // Add a random file in all shards for each node
-  for (auto node_idx = 0; node_idx < num_nodes; node_idx++) {
-    auto& node = cluster->getNode(node_idx);
-    for (int shard_idx = 0; shard_idx < node.num_db_shards_; ++shard_idx) {
-      std::string touched_path = node.getShardPath(shard_idx) + "/TOUCHED";
-      folly::writeFile(std::string("testing123"), touched_path.c_str());
-    }
-  }
-
-  // Disable storage on node 1
-  // Restart all the nodes
-  cluster->getNode(1).kill();
-  cluster->updateNodeAttributes(1, configuration::StorageState::DISABLED, 1);
-  for (auto node_idx = 0; node_idx < num_nodes; node_idx++) {
-    cluster->getNode(node_idx).restart(
-        /* graceful */ true, /* wait_until_available */ true);
-  }
-
-  // Verify if only node 1 got a wiped shard
-  for (auto node_idx = 0; node_idx < num_nodes; node_idx++) {
-    auto& node = cluster->getNode(node_idx);
-    for (int shard_idx = 0; shard_idx < node.num_db_shards_; ++shard_idx) {
-      std::string touched_path = node.getShardPath(shard_idx) + "/TOUCHED";
-      EXPECT_EQ(node_idx == 1 && enabled, !fs::exists(touched_path));
-    }
-  }
-}
-} // namespace
-
-TEST_F(LocalLogStoreIntegrationTest, WipeStorageNodeIfEmptyTest) {
-  testWipeStorageIfEmpty(true);
-}
-
-TEST_F(LocalLogStoreIntegrationTest,
-       WipeStorageNodeIfEmptySettingDisabledTest) {
-  testWipeStorageIfEmpty(false);
 }

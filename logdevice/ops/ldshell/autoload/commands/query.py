@@ -9,7 +9,6 @@
 import sys
 import textwrap
 import traceback
-from collections import Counter
 
 from nubia import context
 from nubia.internal.cmdbase import Command
@@ -160,7 +159,7 @@ class SelectCommand(Command):
         if not self.ldquery:
             return []
         if self._tables_cached is None:
-            self._tables_cached = [t for t in self.ldquery.tables]
+            self._tables_cached = list(self.ldquery.tables)
         return self._tables_cached
 
     @property
@@ -414,7 +413,7 @@ class SelectCommand(Command):
         except RuntimeError as e:
             print()
             cprint("[ERROR] A runtime error occured: {}".format(str(e)), "red")
-            return "Invalid Statement"
+            return "Unexpected Runtime Error"
         except StatementError as e:
             print()
             cprint("[ERROR] Invalid Statement: {}".format(str(e)), "red")
@@ -422,7 +421,7 @@ class SelectCommand(Command):
         except LDQueryError as e:
             print()
             cprint("[ERROR] Something went wrong in ldquery: {}".format(str(e)), "red")
-            return "Unexpected Error"
+            return "Unexpected Query Error"
 
     def run_interactive(self, cmd, input, query):
         try:

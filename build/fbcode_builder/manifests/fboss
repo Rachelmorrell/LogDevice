@@ -17,7 +17,6 @@ builder = nop
 folly
 fb303
 wangle
-rsocket-cpp
 fizz
 fmt
 libsodium
@@ -32,7 +31,7 @@ libnl
 libsai
 OpenNSA
 re2
-Python-3.7.6
+python
 
 [shipit.pathmap]
 fbcode/fboss/github = .

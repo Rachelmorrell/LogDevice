@@ -10,6 +10,7 @@ import asyncio
 import datetime
 import json
 import sys
+import time
 from collections import Counter, OrderedDict, defaultdict
 from dataclasses import asdict, dataclass, field, fields
 from datetime import timedelta
@@ -19,7 +20,7 @@ from typing import Any, Dict, List, Optional
 
 from humanize import naturaltime
 from ldops import admin_api
-from ldops.const import DEFAULT_THRIFT_PORT
+from ldops.const import DEFAULT_ADMIN_API_PORT
 from logdevice.admin.nodes.types import (
     MaintenanceStatus,
     NodesStateRequest,
@@ -97,30 +98,40 @@ def get_rpc_options() -> RpcOptions:
 
 async def get_host_info(client_factory, *args, **kwargs) -> Optional[HostInfo]:
     options = get_rpc_options()
-    async with client_factory(*args, **kwargs) as client:
-        host_tasks = {
-            "version": client.getVersion(rpc_options=options),
-            "uptime": client.aliveSince(rpc_options=options),
-        }
+    try:
+        async with client_factory(*args, **kwargs) as client:
+            host_tasks = {
+                "version": client.getVersion(rpc_options=options),
+                "uptime": client.aliveSince(rpc_options=options),
+            }
 
-        # pyre-ignore
-        await add_additional_host_tasks(
-            client=client, rpc_options=options, host_tasks=host_tasks
-        )
+            # pyre-ignore
+            await add_additional_host_tasks(
+                client=client, rpc_options=options, host_tasks=host_tasks
+            )
 
-        results = await asyncio.gather(*host_tasks.values(), return_exceptions=True)
-        # TODO: better / granular handling of exceptions
-        if any(isinstance(e, Exception) for e in results):
-            return None
-        else:
-            # This way the order of HostInfo's properties does not matter.
-            return HostInfo(**dict(zip(host_tasks.keys(), results)))
+            results = await asyncio.gather(*host_tasks.values(), return_exceptions=True)
+            # TODO: better / granular handling of exceptions
+            if any(isinstance(e, Exception) for e in results):
+                return None
+            else:
+                # This way the order of HostInfo's properties does not matter.
+                return HostInfo(**dict(zip(host_tasks.keys(), results)))
+    except Exception as ex:
+        cprint("Failed to connect to host: {}".format(str(ex)), file=sys.stderr)
+        return None
 
 
 async def print_results_tabular(results, *args, **kwargs):
+    def get_sort_key(x):
+        # this ensures that None values are sorted last,
+        # and avoids type errors when comparing values with Nones
+        attr = getattr(x, sort_key)
+        return (attr is None, attr)
+
     sort_key = kwargs["sort"] if "sort" in kwargs else "hostname"
     if results:
-        results.sort(key=lambda x: getattr(x, sort_key))
+        results.sort(key=get_sort_key)
     else:
         results = []
 
@@ -148,9 +159,7 @@ async def print_results_tabular(results, *args, **kwargs):
             ("STATE", lambda result: result.state if result.state else "?"),
             (
                 "UPTIME",
-                lambda result: naturaltime(timedelta(seconds=int(result.uptime)))
-                if result.uptime
-                else "?",
+                lambda result: render_uptime(result.uptime) if result.uptime else "?",
             ),
             ("LOCATION", lambda result: result.location),
             (
@@ -210,6 +219,11 @@ async def print_results_json(results, *args, **kwargs):
         representations[hostname] = representation
 
     print(json.dumps(representations))
+
+
+def render_uptime(uptime: float):
+    elapsed_secs = time.time() - uptime
+    return naturaltime(timedelta(seconds=int(elapsed_secs)))
 
 
 def color_op_state(op_state: ShardOperationalState):
@@ -415,7 +429,7 @@ async def run_status(nodes, hostnames, extended, formatter, force, **kwargs):
                 SocketAddress(
                     address_family=SocketAddressFamily.INET,
                     address=config.data_address.address,
-                    port=DEFAULT_THRIFT_PORT,
+                    port=DEFAULT_ADMIN_API_PORT,
                 )
                 if use_data_address
                 else config.other_addresses.admin
@@ -480,6 +494,8 @@ FIELDS = [field.name for field in fields(NodeInfo)]
 @argument("nodes", type=List[int], aliases=["n"], description="list of node ids")
 @argument("hostnames", type=List[str], aliases=["o"], description="list of hostnames")
 @argument("hosts", type=List[str], description="list of hostnames")
+# pyre-fixme[56]: Argument `list(FIELDS)` to decorator factory `nubia.argument`
+#  could not be resolved in a global scope.
 @argument(
     "sort",
     type=str,

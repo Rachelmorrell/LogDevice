@@ -87,7 +87,12 @@ class SocketAddress:
         Convenience helper which does resolving and returns instance
         """
         socket_address: SocketAddress
-        info: List[  # type: ignore
+        # pyre-fixme[33]: Given annotation cannot contain `Any`.
+        # pyre-fixme[9]: info has type `List[Tuple[socket.AddressFamily,
+        #  socket.SocketKind, int, str, typing.Tuple[typing.Any, ...]]]`; used as
+        #  `List[Tuple[socket.AddressFamily, socket.SocketKind, int, str,
+        #  Union[Tuple[str, int], Tuple[str, int, int, int]]]]`.
+        info: List[
             Tuple[socket.AddressFamily, socket.SocketKind, int, str, Tuple[Any, ...]]
         ] = socket.getaddrinfo(host, port)
         return cls.from_ip_port(random.choice(info)[4][0], port)

@@ -40,17 +40,18 @@ class NodeStatsControllerLocatorTest : public Test {
  public:
   std::shared_ptr<const NodesConfiguration>
   nodesWithLocations(std::vector<folly::Optional<std::string>> locations) {
-    std::vector<NodeTemplate> templates;
+    configuration::Nodes templates;
     for (const auto& location_str : locations) {
       auto idx = node_index++;
       if (!location_str.has_value()) {
         continue;
       }
-      templates.emplace_back(NodeTemplate{
-          idx,
-          kBothRoles,
-          *location_str,
-      });
+      configuration::Node node_template =
+          configuration::Node::withTestDefaults(idx);
+      if (!location_str->empty()) {
+        node_template.setLocation(*location_str);
+      }
+      templates[idx] = std::move(node_template);
     }
     auto nc = provisionNodes(std::move(templates));
     ld_check(nc != nullptr);
@@ -130,6 +131,21 @@ TEST_F(NodeStatsControllerLocatorTest, GapInIndex) {
       .WillRepeatedly(Return(StateList{FULLY_STARTED, DEAD, FULLY_STARTED}));
 
   EXPECT_TRUE(locator.isController(N0, 2));
+  EXPECT_TRUE(locator.isController(N2, 2));
+}
+
+TEST_F(NodeStatsControllerLocatorTest, StaleClusterState) {
+  // The first node is shrinked away but cluster state is not aware
+  auto nodes = nodesWithLocations(
+      {folly::none, "rg0.dc0.cl0.ro0.rk0"s, "rg0.dc0.cl0.ro0.rk0"s});
+
+  EXPECT_CALL(locator, getNodesConfiguration()).WillRepeatedly(Return(nodes));
+
+  EXPECT_CALL(locator, getNodeState(_))
+      .WillRepeatedly(
+          Return(StateList{FULLY_STARTED, FULLY_STARTED, FULLY_STARTED}));
+
+  EXPECT_TRUE(locator.isController(N1, 2));
   EXPECT_TRUE(locator.isController(N2, 2));
 }
 

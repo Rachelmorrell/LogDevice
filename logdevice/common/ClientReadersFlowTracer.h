@@ -34,6 +34,7 @@ constexpr auto READERS_FLOW_TRACER = "readers_flow_tracer";
 class ClientReadersFlowTracer : public SampledTracer {
  public:
   using SystemClock = std::chrono::system_clock;
+  using SteadyClock = std::chrono::steady_clock;
   using TimePoint = SystemClock::time_point;
   template <typename T>
   using CircularBuffer = boost::circular_buffer_space_optimized<T>;
@@ -77,7 +78,6 @@ class ClientReadersFlowTracer : public SampledTracer {
 
   ClientReadersFlowTracer(std::shared_ptr<TraceLogger> logger,
                           ClientReadStream* owner,
-                          MonitoringTier tier = MonitoringTier::MEDIUM_PRI,
                           bool push_samples = true,
                           bool ignore_overload = false);
   virtual ~ClientReadersFlowTracer();
@@ -112,6 +112,7 @@ class ClientReadersFlowTracer : public SampledTracer {
   void updateTimeLagging(Status st = E::OK);
   void updateShouldTrack();
   void maybeBumpStats(bool force_healthy = false);
+  void bumpHistograms();
   double calculateSamplingWeight();
   bool readerIsUnhealthy() const;
   bool readerIsStuck() const;
@@ -137,11 +138,14 @@ class ClientReadersFlowTracer : public SampledTracer {
   bool should_track_{true};
 
   State last_reported_state_{State::HEALTHY};
-  MonitoringTier monitoring_tier_{MonitoringTier::MEDIUM_PRI};
 
   TimePoint last_time_stuck_{TimePoint::max()};
   TimePoint last_time_lagging_{TimePoint::max()};
   lsn_t last_next_lsn_to_deliver_{LSN_INVALID};
+
+  SteadyClock::time_point last_trace_time_{SteadyClock::now()};
+  double speed_records_moving_avg_{0};
+  double speed_bytes_moving_avg_{0};
 
   std::unique_ptr<Timer> timer_;
 

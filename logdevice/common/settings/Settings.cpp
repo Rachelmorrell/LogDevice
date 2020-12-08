@@ -15,6 +15,7 @@
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/program_options.hpp>
 #include <boost/thread/thread.hpp>
+#include <folly/Format.h>
 #include <folly/String.h>
 
 #include "logdevice/common/SnapshotStoreTypes.h"
@@ -320,6 +321,30 @@ parse_optional_chrono_option(const std::string& value) {
   return result;
 };
 
+decltype(auto)
+parse_time_threshold_per_monitoring_tag(const std::string& value) {
+  folly::F14FastMap<std::string, std::chrono::milliseconds> res;
+
+  std::vector<std::string> tokens;
+  folly::split(',', value, tokens, true);
+  for (const auto& token : tokens) {
+    std::string monitoring_tag;
+    std::string time_threshold_str;
+    if (!folly::split(':', token, monitoring_tag, time_threshold_str)) {
+      throw boost::program_options::error(
+          "Invalid monitoring tag / time threshold pair: " + token);
+    }
+    std::chrono::milliseconds time_threshold;
+    if (parse_chrono_string(time_threshold_str, &time_threshold) != 0) {
+      throw boost::program_options::error("Invalid time threhold: " +
+                                          time_threshold_str);
+    }
+    res[monitoring_tag] = time_threshold;
+  }
+
+  return res;
+}
+
 Compression parse_compression(const std::string& value) {
   Compression compression;
   auto rv = parseCompression(value.c_str(), &compression);
@@ -621,6 +646,22 @@ void Settings::defineSettings(SettingEasyInit& init) {
        "Max number of sockets closed in a socket health check period.",
        SERVER | CLIENT,
        SettingsCategory::Network);
+  init("idle-connection-keep-alive",
+       &idle_connection_keep_alive,
+       "5min",
+       validate_positive<ssize_t>(),
+       "How long inactive client-to-server connection will stay open before "
+       "being shut down automatically.",
+       CLIENT,
+       SettingsCategory::Network);
+  init("rate-limit-idle-connection-closed",
+       &rate_limit_idle_connection_closed,
+       "10",
+       validate_nonnegative<ssize_t>(),
+       "Max number of idle connections closed in single round of socket healh "
+       "check. Set to 0 to disable closing of idle connections completely.",
+       CLIENT,
+       SettingsCategory::Network);
   init("max-cached-digest-record-queued-kb",
        &max_cached_digest_record_queued_kb,
        "256",
@@ -701,8 +742,8 @@ void Settings::defineSettings(SettingEasyInit& init) {
        "false",
        nullptr,
        "Use libevent2 based event base to create EventLoop threadpool in "
-       "logdevice.",
-       SERVER | CLIENT | REQUIRES_RESTART,
+       "logdevice. DEPRECATED as libevent2 is being removed from codebase",
+       SERVER | CLIENT | REQUIRES_RESTART | DEPRECATED,
        SettingsCategory::Execution);
   init("request-exec-threshold",
        &request_execution_delay_threshold,
@@ -1431,6 +1472,19 @@ void Settings::defineSettings(SettingEasyInit& init) {
        "(for improved debuggability).",
        CLIENT,
        SettingsCategory::Monitoring);
+
+  init("client-readers-flow-max-acceptable-time-lag-per-tag",
+       &client_readers_flow_max_acceptable_time_lag_per_tag,
+       "",
+       parse_time_threshold_per_monitoring_tag,
+       "Map that establishes the maximum acceptable time lag for each "
+       "monitoring tag. A reader that passes the maximum acceptable time lag "
+       "will be considered unhealthy for the purpose of increasing weight when "
+       "pushing samples. See "
+       "'client-readers-flow-tracer-unhealthy-publish-weight'.",
+       CLIENT,
+       SettingsCategory::Monitoring);
+
   init("client-readers-flow-tracer-GSS-skip-remote-preemption-checks",
        &client_readers_flow_tracer_GSS_skip_remote_preemption_checks,
        "true",
@@ -1733,13 +1787,13 @@ void Settings::defineSettings(SettingEasyInit& init) {
       SERVER | REQUIRES_RESTART /* Used in CopySetManager ctor */,
       SettingsCategory::WritePath);
   init("write-copyset-index",
-       &write_copyset_index,
+       &write_copyset_index_DEPRECATED,
        "true",
        nullptr, // no validation
        "If set, storage nodes will write the copyset index for all records. "
-       "This must be set before --rocksdb-use-copyset-index is enabled. "
-       "Doesn't affect copyset stickiness",
-       SERVER,
+       "Note that this won't be used until --rocksdb-use-copyset-index is "
+       "enabled.",
+       SERVER | DEPRECATED,
        SettingsCategory::WritePath);
   init("iterator-cache-ttl",
        &iterator_cache_ttl,
@@ -1943,14 +1997,23 @@ void Settings::defineSettings(SettingEasyInit& init) {
       nullptr, // no validation
       "If \"false\", the root znodes for a tier should be pre-created "
       "externally before logdevice can do any ZooKeeper epoch store operations",
-      SERVER | EXPERIMENTAL,
-      SettingsCategory::Core);
+      SERVER,
+      SettingsCategory::EpochStore);
+  init("epoch-store-double-write-new-serialization-format",
+       &epoch_store_double_write_new_serialization_format,
+       "false",
+       nullptr, // no validation
+       "If set, epoch stores will double write any data it modifies to its "
+       "corresponding znode and the data serialized with the new serialization "
+       "format to the parent znode",
+       SERVER,
+       SettingsCategory::EpochStore);
   init("ssl-load-client-cert",
        &ssl_load_client_cert,
        "false",
        nullptr, // no validation
        "Set to include client certificate for mutual ssl authentication",
-       CLIENT | SERVER,
+       CLIENT | REQUIRES_RESTART,
        SettingsCategory::Security);
   init("ssl-cert-path",
        &ssl_cert_path,
@@ -1979,6 +2042,14 @@ void Settings::defineSettings(SettingEasyInit& init) {
        validate_positive<ssize_t>(),
        "TTL for an SSL certificate that we have loaded from disk.",
        SERVER | CLIENT | REQUIRES_RESTART /* used in Worker ctor */,
+       SettingsCategory::Security);
+  init("ssl-use-session-resumption",
+       &ssl_use_session_resumption,
+       "false",
+       nullptr,
+       "If enabled, new SSL connections will attempt to resume previously "
+       "cached sessions.",
+       SERVER | CLIENT,
        SettingsCategory::Security);
   init("ssl-boundary",
        &ssl_boundary,
@@ -2099,13 +2170,6 @@ void Settings::defineSettings(SettingEasyInit& init) {
       "storage nodes reject the record.",
       SERVER,
       SettingsCategory::WritePath);
-  init("default-log-namespace",
-       &default_log_namespace,
-       "",
-       nullptr, // no validation
-       "Default log namespace to use on the client.",
-       CLIENT | DEPRECATED,
-       SettingsCategory::Configuration);
   init("server-based-nodes-configuration-store-timeout",
        &server_based_nodes_configuration_store_timeout,
        "60s",
@@ -2305,6 +2369,16 @@ void Settings::defineSettings(SettingEasyInit& init) {
        "group doesn't override it",
        SERVER,
        SettingsCategory::Batching);
+  init("socket-batching-time-trigger",
+       &socket_batching_time_trigger,
+       "0s",
+       nullptr, // no validation
+       "Socket batching allows us to batch data before flushing it to the "
+       "socket to save CPU. It increases the amount of "
+       "memory consumed. And introduces additional latency when sending "
+       "messages.",
+       SERVER | CLIENT,
+       SettingsCategory::Batching);
   init("sequencer-batching-time-trigger",
        &sequencer_batching_time_trigger,
        "1s",
@@ -2459,7 +2533,7 @@ void Settings::defineSettings(SettingEasyInit& init) {
        SettingsCategory::WritePath);
   init("enable-config-synchronization",
        &enable_config_synchronization,
-       "true",
+       "false",
        nullptr, // no validation
        "With config synchronization enabled, nodes on both ends of a connection"
        "will synchronize their configs if there is a mismatch in the config"
@@ -2530,7 +2604,7 @@ void Settings::defineSettings(SettingEasyInit& init) {
        nullptr, // no validation
        "If true, servers will be allowed to fetch configs from the client side "
        "of a connection during config synchronization.",
-       SERVER,
+       SERVER | DEPRECATED,
        SettingsCategory::Configuration);
 
   init("unreleased-record-detector-interval",
@@ -2661,6 +2735,29 @@ void Settings::defineSettings(SettingEasyInit& init) {
        "Range was defined by https://tools.ietf.org/html/rfc4594#section-1.4.4",
        SERVER | CLIENT | REQUIRES_RESTART,
        SettingsCategory::Configuration);
+
+  init("client-default-network-priority",
+       &client_default_network_priority,
+       "",
+       parse_network_priority,
+       "Sets the default client network priority. Clients will connect to the "
+       "server port associated with this priority, unless "
+       "'enable-port-based-qos' is false. Value must be one of 'low','medium', "
+       "or 'high.",
+       CLIENT | SERVER,
+       SettingsCategory::Network);
+
+  init("enable-port-based-qos",
+       &enable_port_based_qos,
+       "false",
+       nullptr,
+       "Feature gate setting for allowing port-based QoS / connections per "
+       "network priority. If disabled, all addresses will resolve to the "
+       "default_data_address listed in nodes configuration. Note that this "
+       "feature does not apply to connections between servers, only client to "
+       "server.",
+       CLIENT | SERVER,
+       SettingsCategory::Network);
 
   init("disable-event-log-trimming",
        &disable_event_log_trimming,
@@ -2904,7 +3001,7 @@ void Settings::defineSettings(SettingEasyInit& init) {
 
   init("enable-nodes-configuration-manager",
        &enable_nodes_configuration_manager,
-       "false", // defaults to false
+       "true",
        nullptr, // no custom validation necessary
        "If set, NodesConfigurationManager and its workflow will be enabled.",
        CLIENT | SERVER | REQUIRES_RESTART,
@@ -2912,7 +3009,7 @@ void Settings::defineSettings(SettingEasyInit& init) {
 
   init("use-nodes-configuration-manager-nodes-configuration",
        &use_nodes_configuration_manager_nodes_configuration,
-       "false", // defaults to false
+       "true",
        nullptr, // no custom validation necessary
        "If true and enable_nodes_configuration_manager is set, logdevice will "
        "use the nodes configuration from the NodesConfigurationManager.",
@@ -3286,9 +3383,9 @@ void Settings::defineSettings(SettingEasyInit& init) {
        &rsm_include_read_pointer_in_snapshot,
        "true",
        nullptr,
-       "Allow inclusion of read pointer in RSM snapshots. Note that if this is "
-       "set to true IT IS UNSAFE TO CHANGE IT BACK TO FALSE!",
-       SERVER | CLIENT,
+       "Deprecated! Allow inclusion of read pointer in RSM snapshots.  "
+       "Set to true by default always",
+       SERVER | CLIENT | DEPRECATED,
        SettingsCategory::Core);
 
   init("rsm-snapshot-request-timeout",
@@ -3310,7 +3407,7 @@ void Settings::defineSettings(SettingEasyInit& init) {
   init(
       "rsm-snapshot-store-type",
       &rsm_snapshot_store_type,
-      "legacy",
+      "log",
       validate_rsm_snapshot_store,
       "One of the following: "
       "legacy (use legacy way of storing and retrieving snapshots from a log), "
@@ -3652,7 +3749,7 @@ void Settings::defineSettings(SettingEasyInit& init) {
        SettingsCategory::Core);
   init("metadata-log-trim-interval",
        &metadata_log_trim_interval,
-       "0ms",
+       "7200s",
        validate_nonnegative<ssize_t>(),
        "How often periodic trimming of metadata logs should run. Zero value "
        "prevents it from running at all. ",
@@ -3666,5 +3763,21 @@ void Settings::defineSettings(SettingEasyInit& init) {
        "completed",
        SERVER,
        SettingsCategory::Sequencer);
+  init("zk-vsc-max-retries",
+       &zk_vcs_max_retries,
+       "3",
+       validate_positive<int>(),
+       "Number of transient error retries for the zookeeper versioned config "
+       "store.",
+       SERVER | CLIENT | REQUIRES_RESTART,
+       SettingsCategory::Configuration);
+  init("test-same-partition-nodes",
+       &test_same_partition_nodes,
+       "",
+       parse_recipients_list,
+       "Used for isolation testing. Only nodes in this set will be addressable "
+       "from this node. An empty list disables this error injection.",
+       SERVER,
+       SettingsCategory::Testing);
 }
 }} // namespace facebook::logdevice

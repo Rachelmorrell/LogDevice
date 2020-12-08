@@ -37,6 +37,9 @@ STAT_DEFINE(worker_executed_mid_pri_work, SUM)
 STAT_DEFINE(worker_executed_lo_pri_work, SUM)
 
 STAT_DEFINE(ssl_context_created, SUM)
+STAT_DEFINE(ssl_session_resumption_attempt, SUM)
+STAT_DEFINE(ssl_session_resumption_success, SUM)
+STAT_DEFINE(ssl_session_resumption_cached, SUM)
 
 // See OverloadDetector
 STAT_DEFINE(num_workers_tracked_by_overload_detector, SUM)
@@ -59,17 +62,6 @@ STAT_DEFINE(metadata_log_read_failed_other, SUM)
 
 // Number of CONFIG_CHANGED_Messages received with Action::Reload.
 STAT_DEFINE(config_changed_reload, SUM)
-// Number of CONFIG_CHANGED_Messages ignored because the config is already
-// up-to-date.
-STAT_DEFINE(config_changed_ignored_uptodate, SUM)
-// Number of CONFIG_CHANGED_Messages ignored because the config is not trusted.
-STAT_DEFINE(config_changed_ignored_not_trusted, SUM)
-// Number of CONFIG_CHANGED_Messages ignored because one with same or newer
-// config is already being processed.
-STAT_DEFINE(config_changed_ignored_update_in_progress, SUM)
-// Number of config updates that occurred as a result of
-// CONFIG_CHANGED_Messages.
-STAT_DEFINE(config_changed_update, SUM)
 
 // Number of times nodes configuration polling gets a success result
 STAT_DEFINE(nodes_configuration_polling_success, SUM)
@@ -325,6 +317,11 @@ STAT_DEFINE(num_read_streams, SUM)
 STAT_DEFINE(read_streams_healthy, SUM)
 STAT_DEFINE(read_streams_non_authoritative, SUM)
 STAT_DEFINE(read_streams_stalled, SUM)
+// ByteOffset requested but not present in records
+STAT_DEFINE(records_missing_byteoffset, SUM)
+// ByteOffset requested but not able to provide
+STAT_DEFINE(records_delivered_without_byteoffset, SUM)
+STAT_DEFINE(records_delivered_with_byteoffset, SUM)
 
 // Separate new metrics for read streams that are considered stuck/lagging. Not
 // related to read_streams_stalled, read_streams_healthy and
@@ -435,6 +432,8 @@ STAT_DEFINE(sock_stalled, SUM)
 STAT_DEFINE(sock_app_limited, SUM)
 STAT_DEFINE(sock_receiver_throttled, SUM)
 STAT_DEFINE(sock_network_throttled, SUM)
+// Socket has been inactive for prolonged period of time
+STAT_DEFINE(sock_idle, SUM)
 STAT_DEFINE(slow_socket_detection_time, SUM)
 STAT_DEFINE(sock_health_unknown, SUM)
 STAT_DEFINE(client_connection_close_backlog, SUM)

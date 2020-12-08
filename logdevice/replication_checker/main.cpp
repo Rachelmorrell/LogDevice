@@ -26,7 +26,6 @@
 #include "logdevice/common/MetaDataLog.h"
 #include "logdevice/common/NoopTraceLogger.h"
 #include "logdevice/common/PermissionChecker.h"
-#include "logdevice/common/PrincipalParser.h"
 #include "logdevice/common/Processor.h"
 #include "logdevice/common/SequencerLocator.h"
 #include "logdevice/common/SingleEvent.h"
@@ -227,13 +226,13 @@ struct RecordCopy {
   copyset_t copyset;
   std::chrono::milliseconds timestamp;
   size_t payload_size;
-  // The interesting flags are BUFFERED_WRITER_BLOB and HOLE.
+  // The interesting flags are BUFFERED_WRITER_BLOB, PAYLOAD_GROUP and HOLE.
   RECORD_flags_t flags;
 
   bool sameData(const RecordCopy& rhs) const {
     auto f = [](const RecordCopy& r) {
-      const RECORD_flags_t flag_mask =
-          RECORD_Header::BUFFERED_WRITER_BLOB | RECORD_Header::HOLE;
+      const RECORD_flags_t flag_mask = RECORD_Header::BUFFERED_WRITER_BLOB |
+          RECORD_Header::PAYLOAD_GROUP | RECORD_Header::HOLE;
       return std::make_tuple(
           r.timestamp, r.payload_hash, r.payload_size, r.flags & flag_mask);
     };
@@ -601,9 +600,11 @@ class LogChecker : public std::enable_shared_from_this<LogChecker> {
         start_lsn_(std::max(1ul, rq.start_lsn)),
         until_lsn_(std::min(LSN_MAX, rq.until_lsn)),
         latest_replication_factor_(rq.latest_replication_factor),
-        cfg_(config->get()),
+        nodes_cfg_(config->updateableNodesConfiguration()),
         perf_stats_(perf_stats),
-        callbackHelper_(this) {}
+        callbackHelper_(this) {
+    ld_check(nodes_cfg_);
+  }
 
   std::string getError() const {
     return error_;
@@ -753,7 +754,7 @@ class LogChecker : public std::enable_shared_from_this<LogChecker> {
   lsn_t until_lsn_;
   size_t latest_replication_factor_;
   read_stream_id_t rsid_{READ_STREAM_ID_INVALID};
-  std::shared_ptr<Configuration> cfg_;
+  std::shared_ptr<UpdateableNodesConfiguration> nodes_cfg_;
   std::shared_ptr<PerfStats> perf_stats_;
 
   CheckStats stats_;
@@ -840,7 +841,7 @@ class LogChecker : public std::enable_shared_from_this<LogChecker> {
             },
             nullptr, // metadata_cache
             nullptr,
-            [self_weak](ShardID from, const DataRecordOwnsPayload* record) {
+            [self_weak](ShardID from, const RawDataRecord* record) {
               if (auto self = self_weak.lock()) {
                 self->gotRecordCopy(from, record);
               }
@@ -873,7 +874,7 @@ class LogChecker : public std::enable_shared_from_this<LogChecker> {
     throttle_timer_->activate(std::chrono::milliseconds{100});
   }
 
-  void gotRecordCopy(ShardID from, const DataRecordOwnsPayload* record) {
+  void gotRecordCopy(ShardID from, const RawDataRecord* record) {
     lsn_t lsn = record->attrs.lsn;
 
     ld_debug("log %lu: got record from %s with lsn %s",
@@ -881,7 +882,7 @@ class LogChecker : public std::enable_shared_from_this<LogChecker> {
              from.toString().c_str(),
              lsn_to_string(record->attrs.lsn).c_str());
 
-    if (!record->extra_metadata_) {
+    if (!record->extra_metadata) {
       ld_error("log %lu: got record without extra metadata from %s with "
                "lsn %s; ignoring",
                log_id_.val_,
@@ -892,14 +893,14 @@ class LogChecker : public std::enable_shared_from_this<LogChecker> {
     }
 
     RecordCopy rec = {
-        record->extra_metadata_->header.wave,
+        record->extra_metadata->header.wave,
         0, // payload hash
-        record->extra_metadata_->copyset,
+        record->extra_metadata->copyset,
         record->attrs.timestamp,
         0, // payload size
-        record->flags_,
+        record->flags,
     };
-    rec.parsePayload(record->payload);
+    rec.parsePayload(record->payload.getPayload());
 
     ++perf_stats_->ncopies_received;
     perf_stats_->payload_bytes += rec.payload_size;
@@ -920,9 +921,7 @@ class LogChecker : public std::enable_shared_from_this<LogChecker> {
     const auto meta = stream_->getCurrentEpochMetadata();
     ld_check(meta);
     replication_checker_ = std::make_unique<FailureDomainNodeSet<lsn_t>>(
-        meta->shards,
-        *cfg_->serverConfig()->getNodesConfigurationFromServerConfigSource(),
-        meta->replication);
+        meta->shards, *nodes_cfg_->get(), meta->replication);
   }
 
   bool gotAllCopiesOfRecord(lsn_t lsn) {
@@ -1985,8 +1984,9 @@ int main(int argc, const char** argv) {
     }
     if (!checker_settings->only_data_logs) {
       add_log(metaDataLogID(logid_t(it->first)),
-              ReplicationProperty::fromLogAttributes(
-                  cfg->serverConfig()->getMetaDataLogGroup()->attrs())
+              cfg->getNodesConfiguration()
+                  ->getMetaDataLogsReplication()
+                  ->getReplicationProperty()
                   .getReplicationFactor());
     }
   }

@@ -96,8 +96,8 @@ int AsyncCheckpointedReaderImpl::resumeReading(logid_t log_id) {
   return reader_->resumeReading(log_id);
 }
 
-void AsyncCheckpointedReaderImpl::setMonitoringTier(MonitoringTier tier) {
-  return reader_->setMonitoringTier(tier);
+void AsyncCheckpointedReaderImpl::addMonitoringTag(std::string tag) {
+  return reader_->addMonitoringTag(std::move(tag));
 }
 
 void AsyncCheckpointedReaderImpl::withoutPayload() {
@@ -128,4 +128,10 @@ void AsyncCheckpointedReaderImpl::getBytesBuffered(
     std::function<void(size_t)> callback) {
   reader_->getBytesBuffered(callback);
 }
+
+void AsyncCheckpointedReaderImpl::setReaderName(
+    const std::string& reader_name) {
+  reader_->setReaderName(reader_name);
+}
+
 }} // namespace facebook::logdevice

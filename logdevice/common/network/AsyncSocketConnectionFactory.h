@@ -9,6 +9,7 @@
 #include <folly/container/F14Map.h>
 
 #include "logdevice/common/ClientID.h"
+#include "logdevice/common/ConnectionKind.h"
 #include "logdevice/common/NodeID.h"
 #include "logdevice/common/ResourceBudget.h"
 #include "logdevice/common/SocketTypes.h"
@@ -22,7 +23,7 @@ namespace facebook { namespace logdevice {
 class Connection;
 class FlowGroup;
 class SockAddr;
-class SocketDependencies;
+class SocketNetworkDependencies;
 class ConnectThrottle;
 
 class AsyncSocketConnectionFactory : public IConnectionFactory {
@@ -33,9 +34,8 @@ class AsyncSocketConnectionFactory : public IConnectionFactory {
   createConnection(NodeID node_id,
                    SocketType socket_type,
                    ConnectionType connection_type,
-                   PeerType peer_type,
                    FlowGroup& flow_group,
-                   std::unique_ptr<SocketDependencies> deps) override;
+                   std::unique_ptr<SocketNetworkDependencies> deps) override;
 
   std::unique_ptr<Connection>
   createConnection(int fd,
@@ -45,7 +45,8 @@ class AsyncSocketConnectionFactory : public IConnectionFactory {
                    SocketType type,
                    ConnectionType conntype,
                    FlowGroup& flow_group,
-                   std::unique_ptr<SocketDependencies> deps) const override;
+                   std::unique_ptr<SocketNetworkDependencies> deps,
+                   ConnectionKind connection_kind) const override;
 
  private:
   folly::EventBase* base_{nullptr};

@@ -26,13 +26,33 @@ class ThriftCodec {
     return Serializer::template serialize<std::string>(thrift);
   }
 
+  template <class Serializer, class T, class... Args>
+  static void serialize(const T& thrift, Args&&... args) {
+    Serializer::template serialize(thrift, std::forward<Args>(args)...);
+  }
+
   template <class Serializer, class T>
   static std::unique_ptr<T> deserialize(const Slice& binary) {
-    std::unique_ptr<T> thrift_ptr{nullptr};
+    T thrift;
+    size_t consumed = deserialize<Serializer>(binary, thrift);
+    if (consumed == 0) {
+      return nullptr;
+    } else {
+      return std::make_unique<T>(std::move(thrift));
+    }
+  }
+
+  /**
+   * Deserializes object from binary representation.
+   * Returns number of bytes consumed or 0 in case of error.
+   */
+  template <class Serializer, class T, class... Args>
+  static size_t deserialize(const folly::IOBuf* binary,
+                            T& thrift,
+                            Args&&... args) {
     try {
-      auto thrift = Serializer::template deserialize<T>(
-          folly::StringPiece(binary.ptr(), binary.size));
-      thrift_ptr = std::make_unique<T>(std::move(thrift));
+      return Serializer::template deserialize<T>(
+          binary, thrift, std::forward<Args>(args)...);
     } catch (const std::exception& exception) {
       RATELIMIT_ERROR(std::chrono::seconds(10),
                       5,
@@ -41,7 +61,17 @@ class ThriftCodec {
                       exception.what());
       err = E::BADMSG;
     }
-    return thrift_ptr;
+    return 0;
+  }
+
+  /**
+   * Deserializes object from binary representation.
+   * Returns number of bytes consumed or 0 in case of error.
+   */
+  template <class Serializer, class T, class... Args>
+  static size_t deserialize(const Slice& binary, T& thrift, Args&&... args) {
+    auto iobuf = folly::IOBuf::wrapBufferAsValue(binary.data, binary.size);
+    return deserialize<Serializer>(&iobuf, thrift, std::forward<Args>(args)...);
   }
 };
 

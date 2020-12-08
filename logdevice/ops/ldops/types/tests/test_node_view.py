@@ -114,9 +114,7 @@ class TestNodeView(TestCase):
             assert from_nc.address is not None
 
             self.assertEqual(nv.thrift_address.port, 6440)
-            self.assertEqual(
-                nv_address.compressed, from_nc.address.compressed
-            )
+            self.assertEqual(nv_address.compressed, from_nc.address.compressed)
 
         self.assertEqual(
             nv.node_id,
@@ -164,16 +162,6 @@ class TestNodeView(TestCase):
             self.assertEqual(
                 nv.shards_data_health_count,
                 Counter(s.data_health for s in ns.shard_states),
-            )
-
-            self.assertTupleEqual(
-                nv.shards_current_storage_state,
-                tuple(s.current_storage_state for s in ns.shard_states),
-            )
-
-            self.assertEqual(
-                nv.shards_current_storage_state_count,
-                Counter(s.current_storage_state for s in ns.shard_states),
             )
 
             self.assertTupleEqual(
@@ -227,6 +215,8 @@ class TestNodeView(TestCase):
             self.assertIsNone(nv.storage_weight)
             self.assertEqual(nv.num_shards, 0)
             self.assertTupleEqual(nv.shard_states, ())
+
+        self.assertEqual(nv.tags, {})
 
     @async_test
     async def test_mismatch(self):

@@ -436,7 +436,8 @@ TEST_F(MetaDataLogsIntegrationTest, MetaDataLogAppendWithStaleSequencerEpoch) {
   for (epoch_t e = epoch_t(EPOCH_MIN.val_ + 2); e < epoch_t(5); ++e.val_) {
     epoch_store->createOrUpdateMetaData(
         LOG_ID,
-        std::make_shared<EpochMetaDataUpdateToNextEpoch>(),
+        std::make_shared<EpochMetaDataUpdateToNextEpoch>(
+            EpochMetaData::Updater::Options().setProvisionIfEmpty()),
         [&](Status status,
             logid_t log_id,
             std::unique_ptr<EpochMetaData> info,
@@ -530,25 +531,23 @@ TEST_F(MetaDataLogsIntegrationTest, SequencerReadHistoricMetadata) {
   // change the nodes config and force two metadata log entries
   for (auto i = 0; i < 2; i++) {
     Semaphore sem;
-    auto handle = client->subscribeToConfigUpdates([&]() { sem.post(); });
+    auto handle = client_impl->getConfig()
+                      ->updateableNodesConfiguration()
+                      ->subscribeToUpdates([&]() { sem.post(); });
     auto org_res = client_impl->getHistoricalMetaDataSync(LOG_ID);
     auto org_epoch_metadata = org_res->getLastEpochMetaData();
     ASSERT_NE(nullptr, org_epoch_metadata);
 
-    // Get the nodes in the server config
-    auto current_config = cluster->getConfig()->get();
-    auto nodes = current_config->serverConfig()->getNodes();
-    nodes[1].storage_attributes->exclude_from_nodesets =
-        nodes[1].storage_attributes->exclude_from_nodesets ? false : true;
+    // Get the nodes in the nodes config
+    auto nodes_config = cluster->getConfig()->getNodesConfiguration();
 
-    Configuration::NodesConfig nodes_config(std::move(nodes));
-    // create a new config with the modified node config
-    Configuration config(current_config->serverConfig()
-                             ->withNodes(nodes_config)
-                             ->withIncrementedVersion(),
-                         current_config->logsConfig());
-    // Write it out to the logdevice.conf file
-    cluster->writeConfig(config);
+    auto current_exclude_from_nodesets =
+        nodes_config->getNodeStorageAttribute(1)->exclude_from_nodesets;
+    nodes_config = nodes_config->applyUpdate(
+        NodesConfigurationTestUtil::excludeFromNodesetUpdate(
+            *nodes_config, {1}, current_exclude_from_nodesets ? false : true));
+
+    cluster->updateNodesConfiguration(*nodes_config);
 
     ld_info("Waiting for Client to pick up the config changes");
     sem.wait();

@@ -12,10 +12,7 @@
 
 #include <folly/io/async/EventBaseThread.h>
 
-#include "logdevice/admin/AdminServer.h"
-#include "logdevice/admin/settings/AdminServerSettings.h"
 #include "logdevice/common/PermissionChecker.h"
-#include "logdevice/common/PrincipalParser.h"
 #include "logdevice/common/configuration/ServerConfig.h"
 #include "logdevice/common/configuration/UpdateableConfig.h"
 #include "logdevice/common/settings/GossipSettings.h"
@@ -23,12 +20,12 @@
 #include "logdevice/common/stats/Stats.h"
 #include "logdevice/include/ConfigSubscriptionHandle.h"
 #include "logdevice/server/ConnectionListener.h"
-#include "logdevice/server/LocalLogFile.h"
 #include "logdevice/server/ServerSettings.h"
 #include "logdevice/server/UnreleasedRecordDetector.h"
 #include "logdevice/server/admincommands/CommandProcessor.h"
 #include "logdevice/server/locallogstore/LocalLogStoreSettings.h"
 #include "logdevice/server/locallogstore/RocksDBSettings.h"
+#include "logdevice/server/thrift/LogDeviceThriftServer.h"
 
 namespace facebook { namespace logdevice {
 
@@ -48,6 +45,8 @@ class ShardedRocksDBLocalLogStore;
 class ShardedStorageThreadPool;
 class TraceLogger;
 class UnreleasedRecordDetector;
+class AdminAPIHandler;
+class AdminServerSettings;
 
 namespace maintenance {
 class ClusterMaintenanceStateMachine;
@@ -91,7 +90,6 @@ class ServerParameters {
 
   std::shared_ptr<UpdateableConfig> getUpdateableConfig();
   std::shared_ptr<TraceLogger> getTraceLogger();
-  const std::shared_ptr<LocalLogFile>& getAuditLog();
   StatsHolder* getStats();
   void requestStop();
   std::shared_ptr<PluginRegistry> getPluginRegistry() const {
@@ -150,7 +148,6 @@ class ServerParameters {
 
   std::shared_ptr<UpdateableConfig> updateable_config_;
   std::shared_ptr<TraceLogger> trace_logger_;
-  std::shared_ptr<LocalLogFile> audit_log_;
 
   // Assigned when config is loaded.
   folly::Optional<NodeID> my_node_id_;
@@ -174,7 +171,6 @@ class ServerParameters {
   bool hasMyNodeInfoChanged(const NodesConfiguration& config);
 
   // Server Config Hooks
-  bool updateServerOrigin(ServerConfig& config);
   bool updateConfigSettings(ServerConfig& config);
 
   // The main server config hook that invokes other hooks
@@ -269,7 +265,9 @@ class Server {
     }
   }
 
-  void rotateLocalLogs();
+  bool isShuttingDown() {
+    return is_shut_down_.load();
+  }
 
  private:
   ServerParameters* params_;
@@ -286,14 +284,17 @@ class Server {
 
   // initListeners()
   std::unique_ptr<folly::EventBaseThread> connection_listener_loop_;
-  std::unique_ptr<folly::EventBaseThread> ssl_connection_listener_loop_;
   std::unique_ptr<folly::EventBaseThread> gossip_listener_loop_;
   std::unique_ptr<folly::EventBaseThread> server_to_server_listener_loop_;
-  std::unique_ptr<AdminServer> admin_server_handle_;
+  std::unique_ptr<LogDeviceThriftServer> s2s_thrift_api_handle_;
+  std::unique_ptr<LogDeviceThriftServer> c2s_thrift_api_handle_;
+  std::unique_ptr<LogDeviceThriftServer> admin_server_handle_;
   std::unique_ptr<Listener> connection_listener_;
   std::unique_ptr<Listener> ssl_connection_listener_;
   std::unique_ptr<Listener> gossip_listener_;
   std::unique_ptr<Listener> server_to_server_listener_;
+  std::map<ServerSettings::ClientNetworkPriority, std::unique_ptr<Listener>>
+      listeners_per_network_priority_;
 
   // initStore()
   std::unique_ptr<ShardedRocksDBLocalLogStore> sharded_store_;
@@ -345,6 +346,13 @@ class Server {
   // These methods should be called in this order.
   // In case of error, log it and return false.
   bool initListeners();
+  // Initializes both (client-facing and server-to-server) Thrift API servers
+  bool initThriftServers();
+  // Initializes single Thrift API server and returns pointer to it or nullptr
+  // if server is disabled
+  std::unique_ptr<LogDeviceThriftServer>
+  initThriftServer(std::string name, const folly::Optional<Sockaddr>& address);
+
   bool initStore();
   bool initLogStorageStateMap();
   bool initStorageThreadPool();
@@ -358,10 +366,11 @@ class Server {
   bool initSequencerPlacement();
   bool initRebuildingCoordinator();
   bool initClusterMaintenanceStateMachine();
-  bool createAndAttachMaintenanceManager(AdminServer* server);
+  bool createAndAttachMaintenanceManager(AdminAPIHandler*);
   bool initUnreleasedRecordDetector();
   bool initLogsConfigManager();
   bool initAdminServer();
+  bool initRocksDBMetricsExport();
 
   // Calls gracefulShutdown in separate thread and does _exit(EXIT_FAILURE)
   // if it takes longer than server_settings_->shutdown_timeout ms.

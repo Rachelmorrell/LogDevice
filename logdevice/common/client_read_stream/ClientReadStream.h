@@ -7,6 +7,7 @@
  */
 #pragma once
 
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <queue>
@@ -22,6 +23,7 @@
 #include "logdevice/common/MetaDataLogReader.h"
 #include "logdevice/common/NodeID.h"
 #include "logdevice/common/NodeSetFinder.h"
+#include "logdevice/common/RawDataRecord.h"
 #include "logdevice/common/ReadStreamAttributes.h"
 #include "logdevice/common/ShardID.h"
 #include "logdevice/common/Timer.h"
@@ -42,7 +44,6 @@ class ClientGapTracer;
 class ClientReadStreamBuffer;
 class ClientReadStreamConnectionHealth;
 class ClientReadStreamScd;
-class ClientReadStreamTracer;
 class ClientReadTracer;
 class ClientReadersFlowTracer;
 class ClientStalledReadTracer;
@@ -114,8 +115,7 @@ class ClientReadStreamDependencies {
   using record_cb_t = std::function<bool(std::unique_ptr<DataRecord>&)>;
   using gap_cb_t = std::function<bool(const GapRecord&)>;
   using done_cb_t = std::function<void(logid_t)>;
-  using record_copy_cb_t =
-      std::function<void(ShardID, const DataRecordOwnsPayload*)>;
+  using record_copy_cb_t = std::function<void(ShardID, const RawDataRecord*)>;
   using health_cb_t = std::function<void(bool)>;
 
   ClientReadStreamDependencies(read_stream_id_t rsid,
@@ -261,8 +261,7 @@ class ClientReadStreamDependencies {
    * shard (in onDataRecord()), so these callbacks can come out of order
    * and have duplicate LSNs.
    */
-  virtual void recordCopyCallback(ShardID from,
-                                  const DataRecordOwnsPayload* record) {
+  virtual void recordCopyCallback(ShardID from, const RawDataRecord* record) {
     if (record_copy_callback_) {
       record_copy_callback_(from, record);
     }
@@ -321,12 +320,20 @@ class ClientReadStreamDependencies {
                                         const EpochMetaData& metadata,
                                         MetaDataLogReader::RecordSource source);
 
+  virtual void setReaderName(const std::string& reader_name) {
+    reader_name_ = reader_name;
+  }
+
   read_stream_id_t getReadStreamID() const {
     return read_stream_id_;
   }
 
   const std::string& getClientSessionID() const {
     return client_session_id_;
+  }
+
+  const std::string& getReaderName() const {
+    return reader_name_;
   }
 
   // Gets the protocol version of an outgoing socket (if the socket exists).
@@ -345,6 +352,7 @@ class ClientReadStreamDependencies {
   read_stream_id_t read_stream_id_;
   logid_t log_id_;
   std::string client_session_id_;
+  std::string reader_name_;
   record_cb_t record_callback_;
   gap_cb_t gap_callback_;
   done_cb_t done_callback_;
@@ -379,6 +387,12 @@ struct ClientReadStreamRecordState {
    * Pointer to the record received from storage shard.
    */
   std::unique_ptr<DataRecordOwnsPayload> record{};
+
+  /**
+   * Indicates that record is corrupted (can be set if shipping corrupted
+   * records is enabled), and record->payload can be some garbage.
+   */
+  bool record_corrupted = false;
 
   /**
    * List of storage shards for which one of the records the shard delivered
@@ -416,6 +430,13 @@ class ClientReadStream : boost::noncopyable {
   using RecordState = ClientReadStreamRecordState;
   using GapState = SenderState::GapState;
 
+  /**
+   * Contains possible outcomes of payload decoding.
+   * nullptr is used to indicate decoding failure.
+   */
+  using DecodedPayload =
+      std::variant<std::nullptr_t, PayloadHolder, PayloadGroup>;
+
  public:
   using GapFailureDomain =
       FailureDomainNodeSet<SenderState::GapState,
@@ -432,7 +453,7 @@ class ClientReadStream : boost::noncopyable {
                    std::shared_ptr<UpdateableConfig> config,
                    ReaderBridge* reader = nullptr,
                    const ReadStreamAttributes* attrs = nullptr,
-                   MonitoringTier tier = MonitoringTier::MEDIUM_PRI,
+                   const std::set<std::string>& monitoring_tags = {},
                    folly::Optional<SCDCopysetReordering>
                        scd_copyset_reordering = folly::none);
 
@@ -472,8 +493,7 @@ class ClientReadStream : boost::noncopyable {
    * Called by a worker thread when a RECORD message is received from a
    * storage shard.
    */
-  void onDataRecord(ShardID shard,
-                    std::unique_ptr<DataRecordOwnsPayload> record);
+  void onDataRecord(ShardID shard, std::unique_ptr<RawDataRecord> record);
 
   /**
    * Called by a worker thread when a STARTED message is received from a
@@ -692,6 +712,10 @@ class ClientReadStream : boost::noncopyable {
     return id_;
   }
 
+  const std::string& getReaderName() const {
+    return deps_->getReaderName();
+  }
+
   const std::shared_ptr<UpdateableConfig>& getConfig() const {
     return config_;
   }
@@ -796,6 +820,7 @@ class ClientReadStream : boost::noncopyable {
     const read_stream_id_t stream_id;
     /* Client session ID */
     std::string csid;
+    std::string reader_name;
     /* Next lsn to deliver */
     lsn_t next_lsn;
     lsn_t window_high;
@@ -824,21 +849,29 @@ class ClientReadStream : boost::noncopyable {
   };
 
   /**
+   * sample the ClientReadStreamDebugInfo
+   */
+  void sampleDebugInfo() const;
+
+ private:
+  /**
    * @return ClientReadStreamDebugInfo with all the data for debug
    */
   ClientReadStreamDebugInfo getClientReadStreamDebugInfo() const;
 
   /**
-   * sample the ClientReadStreamDebugInfo
-   */
-  void sampleDebugInfo(const ClientReadStreamDebugInfo&) const;
-
- private:
-  /**
    * @return True if there are records we can ship right now to the application,
    * ie the front of `buffer_` contains a record.
    */
   bool canDeliverRecordsNow() const;
+
+  /**
+   * Decodes raw data record payload into payload suitable for delivery to the
+   * client, taking into account different delivery modes, such as NO_PAYLOAD
+   * and PAYLOAD_HASH_ONLY.
+   * @return nullptr if decoding fails. In this case record is left intact.
+   */
+  DecodedPayload decodePayload(const RawDataRecord& record) const;
 
   /**
    * Delivers the record and pops it from buffer, updating state accordingly.
@@ -1224,7 +1257,9 @@ class ClientReadStream : boost::noncopyable {
   // @param require_consistent_from_cache   if true, only allows consistent
   //                                        metadata records delivered from
   //                                        the metadata cache
-  void requestEpochMetaData(epoch_t epoch,
+  // @returns true if onEpochMetaData was called synchronously in the stack
+  // below
+  bool requestEpochMetaData(epoch_t epoch,
                             bool require_consistent_from_cache = true);
 
   // updated last_released_ based on what we got from storage shards.
@@ -1499,7 +1534,7 @@ class ClientReadStream : boost::noncopyable {
   // @see shipCorruptedRecords
   bool ship_corrupted_records_ = false;
 
-  MonitoringTier monitoring_tier_{MonitoringTier::MEDIUM_PRI};
+  folly::small_vector<std::string> monitoring_tags_;
 
   // Reader object to deliver to when not using callbacks.  Null if using
   // callbacks
@@ -1541,8 +1576,6 @@ class ClientReadStream : boost::noncopyable {
   std::unique_ptr<ClientReadTracer> read_tracer_;
   // a Throttled tracelogger for tracing tailer reads
   std::unique_ptr<ClientReadersFlowTracer> readers_flow_tracer_;
-  // a Throttled tracelogger for tracing events
-  std::unique_ptr<ClientReadStreamTracer> events_tracer_;
 
   // Tracks the health of the connection, ie whether we have a healthy TCP
   // connection to an f-majority of shards in the read set. Uses a tracer to log

@@ -9,7 +9,7 @@ set(LD_PYTHON_VERSION 3.5 CACHE STRING "Python version")
 find_package(PythonInterp ${LD_PYTHON_VERSION} REQUIRED)
 find_package(PythonLibs ${LD_PYTHON_VERSION} REQUIRED)
 if(thriftpy3)
-  find_package(Cython 0.28 REQUIRED)
+  find_package(Cython 0.29 REQUIRED)
 endif()
 
 set(_boost_py_component1
@@ -31,8 +31,8 @@ foreach(_boost_py_component ${_boost_py_component1} ${_boost_py_component2} ${_b
     thread
     ${_boost_py_component})
 
-
-  if(Boost_FOUND)
+  string(TOUPPER ${_boost_py_component} _BOOST_PY_COMP)
+  if(Boost_${_BOOST_PY_COMP}_FOUND)
     message(STATUS "Boost Python Component ${_boost_py_component} found")
     break()
   else()
@@ -40,7 +40,7 @@ foreach(_boost_py_component ${_boost_py_component1} ${_boost_py_component2} ${_b
   endif()
 endforeach()
 
-if(NOT Boost_FOUND)
+if(NOT Boost_${_BOOST_PY_COMP}_FOUND)
   message(FATAL_ERROR "Couldn't find any Boost python component. At least one is required, terminating. ${Boost_ERROR_REASON}")
 endif()
 
@@ -50,7 +50,6 @@ find_package(JeMalloc REQUIRED)
 find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(Zstd REQUIRED)
-find_package(LibLZMA REQUIRED)
 find_package(Libsodium REQUIRED)
 find_package(LibEvent REQUIRED)
 find_package(LibDl REQUIRED)
@@ -84,7 +83,6 @@ include_directories(${BZIP2_INCLUDE_DIR})
 include_directories(${ZLIB_INCLUDE_DIR})
 include_directories(${SNAPPY_INCLUDE_DIR})
 include_directories(${ROCKSDB_INCLUDE_DIRS})
-include_directories(${LIBLZMA_INCLUDE_DIRS})
 include_directories(${LIBGFLAGS_INCLUDE_DIR})
 include_directories(${FBTHRIFT_INCLUDE_DIR})
 

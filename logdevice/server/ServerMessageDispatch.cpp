@@ -18,33 +18,33 @@
 #include "logdevice/common/protocol/STORE_Message.h"
 #include "logdevice/common/protocol/WINDOW_Message.h"
 #include "logdevice/common/util.h"
-#include "logdevice/server/CHECK_NODE_HEALTH_onReceived.h"
-#include "logdevice/server/CHECK_SEAL_onReceived.h"
-#include "logdevice/server/DATA_SIZE_onReceived.h"
-#include "logdevice/server/DELETE_LOG_METADATA_onReceived.h"
-#include "logdevice/server/DELETE_onReceived.h"
-#include "logdevice/server/FINDKEY_onReceived.h"
+#include "logdevice/include/PermissionActions.h"
 #include "logdevice/server/GAP_onSent.h"
-#include "logdevice/server/GET_EPOCH_RECOVERY_METADATA_REPLY_onReceived.h"
-#include "logdevice/server/GET_EPOCH_RECOVERY_METADATA_onReceived.h"
-#include "logdevice/server/GET_HEAD_ATTRIBUTES_onReceived.h"
-#include "logdevice/server/GET_RSM_SNAPSHOT_onReceived.h"
-#include "logdevice/server/GET_TRIM_POINT_onReceived.h"
-#include "logdevice/server/GOSSIP_onReceived.h"
 #include "logdevice/server/GOSSIP_onSent.h"
-#include "logdevice/server/LOGS_CONFIG_API_onReceived.h"
-#include "logdevice/server/MEMTABLE_FLUSHED_onReceived.h"
 #include "logdevice/server/RECORD_onSent.h"
-#include "logdevice/server/SEAL_onReceived.h"
 #include "logdevice/server/STARTED_onSent.h"
-#include "logdevice/server/START_onReceived.h"
-#include "logdevice/server/STOP_onReceived.h"
-#include "logdevice/server/STORED_onReceived.h"
 #include "logdevice/server/STORE_onSent.h"
-#include "logdevice/server/ServerMessagePermission.h"
 #include "logdevice/server/ServerWorker.h"
 #include "logdevice/server/StoreStateMachine.h"
-#include "logdevice/server/TRIM_onReceived.h"
+#include "logdevice/server/message_handlers/CHECK_NODE_HEALTH_onReceived.h"
+#include "logdevice/server/message_handlers/CHECK_SEAL_onReceived.h"
+#include "logdevice/server/message_handlers/DATA_SIZE_onReceived.h"
+#include "logdevice/server/message_handlers/DELETE_LOG_METADATA_onReceived.h"
+#include "logdevice/server/message_handlers/DELETE_onReceived.h"
+#include "logdevice/server/message_handlers/FINDKEY_onReceived.h"
+#include "logdevice/server/message_handlers/GET_EPOCH_RECOVERY_METADATA_REPLY_onReceived.h"
+#include "logdevice/server/message_handlers/GET_EPOCH_RECOVERY_METADATA_onReceived.h"
+#include "logdevice/server/message_handlers/GET_HEAD_ATTRIBUTES_onReceived.h"
+#include "logdevice/server/message_handlers/GET_RSM_SNAPSHOT_onReceived.h"
+#include "logdevice/server/message_handlers/GET_TRIM_POINT_onReceived.h"
+#include "logdevice/server/message_handlers/GOSSIP_onReceived.h"
+#include "logdevice/server/message_handlers/LOGS_CONFIG_API_onReceived.h"
+#include "logdevice/server/message_handlers/MEMTABLE_FLUSHED_onReceived.h"
+#include "logdevice/server/message_handlers/SEAL_onReceived.h"
+#include "logdevice/server/message_handlers/START_onReceived.h"
+#include "logdevice/server/message_handlers/STOP_onReceived.h"
+#include "logdevice/server/message_handlers/STORED_onReceived.h"
+#include "logdevice/server/message_handlers/TRIM_onReceived.h"
 #include "logdevice/server/read_path/AllServerReadStreams.h"
 #include "logdevice/server/sequencer_boycotting/NODE_STATS_AGGREGATE_REPLY_onReceived.h"
 #include "logdevice/server/sequencer_boycotting/NODE_STATS_AGGREGATE_onReceived.h"
@@ -59,14 +59,13 @@ Message::Disposition
 ServerMessageDispatch::onReceivedImpl(Message* msg,
                                       const Address& from,
                                       const PrincipalIdentity& principal) {
-  auto params = ServerMessagePermission::computePermissionParams(msg);
+  auto params = msg->getPermissionParams();
 
   std::shared_ptr<PermissionChecker> permission_checker =
-      processor_->security_info_->get()->permission_checker;
+      security_info_->get()->permission_checker;
 
   if (permission_checker && params.requiresPermission &&
-      processor_->settings()->require_permission_message_types.count(
-          msg->type_) == 0) {
+      settings_->require_permission_message_types.count(msg->type_) == 0) {
     // override permission requirement per configured settings
     RATELIMIT_INFO(std::chrono::seconds(10),
                    1,
@@ -76,11 +75,24 @@ ServerMessageDispatch::onReceivedImpl(Message* msg,
                    messageTypeNames()[msg->type_].c_str(),
                    Sender::describeConnection(from).c_str());
     params.requiresPermission = false;
-    STAT_INCR(processor_->stats_, server_message_dispatch_bypass_permission);
+    STAT_INCR(stats_, server_message_dispatch_bypass_permission);
+  }
+
+  if (isInternalServerMessageFromNonServerNode(params, principal) &&
+      settings_->require_permission_message_types.count(msg->type_) > 0) {
+    STAT_INCR(stats_, unauthorized_server_message_by_client);
+    RATELIMIT_WARNING(std::chrono::seconds(10),
+                      1,
+                      "Server only message type %s "
+                      "received from %s source address",
+                      messageTypeNames()[msg->type_].c_str(),
+                      from.toString().c_str());
+
+    return Message::Disposition::ERROR;
   }
 
   if (permission_checker && params.requiresPermission) {
-    STAT_INCR(processor_->stats_, server_message_dispatch_check_permission);
+    STAT_INCR(stats_, server_message_dispatch_check_permission);
     permission_checker->isAllowed(params.action,
                                   principal,
                                   params.log_id,
@@ -100,7 +112,7 @@ ServerMessageDispatch::onReceivedImpl(Message* msg,
                                   });
     return Message::Disposition::KEEP;
   } else {
-    STAT_INCR(processor_->stats_, server_message_dispatch_skip_permission);
+    STAT_INCR(stats_, server_message_dispatch_skip_permission);
     return onReceivedHandler(msg, from, PermissionCheckStatus::NONE);
   }
 }
@@ -281,5 +293,13 @@ void ServerMessageDispatch::onSentImpl(const Message& msg,
       // whose handler lives in common/ with the Message subclass)
       return msg.onSent(st, to);
   }
+}
+
+bool ServerMessageDispatch::isInternalServerMessageFromNonServerNode(
+    const PermissionParams& params,
+    const PrincipalIdentity& principal) const {
+  return params.requiresPermission &&
+      params.action == ACTION::SERVER_INTERNAL &&
+      principal.type != Principal::CLUSTER_NODE;
 }
 }} // namespace facebook::logdevice

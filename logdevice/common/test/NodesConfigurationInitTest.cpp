@@ -107,9 +107,8 @@ class TimeControlledNCS : public NodesConfigurationStore {
 
 TEST(NodesConfigurationInitTest, ConfigCreation) {
   MockNodesConfigurationInit init(nullptr, UpdateableSettings<Settings>());
-  auto server_config =
-      Configuration::fromJsonFile(TEST_CONFIG_FILE("sample_valid.conf"))
-          ->serverConfig();
+  std::shared_ptr<ServerConfig> server_config =
+      ServerConfig::fromDataTest(__FILE__);
 
   auto config = init.buildBootstrappingServerConfig(
       {
@@ -123,19 +122,21 @@ TEST(NodesConfigurationInitTest, ConfigCreation) {
   auto nodes = config->getNodesConfiguration()->getServiceDiscovery();
   EXPECT_EQ(3, nodes->numNodes());
   EXPECT_EQ("10.0.0.2:4440",
-            nodes->getNodeAttributesPtr(node_index_t(0))->address.toString());
+            nodes->getNodeAttributesPtr(node_index_t(0))
+                ->default_client_data_address.toString());
   EXPECT_EQ("10.0.0.3:4440",
-            nodes->getNodeAttributesPtr(node_index_t(1))->address.toString());
+            nodes->getNodeAttributesPtr(node_index_t(1))
+                ->default_client_data_address.toString());
   EXPECT_EQ("10.0.0.4:4440",
-            nodes->getNodeAttributesPtr(node_index_t(2))->address.toString());
+            nodes->getNodeAttributesPtr(node_index_t(2))
+                ->default_client_data_address.toString());
 }
 
 TEST(NodesConfigurationInitTest, InitTest) {
   // Create a dummy nodes configuration
-  auto node_config = createSimpleNodesConfig(3);
-  auto metadata_config = createMetaDataLogsConfig(node_config, 2, 1);
-  node_config.generateNodesConfiguration(metadata_config, config_version_t(2));
-  auto nodes_configuration = node_config.getNodesConfiguration();
+  auto nodes_configuration = provisionNodes();
+  auto cluster_size = nodes_configuration->clusterSize();
+  auto version = nodes_configuration->getVersion();
 
   // Serialize it
   auto serialized = NodesConfigurationCodec::serialize(*nodes_configuration);
@@ -151,9 +152,8 @@ TEST(NodesConfigurationInitTest, InitTest) {
       std::move(store), UpdateableSettings<Settings>());
   auto fetched_node_config = std::make_shared<UpdateableNodesConfiguration>();
 
-  auto current_server_config =
-      Configuration::fromJsonFile(TEST_CONFIG_FILE("sample_valid.conf"))
-          ->serverConfig();
+  std::shared_ptr<ServerConfig> current_server_config =
+      ServerConfig::fromDataTest(__FILE__);
 
   int success = init.init(fetched_node_config,
                           make_test_plugin_registry(),
@@ -161,8 +161,8 @@ TEST(NodesConfigurationInitTest, InitTest) {
                           current_server_config);
   EXPECT_TRUE(success);
   ASSERT_NE(nullptr, fetched_node_config->get());
-  EXPECT_EQ(vcs_config_version_t(2), fetched_node_config->get()->getVersion());
-  EXPECT_EQ(3, fetched_node_config->get()->clusterSize());
+  EXPECT_EQ(version, fetched_node_config->get()->getVersion());
+  EXPECT_EQ(cluster_size, fetched_node_config->get()->clusterSize());
 }
 
 TEST(NodesConfigurationInitTest, Retry) {
@@ -182,9 +182,8 @@ TEST(NodesConfigurationInitTest, Retry) {
   MockNodesConfigurationInit init(
       std::move(store), UpdateableSettings<Settings>(settings));
   auto fetched_node_config = std::make_shared<UpdateableNodesConfiguration>();
-  auto current_server_config =
-      Configuration::fromJsonFile(TEST_CONFIG_FILE("sample_valid.conf"))
-          ->serverConfig();
+  std::shared_ptr<ServerConfig> current_server_config =
+      ServerConfig::fromDataTest(__FILE__);
   int success = init.init(fetched_node_config,
                           make_test_plugin_registry(),
                           "data:10.0.0.2:4440",
@@ -211,9 +210,8 @@ TEST(NodesConfigurationInitTest, Timeout) {
   MockNodesConfigurationInit init(
       std::move(store), UpdateableSettings<Settings>(settings));
   auto fetched_node_config = std::make_shared<UpdateableNodesConfiguration>();
-  auto current_server_config =
-      Configuration::fromJsonFile(TEST_CONFIG_FILE("sample_valid.conf"))
-          ->serverConfig();
+  std::shared_ptr<ServerConfig> current_server_config =
+      ServerConfig::fromDataTest(__FILE__);
   int success = init.init(fetched_node_config,
                           make_test_plugin_registry(),
                           "data:10.0.0.2:4440",
@@ -239,9 +237,8 @@ TEST(NodesConfigurationInitTest, WithLongDurationCallback) {
   MockNodesConfigurationInit init(
       std::move(store), UpdateableSettings<Settings>(settings));
   auto fetched_node_config = std::make_shared<UpdateableNodesConfiguration>();
-  auto current_server_config =
-      Configuration::fromJsonFile(TEST_CONFIG_FILE("sample_valid.conf"))
-          ->serverConfig();
+  std::shared_ptr<ServerConfig> current_server_config =
+      ServerConfig::fromDataTest(__FILE__);
   int success = init.init(fetched_node_config,
                           make_test_plugin_registry(),
                           "data:10.0.0.2:4440",

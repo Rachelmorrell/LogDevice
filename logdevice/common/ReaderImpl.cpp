@@ -311,6 +311,8 @@ int ReaderImpl::startReadingImpl(logid_t log_id,
       },
       nullptr);
 
+  deps->setReaderName(reader_name_);
+
   auto read_stream = std::make_unique<ClientReadStream>(
       rsid,
       log_id,
@@ -323,7 +325,7 @@ int ReaderImpl::startReadingImpl(logid_t log_id,
       processor_->config_,
       bridge_.get(),
       attrs,
-      monitoring_tier_);
+      monitoring_tags_);
 
   if (without_payload_) {
     read_stream->setNoPayload();
@@ -625,8 +627,8 @@ void ReaderImpl::read_handleData(
   ++nread_;
 }
 
-void ReaderImpl::setMonitoringTier(MonitoringTier tier) {
-  monitoring_tier_ = tier;
+void ReaderImpl::addMonitoringTag(std::string tag) {
+  monitoring_tags_.emplace(std::move(tag));
 }
 
 void ReaderImpl::read_handleGap(QueueEntry& entry,
@@ -681,8 +683,8 @@ void ReaderImpl::read_decodeBuffered(QueueEntry& entry) {
   ld_check(!entry.getData().extra_metadata_);
 
   auto decoder = std::make_shared<BufferedWriteDecoderImpl>();
-  std::vector<Payload> payloads;
-  int rv = decoder->decodeOne(entry.releaseData(), payloads);
+  std::vector<PayloadGroup> payload_groups;
+  int rv = decoder->decodeOne(entry.releaseData(), payload_groups);
   if (rv != 0) {
     // Whoops, decoding failed.  This is tragic and unlikely with checksums
     // but let's generate a DATALOSS gap to inform the client.
@@ -697,14 +699,17 @@ void ReaderImpl::read_decodeBuffered(QueueEntry& entry) {
   // each original record, push them onto `pre_queue_' and let the main
   // read() loop consume them.
   int batch_offset = 0;
-  for (const Payload& payload : payloads) {
+  for (PayloadGroup& payload_group : payload_groups) {
     auto record = std::make_unique<DataRecordOwnsPayload>(
         log_id,
-        payload,
+        std::move(payload_group),
         decoder, // shared ownership of the decoder
         attrs.lsn,
         attrs.timestamp,
         flags & ~RECORD_Header::BUFFERED_WRITER_BLOB,
+        // Same reasoning as in AsyncReaderImpl::handleBufferedWrite as to why
+        // same offsets value for all payloads.
+        attrs.offsets,
         nullptr, // no rebuilding metadata
         batch_offset++);
     pre_queue_.emplace_back( // creating a QueueEntry
@@ -713,7 +718,8 @@ void ReaderImpl::read_decodeBuffered(QueueEntry& entry) {
         1);
     // Only allow read() to stop reading the log after consuming the last
     // record
-    pre_queue_.back().setAllowEndReading(&payload == &payloads.back());
+    pre_queue_.back().setAllowEndReading(&payload_group ==
+                                         &payload_groups.back());
   }
 }
 

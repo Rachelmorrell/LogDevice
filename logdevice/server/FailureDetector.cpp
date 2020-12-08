@@ -8,6 +8,7 @@
 
 #include "logdevice/server/FailureDetector.h"
 
+#include <chrono>
 #include <unordered_set>
 
 #include <folly/Memory.h>
@@ -15,10 +16,9 @@
 #include <folly/small_vector.h>
 
 #include "logdevice/common/ClusterState.h"
-#include "logdevice/common/Connection.h"
 #include "logdevice/common/GetClusterStateRequest.h"
 #include "logdevice/common/NodeID.h"
-#include "logdevice/common/Sender.h"
+#include "logdevice/common/SocketSender.h"
 #include "logdevice/common/configuration/Configuration.h"
 #include "logdevice/common/configuration/nodes/utils.h"
 #include "logdevice/common/request_util.h"
@@ -147,6 +147,9 @@ FailureDetector::FailureDetector(UpdateableSettings<GossipSettings> settings,
   registered_rsms_.push_back(configuration::InternalLogs::EVENT_LOG_DELTAS);
   registered_rsms_.push_back(configuration::InternalLogs::CONFIG_LOG_DELTAS);
   /* skipping maintenance log as it doesn't run on cluster */
+
+  // Set this to now so we know if the node stops processing gossip messages.
+  last_gossip_received_ts_ = SteadyTimestamp::now();
 }
 
 void FailureDetector::fetchVersions(RsmVersionType type) {
@@ -348,6 +351,9 @@ void FailureDetector::buildInitialState(
   // Tell others that this node is alive, so that they can start sending
   // gossips.
   broadcastBringupUpdate(0);
+
+  // Set this to now so we know if the node stops processing gossip messages.
+  last_gossip_received_ts_ = SteadyTimestamp::now();
 
   // Start gossiping after we have got a chance to build FD state.
   // If cluster-state reply doesn't come, it is fine, since we will
@@ -588,6 +594,28 @@ void FailureDetector::gossip() {
       versions_list.push_back(rnode);
     }
   }
+
+  // if it has been too long since we processed a gossip message, set a flag
+  // so the receiving node(s) can mark this node appropriately.
+  if (settings_->gossip_intervals_without_processing_threshold) {
+    auto window = (settings_->gossip_interval *
+                   settings_->gossip_intervals_without_processing_threshold);
+    if (now > last_gossip_received_ts_ + window) {
+      RATELIMIT_WARNING(std::chrono::seconds(1),
+                        1,
+                        "haven't been processing gossips for %lu seconds"
+                        "(%ld intervals)",
+                        std::chrono::duration_cast<std::chrono::seconds>(
+                            now - last_gossip_received_ts_)
+                            .count(),
+                        (std::chrono::duration_cast<std::chrono::milliseconds>(
+                             now - last_gossip_received_ts_) /
+                         settings_->gossip_interval));
+      flags |= GOSSIP_Message::LONG_TIME_SINCE_LAST_GOSSIP;
+      STAT_INCR(getStats(), gossips_failed_to_process);
+    }
+  }
+
   skip_sending_versions_ = (skip_sending_versions_ + 1) %
       (settings_->gossip_include_rsm_versions_frequency);
 
@@ -631,9 +659,16 @@ bool FailureDetector::processFlags(
       bool(msg.flags_ & GOSSIP_Message::SUSPECT_STATE_FINISHED);
   const bool is_start_state_finished =
       bool(msg.flags_ & GOSSIP_Message::STARTING_STATE_FINISHED);
+  const bool is_stalled_gossip_processor =
+      bool(msg.flags_ & GOSSIP_Message::LONG_TIME_SINCE_LAST_GOSSIP);
   auto msg_type = flagsToString(msg.flags_);
 
-  if (!is_node_bringup && !is_suspect_state_finished) {
+  if (!is_stalled_gossip_processor) {
+    sender_node.stalled_gossip_processor_ = false;
+  }
+
+  if (!is_node_bringup && !is_suspect_state_finished &&
+      !is_stalled_gossip_processor) {
     return false; /* not a special broadcast message */
   }
 
@@ -685,6 +720,9 @@ bool FailureDetector::processFlags(
     updateNodeState(sender_idx, sender_node, false, false, false);
     // When new instance id comes up, reset all version information
     resetVersions(sender_idx);
+  } else if (is_stalled_gossip_processor) {
+    ld_info("N%hu has stopped processing gossip messages.", sender_idx);
+    sender_node.stalled_gossip_processor_ = true;
   } else {
     return true;
   }
@@ -710,6 +748,13 @@ FailureDetector::flagsToString(GOSSIP_Message::GOSSIP_flags_t flags) {
       s += "|";
     }
     s += "starting_state_finished";
+  }
+
+  if (flags & GOSSIP_Message::LONG_TIME_SINCE_LAST_GOSSIP) {
+    if (!s.empty()) {
+      s += "|";
+    }
+    s += "long-time-since-last-gossip";
   }
 
   if (!s.empty()) {
@@ -862,6 +907,8 @@ void FailureDetector::onGossipReceived(const GOSSIP_Message& msg) {
   if (num_gossips_received_ <= settings_->min_gossips_for_stable_state) {
     ld_debug("Received gossip#%zu", num_gossips_received_);
   }
+
+  last_gossip_received_ts_ = SteadyTimestamp::now();
 }
 
 void FailureDetector::startSuspectTimer() {
@@ -1052,9 +1099,12 @@ void FailureDetector::detectFailures(
     // other nodes haven't heard from it in a long time
     // OR
     // Node 'it' is performing a graceful shutdown.
+    // OR
+    // 'it' hasn't been processgin gossip messages from some time.
     // Mark it DEAD so no work ends up sent its way.
     bool failover = (it.second.failover_ > std::chrono::milliseconds::zero());
-    bool dead = (it.second.gossip_ > threshold);
+    bool dead = (it.second.gossip_ > threshold) ||
+        (it.second.stalled_gossip_processor_);
     if (dead) {
       // if the node is actually dead, clear the failover boolean, to make
       // sure we don't mistakenly transition from DEAD to FAILING_OVER in the
@@ -1216,10 +1266,7 @@ void FailureDetector::updateNodeState(node_index_t idx,
       // Node's state is no longer DEAD. Reset connection throttling
       // on a server socket to that node to allow subsequent gossip
       // messages to be immediately sent to it.
-      Connection* conn = getServerConnection(idx);
-      if (conn) {
-        conn->resetConnectThrottle();
-      }
+      resetServerSocketConnectThrottle(idx);
     } else {
       // This node should transition itself to DEAD.
       if (self) {
@@ -1280,14 +1327,7 @@ bool FailureDetector::isValidDestination(node_index_t node_idx) {
     }
   }
 
-  Connection* conn = getServerConnection(node_idx);
-  if (!conn) {
-    // If a connection to the node doesn't exist yet, consider it as a valid
-    // destination.
-    return true;
-  }
-
-  int rv = conn->checkConnection(nullptr);
+  int rv = checkServerConnection(node_idx);
   if (rv != 0) {
     if (err == E::DISABLED || err == E::NOBUFS) {
       ld_spew("Can't gossip to N%u: %s", node_idx, error_description(err));
@@ -1544,8 +1584,15 @@ FailureDetector::getNodeBoycottObject(node_index_t node_index) {
   return it->second;
 }
 
-Connection* FailureDetector::getServerConnection(node_index_t idx) {
-  return Worker::onThisThread()->sender().findServerConnection(idx);
+void FailureDetector::resetServerSocketConnectThrottle(node_index_t node_idx) {
+  auto* socket_sender = Worker::onThisThread()->socketSender();
+  if (socket_sender) {
+    socket_sender->resetServerSocketConnectThrottle(node_idx);
+  }
+}
+
+int FailureDetector::checkServerConnection(node_index_t node_idx) {
+  return Worker::onThisThread()->sender().checkServerConnection(node_idx);
 }
 
 void FailureDetector::setBlacklisted(node_index_t idx, bool blacklisted) {
@@ -1677,18 +1724,18 @@ void FailureDetector::updateVersions(
       }
       if (new_instance_id ||
           (accepting_durable_ver_indirectly && (recvd > existing))) {
-        ld_info("Updating RSM %s versions for N%zu, GOSSIP received from:%s, "
-                "new_instance_id:%s, rsm_type:%lu, "
-                "recvd:%s, existing:%s, accepting indirectly:%d",
-                msg.flags_ & GOSSIP_Message::HAS_IN_MEM_VERSIONS ? "in-memory"
-                                                                 : "durable",
-                id,
-                msg.gossip_node_.toString().c_str(),
-                new_instance_id ? "yes" : "no",
-                msg.rsm_types_[i].val_,
-                lsn_to_string(recvd).c_str(),
-                lsn_to_string(existing).c_str(),
-                accepting_durable_ver_indirectly);
+        ld_debug("Updating RSM %s versions for N%zu, GOSSIP received from:%s, "
+                 "new_instance_id:%s, rsm_type:%lu, "
+                 "recvd:%s, existing:%s, accepting indirectly:%d",
+                 msg.flags_ & GOSSIP_Message::HAS_IN_MEM_VERSIONS ? "in-memory"
+                                                                  : "durable",
+                 id,
+                 msg.gossip_node_.toString().c_str(),
+                 new_instance_id ? "yes" : "no",
+                 msg.rsm_types_[i].val_,
+                 lsn_to_string(recvd).c_str(),
+                 lsn_to_string(existing).c_str(),
+                 accepting_durable_ver_indirectly);
         fdnode_rsm_versions[msg.rsm_types_[i]] = node.rsm_versions_[i];
       }
     }

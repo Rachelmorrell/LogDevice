@@ -12,6 +12,8 @@
 #define STAT_DEFINE(...)
 #endif
 
+// MS we took to shutdown server
+STAT_DEFINE(shutdown_time_ms, SUM)
 // Total number of read requests
 STAT_DEFINE(read_requests, SUM)
 // Number of read requests that got kicked to storage threads
@@ -153,6 +155,26 @@ STAT_DEFINE(read_stream_start_violations, SUM)
 STAT_DEFINE(read_stream_started_violations, SUM)
 STAT_DEFINE(read_stream_gap_violations, SUM)
 STAT_DEFINE(read_stream_record_violations, SUM)
+
+// Read stream byte offset computation
+// Number of instances where byte offset is missing in the record payload
+STAT_DEFINE(read_stream_missing_record_offset, SUM)
+// Number of instances where epoch offset was unavailable
+STAT_DEFINE(read_stream_missing_epoch_offset, SUM)
+// Number of instances where byte offset was delivered as part of read request
+STAT_DEFINE(read_stream_included_byte_offset, SUM)
+
+// Read stream error computing epoch offset
+// Epoch offset unavailable due to store uninitialized
+STAT_DEFINE(epoch_offset_store_uninitialized, SUM)
+// Epoch offset unavailable due to error getting log metadata for earlier epochs
+STAT_DEFINE(epoch_offset_logmetadata_previous_error, SUM)
+// Epoch offset unavailable due to log metadata unavailable in current epoch
+STAT_DEFINE(epoch_offset_logmetadata_current_notfound, SUM)
+// Epoch offset unavailable due to error in getting log metadata in current epoch
+STAT_DEFINE(epoch_offset_logmetadata_current_error, SUM)
+// Request to retrieve epoch offset through log state
+STAT_DEFINE(epoch_offset_recover_logstate, SUM)
 
 // How many times did we consult Read Throttling framework
 STAT_DEFINE(read_throttling_num_throttle_checks, SUM)
@@ -708,6 +730,9 @@ STAT_DEFINE(append_rejected_cancelled, SUM)
 // number of rocksdb manual compaction performed
 STAT_DEFINE(manual_compactions, SUM)
 
+// How many times we reloaded the TLS ticket seeds
+STAT_DEFINE(tls_ticket_seeds_reloaded, SUM)
+
 STAT_DEFINE(server_read_streams_created, SUM)
 
 // Total number of records read by LocalLogStoreReader for all read streams.
@@ -1013,6 +1038,9 @@ STAT_DEFINE(gossips_failed_to_send, SUM)
 // How many times the failure detector failed to send gossip messages to an alive node
 STAT_DEFINE(gossips_failed_to_send_to_alive_nodes, SUM)
 
+// How many times a node didn't process gossips for
+// 'gossip_intervals_without_processing_threshold' intervals.
+STAT_DEFINE(gossips_failed_to_process, SUM)
 
 // Total number of nodes expected to be seen (including self)
 STAT_DEFINE(num_nodes, SUM)
@@ -1134,12 +1162,17 @@ STAT_DEFINE(server_message_dispatch_skip_permission, SUM)
 STAT_DEFINE(server_message_dispatch_check_permission, SUM)
 // bypass permission
 STAT_DEFINE(server_message_dispatch_bypass_permission, SUM)
+// check server messages sent by client
+STAT_DEFINE(unauthorized_server_message_by_client, SUM)
 
 // ACL Cache
 // cache misses
 STAT_DEFINE(acl_cache_misses, SUM)
 // cache hits
 STAT_DEFINE(acl_cache_hits, SUM)
+
+// Number of denied unauthenticated connections
+STAT_DEFINE(unauthenticated_connection_denied, SUM)
 
 // how many times metadata log has been trimmed
 STAT_DEFINE(metadata_log_trims, SUM)
@@ -1192,6 +1225,13 @@ STAT_DEFINE(appenderbuffer_pending_appenders, SUM)
 STAT_DEFINE(num_backlog_connections, SUM)
 // Total number of open connections
 STAT_DEFINE(num_connections, SUM)
+STAT_DEFINE(num_connections_incoming_data, SUM)
+STAT_DEFINE(num_connections_incoming_data_low_priority, SUM)
+STAT_DEFINE(num_connections_incoming_data_high_priority, SUM)
+STAT_DEFINE(num_connections_incoming_data_ssl, SUM)
+STAT_DEFINE(num_connections_incoming_gossip, SUM)
+STAT_DEFINE(num_connections_incoming_server_to_server, SUM)
+
 // Total number of open connections using ssl
 STAT_DEFINE(num_ssl_connections, SUM)
 // Dropped connections due to limit/burst

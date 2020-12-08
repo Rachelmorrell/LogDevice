@@ -21,9 +21,15 @@ import getdeps.cache as cache_module
 from getdeps.buildopts import setup_build_options
 from getdeps.dyndeps import create_dyn_dep_munger
 from getdeps.errors import TransientFailure
+from getdeps.fetcher import (
+    SystemPackageFetcher,
+    file_name_is_cmake_file,
+    list_files_under_dir_newer_than_timestamp,
+)
 from getdeps.load import ManifestLoader
 from getdeps.manifest import ManifestParser
 from getdeps.platform import HostType
+from getdeps.runcmd import run_cmd
 from getdeps.subcmd import SubCmd, add_subcommands, cmd
 
 
@@ -201,8 +207,8 @@ class ProjectCmdBase(SubCmd):
 
 
 class CachedProject(object):
-    """ A helper that allows calling the cache logic for a project
-    from both the build and the fetch code """
+    """A helper that allows calling the cache logic for a project
+    from both the build and the fetch code"""
 
     def __init__(self, cache, loader, m):
         self.m = m
@@ -227,6 +233,10 @@ class CachedProject(object):
         """ We only cache third party projects """
         return self.cache and self.m.shipit_project is None
 
+    def was_cached(self):
+        cached_marker = os.path.join(self.inst_dir, ".getdeps-cached-build")
+        return os.path.exists(cached_marker)
+
     def download(self):
         if self.is_cacheable() and not os.path.exists(self.inst_dir):
             print("check cache for %s" % self.cache_file_name)
@@ -241,6 +251,11 @@ class CachedProject(object):
                         "Extracting %s -> %s..." % (self.cache_file_name, self.inst_dir)
                     )
                     tf.extractall(self.inst_dir)
+
+                    cached_marker = os.path.join(self.inst_dir, ".getdeps-cached-build")
+                    with open(cached_marker, "w") as f:
+                        f.write("\n")
+
                     return True
             except Exception as exc:
                 print("%s" % str(exc))
@@ -308,6 +323,45 @@ class FetchCmd(ProjectCmdBase):
             # We need to fetch the sources
             fetcher = loader.create_fetcher(m)
             fetcher.update()
+
+
+@cmd("install-system-deps", "Install system packages to satisfy the deps for a project")
+class InstallSysDepsCmd(ProjectCmdBase):
+    def setup_project_cmd_parser(self, parser):
+        parser.add_argument(
+            "--recursive",
+            help="install the transitive deps also",
+            action="store_true",
+            default=False,
+        )
+
+    def run_project_cmd(self, args, loader, manifest):
+        if args.recursive:
+            projects = loader.manifests_in_dependency_order()
+        else:
+            projects = [manifest]
+
+        cache = cache_module.create_cache()
+        all_packages = {}
+        for m in projects:
+            ctx = loader.ctx_gen.get_context(m.name)
+            packages = m.get_required_system_packages(ctx)
+            for k, v in packages.items():
+                merged = all_packages.get(k, [])
+                merged += v
+                all_packages[k] = merged
+
+        manager = loader.build_opts.host_type.get_package_manager()
+        if manager == "rpm":
+            packages = sorted(list(set(all_packages["rpm"])))
+            if packages:
+                run_cmd(["dnf", "install", "-y"] + packages)
+        elif manager == "deb":
+            packages = sorted(list(set(all_packages["deb"])))
+            if packages:
+                run_cmd(["apt", "install", "-y"] + packages)
+        else:
+            print("I don't know how to install any packages on this system")
 
 
 @cmd("list-deps", "lists the transitive deps for a given project")
@@ -402,13 +456,24 @@ class BuildCmd(ProjectCmdBase):
         for m in projects:
             fetcher = loader.create_fetcher(m)
 
+            if isinstance(fetcher, SystemPackageFetcher):
+                # We are guaranteed that if the fetcher is set to
+                # SystemPackageFetcher then this item is completely
+                # satisfied by the appropriate system packages
+                continue
+
             if args.clean:
                 fetcher.clean()
 
             build_dir = loader.get_project_build_dir(m)
             inst_dir = loader.get_project_install_dir(m)
 
-            if m == manifest or not args.no_deps:
+            if (
+                m == manifest
+                and not args.only_deps
+                or m != manifest
+                and not args.no_deps
+            ):
                 print("Assessing %s..." % m.name)
                 project_hash = loader.get_project_hash(m)
                 ctx = loader.ctx_gen.get_context(m.name)
@@ -419,6 +484,17 @@ class BuildCmd(ProjectCmdBase):
                 reconfigure, sources_changed = self.compute_source_change_status(
                     cached_project, fetcher, m, built_marker, project_hash
                 )
+
+                if os.path.exists(built_marker) and not cached_project.was_cached():
+                    # We've previously built this. We may need to reconfigure if
+                    # our deps have changed, so let's check them.
+                    dep_reconfigure, dep_build = self.compute_dep_change_status(
+                        m, built_marker, loader
+                    )
+                    if dep_reconfigure:
+                        reconfigure = True
+                    if dep_build:
+                        sources_changed = True
 
                 if sources_changed or reconfigure or not os.path.exists(built_marker):
                     if os.path.exists(built_marker):
@@ -443,6 +519,42 @@ class BuildCmd(ProjectCmdBase):
                         cached_project.upload()
 
             install_dirs.append(inst_dir)
+
+    def compute_dep_change_status(self, m, built_marker, loader):
+        reconfigure = False
+        sources_changed = False
+        st = os.lstat(built_marker)
+
+        ctx = loader.ctx_gen.get_context(m.name)
+        dep_list = sorted(m.get_section_as_dict("dependencies", ctx).keys())
+        for dep in dep_list:
+            if reconfigure and sources_changed:
+                break
+
+            dep_manifest = loader.load_manifest(dep)
+            dep_root = loader.get_project_install_dir(dep_manifest)
+            for dep_file in list_files_under_dir_newer_than_timestamp(
+                dep_root, st.st_mtime
+            ):
+                if os.path.basename(dep_file) == ".built-by-getdeps":
+                    continue
+                if file_name_is_cmake_file(dep_file):
+                    if not reconfigure:
+                        reconfigure = True
+                        print(
+                            f"Will reconfigure cmake because {dep_file} is newer than {built_marker}"
+                        )
+                else:
+                    if not sources_changed:
+                        sources_changed = True
+                        print(
+                            f"Will run build because {dep_file} is newer than {built_marker}"
+                        )
+
+                if reconfigure and sources_changed:
+                    break
+
+        return reconfigure, sources_changed
 
     def compute_source_change_status(
         self, cached_project, fetcher, m, built_marker, project_hash
@@ -470,6 +582,10 @@ class BuildCmd(ProjectCmdBase):
                     os.unlink(built_marker)
                     reconfigure = True
                     sources_changed = True
+                    # While we don't need to consult the fetcher for the
+                    # status in this case, we may still need to have eg: shipit
+                    # run in order to have a correct source tree.
+                    fetcher.update()
 
             if check_fetcher:
                 change_status = fetcher.update()
@@ -500,6 +616,16 @@ class BuildCmd(ProjectCmdBase):
             ),
         )
         parser.add_argument(
+            "--only-deps",
+            action="store_true",
+            default=False,
+            help=(
+                "Only build the named project's deps. "
+                "This is most useful when you want to separate out building "
+                "of all of the deps and your project"
+            ),
+        )
+        parser.add_argument(
             "--no-build-cache",
             action="store_false",
             default=True,
@@ -525,13 +651,21 @@ class FixupDeps(ProjectCmdBase):
             install_dirs.append(inst_dir)
 
             if m == manifest:
-                dep_munger = create_dyn_dep_munger(loader.build_opts, install_dirs)
+                dep_munger = create_dyn_dep_munger(
+                    loader.build_opts, install_dirs, args.strip
+                )
                 dep_munger.process_deps(args.destdir, args.final_install_prefix)
 
     def setup_project_cmd_parser(self, parser):
-        parser.add_argument("destdir", help=("Where to copy the fixed up executables"))
+        parser.add_argument("destdir", help="Where to copy the fixed up executables")
         parser.add_argument(
-            "--final-install-prefix", help=("specify the final installation prefix")
+            "--final-install-prefix", help="specify the final installation prefix"
+        )
+        parser.add_argument(
+            "--strip",
+            action="store_true",
+            default=False,
+            help="Strip debug info while processing executables",
         )
 
 
@@ -562,10 +696,14 @@ class TestCmd(ProjectCmdBase):
                 builder = m.create_builder(
                     loader.build_opts, src_dir, build_dir, inst_dir, ctx, loader
                 )
+
                 builder.run_tests(
                     install_dirs,
                     schedule_type=args.schedule_type,
                     owner=args.test_owner,
+                    test_filter=args.filter,
+                    retry=args.retry,
+                    no_testpilot=args.no_testpilot,
                 )
 
             install_dirs.append(inst_dir)
@@ -575,10 +713,32 @@ class TestCmd(ProjectCmdBase):
             "--schedule-type", help="Indicates how the build was activated"
         )
         parser.add_argument("--test-owner", help="Owner for testpilot")
+        parser.add_argument("--filter", help="Only run the tests matching the regex")
+        parser.add_argument(
+            "--retry",
+            type=int,
+            default=3,
+            help="Number of immediate retries for failed tests "
+            "(noop in continuous and testwarden runs)",
+        )
+        parser.add_argument(
+            "--no-testpilot",
+            help="Do not use Test Pilot even when available",
+            action="store_true",
+        )
 
 
 @cmd("generate-github-actions", "generate a GitHub actions configuration")
 class GenerateGitHubActionsCmd(ProjectCmdBase):
+    RUN_ON_ALL = """ [push, pull_request]"""
+    RUN_ON_DEFAULT = """
+  push:
+    branches:
+    - master
+  pull_request:
+    branches:
+    - master"""
+
     def run_project_cmd(self, args, loader, manifest):
         platforms = [
             HostType("linux", "ubuntu", "18"),
@@ -586,39 +746,20 @@ class GenerateGitHubActionsCmd(ProjectCmdBase):
             HostType("windows", None, None),
         ]
 
-        with open(args.output_file, "w") as out:
-            # Deliberate line break here because the @ and the generated
-            # symbols are meaningful to our internal tooling when they
-            # appear in a single token
-            out.write("# This file was @")
-            out.write("generated by getdeps.py\n")
-            out.write(
-                """
-name: CI
+        for p in platforms:
+            self.write_job_for_platform(p, args)
 
-on:
-  push:
-    branches:
-    - master
-  pull_request:
-    branches:
-    - master
-
-jobs:
-"""
-            )
-            for p in platforms:
-                build_opts = setup_build_options(args, p)
-                self.write_job_for_platform(out, args, build_opts)
-
-    def write_job_for_platform(self, out, args, build_opts):
+    # TODO: Break up complex function
+    def write_job_for_platform(self, platform, args):  # noqa: C901
+        build_opts = setup_build_options(args, platform)
         ctx_gen = build_opts.get_context_generator()
         loader = ManifestLoader(build_opts, ctx_gen)
         manifest = loader.load_manifest(args.project)
         manifest_ctx = loader.ctx_gen.get_context(manifest.name)
+        run_on = self.RUN_ON_ALL if args.run_on_all_branches else self.RUN_ON_DEFAULT
 
         # Some projects don't do anything "useful" as a leaf project, only
-        # as a dep for a leaf project.  Check for those here; we don't want
+        # as a dep for a leaf project. Check for those here; we don't want
         # to waste the effort scheduling them on CI.
         # We do this by looking at the builder type in the manifest file
         # rather than creating a builder and checking its type because we
@@ -635,7 +776,7 @@ jobs:
 
         if build_opts.is_linux():
             job_name = "linux"
-            runs_on = "ubuntu-18.04"
+            runs_on = f"ubuntu-{args.ubuntu_version}"
         elif build_opts.is_windows():
             # We're targeting the windows-2016 image because it has
             # Visual Studio 2017 installed, and at the time of writing,
@@ -650,59 +791,126 @@ jobs:
             job_name = "mac"
             runs_on = "macOS-latest"
 
-        getdeps = f"{py3} build/fbcode_builder/getdeps.py"
+        os.makedirs(args.output_dir, exist_ok=True)
+        output_file = os.path.join(args.output_dir, f"getdeps_{job_name}.yml")
+        with open(output_file, "w") as out:
+            # Deliberate line break here because the @ and the generated
+            # symbols are meaningful to our internal tooling when they
+            # appear in a single token
+            out.write("# This file was @")
+            out.write("generated by getdeps.py\n")
+            out.write(
+                f"""
+name: {job_name}
 
-        out.write("  %s:\n" % job_name)
-        out.write("    runs-on: %s\n" % runs_on)
-        out.write("    steps:\n")
-        out.write("    - uses: actions/checkout@v1\n")
+on:{run_on}
 
-        if build_opts.is_windows():
-            # The git installation may not like long filenames, so tell it
-            # that we want it to use them!
-            out.write("    - name: Fix Git config\n")
-            out.write("      run: git config --system core.longpaths true\n")
+jobs:
+"""
+            )
 
-        projects = loader.manifests_in_dependency_order()
+            getdeps = f"{py3} build/fbcode_builder/getdeps.py"
+            if not args.disallow_system_packages:
+                getdeps += " --allow-system-packages"
 
-        for m in projects:
-            if m != manifest:
-                out.write("    - name: Fetch %s\n" % m.name)
-                out.write(f"      run: {getdeps} fetch --no-tests {m.name}\n")
+            out.write("  build:\n")
+            out.write("    runs-on: %s\n" % runs_on)
+            out.write("    steps:\n")
+            out.write("    - uses: actions/checkout@v1\n")
 
-        for m in projects:
-            if m != manifest:
-                out.write("    - name: Build %s\n" % m.name)
-                out.write(f"      run: {getdeps} build --no-tests {m.name}\n")
+            if build_opts.is_windows():
+                # cmake relies on BOOST_ROOT but GH deliberately don't set it in order
+                # to avoid versioning issues:
+                # https://github.com/actions/virtual-environments/issues/319
+                # Instead, set the version we think we need; this is effectively
+                # coupled with the boost manifest
+                # This is the unusual syntax for setting an env var for the rest of
+                # the steps in a workflow:
+                # https://help.github.com/en/actions/reference/workflow-commands-for-github-actions#setting-an-environment-variable
+                out.write("    - name: Export boost environment\n")
+                out.write(
+                    '      run: "echo ::set-env name=BOOST_ROOT::%BOOST_ROOT_1_69_0%"\n'
+                )
+                out.write("      shell: cmd\n")
 
-        out.write("    - name: Build %s\n" % manifest.name)
+                # The git installation may not like long filenames, so tell it
+                # that we want it to use them!
+                out.write("    - name: Fix Git config\n")
+                out.write("      run: git config --system core.longpaths true\n")
+            elif not args.disallow_system_packages:
+                out.write("    - name: Install system deps\n")
+                out.write(
+                    f"      run: sudo {getdeps} install-system-deps --recursive {manifest.name}\n"
+                )
 
-        project_prefix = ""
-        if not build_opts.is_windows():
-            project_prefix = " --project-install-prefix %s:/usr/local" % manifest.name
+            projects = loader.manifests_in_dependency_order()
 
-        out.write(
-            f"      run: {getdeps} build --src-dir=. {manifest.name} {project_prefix}\n"
-        )
+            for m in projects:
+                if m != manifest:
+                    out.write("    - name: Fetch %s\n" % m.name)
+                    out.write(f"      run: {getdeps} fetch --no-tests {m.name}\n")
 
-        out.write("    - name: Copy artifacts\n")
-        out.write(
-            f"      run: {getdeps} fixup-dyn-deps "
-            f"--src-dir=. {manifest.name} _artifacts/{job_name} --final-install-prefix /usr/local\n"
-        )
+            for m in projects:
+                if m != manifest:
+                    out.write("    - name: Build %s\n" % m.name)
+                    out.write(f"      run: {getdeps} build --no-tests {m.name}\n")
 
-        out.write("    - uses: actions/upload-artifact@master\n")
-        out.write("      with:\n")
-        out.write("        name: %s\n" % manifest.name)
-        out.write("        path: _artifacts\n")
+            out.write("    - name: Build %s\n" % manifest.name)
 
-        out.write("    - name: Test %s\n" % manifest.name)
-        out.write(
-            f"      run: {getdeps} test --src-dir=. {manifest.name} {project_prefix}\n"
-        )
+            project_prefix = ""
+            if not build_opts.is_windows():
+                project_prefix = (
+                    " --project-install-prefix %s:/usr/local" % manifest.name
+                )
+
+            out.write(
+                f"      run: {getdeps} build --src-dir=. {manifest.name} {project_prefix}\n"
+            )
+
+            out.write("    - name: Copy artifacts\n")
+            if build_opts.is_linux():
+                # Strip debug info from the binaries, but only on linux.
+                # While the `strip` utility is also available on macOS,
+                # attempting to strip there results in an error.
+                # The `strip` utility is not available on Windows.
+                strip = " --strip"
+            else:
+                strip = ""
+
+            out.write(
+                f"      run: {getdeps} fixup-dyn-deps{strip} "
+                f"--src-dir=. {manifest.name} _artifacts/{job_name} {project_prefix} "
+                f"--final-install-prefix /usr/local\n"
+            )
+
+            out.write("    - uses: actions/upload-artifact@master\n")
+            out.write("      with:\n")
+            out.write("        name: %s\n" % manifest.name)
+            out.write("        path: _artifacts\n")
+
+            out.write("    - name: Test %s\n" % manifest.name)
+            out.write(
+                f"      run: {getdeps} test --src-dir=. {manifest.name} {project_prefix}\n"
+            )
 
     def setup_project_cmd_parser(self, parser):
-        parser.add_argument("--output-file", help="The name of the yaml file")
+        parser.add_argument(
+            "--disallow-system-packages",
+            help="Disallow satisfying third party deps from installed system packages",
+            action="store_true",
+            default=False,
+        )
+        parser.add_argument(
+            "--output-dir", help="The directory that will contain the yml files"
+        )
+        parser.add_argument(
+            "--run-on-all-branches",
+            action="store_true",
+            help="Allow CI to fire on all branches - Handy for testing",
+        )
+        parser.add_argument(
+            "--ubuntu-version", default="18.04", help="Version of Ubuntu to use"
+        )
 
 
 def get_arg_var_name(args):
@@ -768,6 +976,12 @@ def parse_args():
         help="Perform a non-FB internal build, even when in an fbsource repository",
         action="store_false",
         dest="facebook_internal",
+    )
+    add_common_arg(
+        "--allow-system-packages",
+        help="Allow satisfying third party deps from installed system packages",
+        action="store_true",
+        default=False,
     )
 
     ap = argparse.ArgumentParser(

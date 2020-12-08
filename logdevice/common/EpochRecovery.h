@@ -36,7 +36,7 @@ namespace facebook { namespace logdevice {
  *       recovery of that log.
  */
 
-struct DataRecordOwnsPayload;
+struct RawDataRecord;
 struct GAP_Header;
 struct MUTATED_Header;
 struct Settings;
@@ -63,12 +63,6 @@ class EpochRecoveryDependencies {
 
   virtual void onShardRemovedFromConfig(ShardID shard);
 
-  /**
-   * @return   if mutation can happen on _shard_; i.e., the shard is
-   *           writable (not in rebuilding set).
-   */
-  virtual bool canMutateShard(ShardID shard) const;
-
   virtual NodeID getMyNodeID() const;
 
   virtual read_stream_id_t issueReadStreamID();
@@ -82,7 +76,8 @@ class EpochRecoveryDependencies {
   virtual std::unique_ptr<Timer>
   createTimer(std::function<void()> cb = nullptr);
 
-  virtual int registerOnSocketClosed(const Address& addr, SocketCallback& cb);
+  virtual int registerOnConnectionClosed(const Address& addr,
+                                         SocketCallback& cb);
 
   virtual int setLastCleanEpoch(logid_t logid,
                                 epoch_t lce,
@@ -160,7 +155,7 @@ class EpochRecovery {
       logid_t log_id,
       epoch_t epoch,
       const EpochMetaData& epoch_metadata,
-      const std::shared_ptr<const NodesConfiguration>& nodes_configuration,
+      std::shared_ptr<UpdateableNodesConfiguration> nodes_configuration,
       std::unique_ptr<EpochRecoveryDependencies> deps,
       bool tail_optimized);
 
@@ -310,7 +305,7 @@ class EpochRecovery {
    */
   void onDigestRecord(ShardID from,
                       read_stream_id_t rsid,
-                      std::unique_ptr<DataRecordOwnsPayload> record);
+                      std::unique_ptr<RawDataRecord> record);
 
   /**
    * Called by GAP_Message::onReceived() when a GAP message is received
@@ -591,7 +586,7 @@ class EpochRecovery {
   createMutationHeader(esn_t esn,
                        uint64_t timestamp,
                        STORE_flags_t flags,
-                       DataRecordOwnsPayload* record) const;
+                       RawDataRecord* record) const;
 
   /**
    * Given the final digest, perform mutations for the epoch. Starting from
@@ -626,6 +621,11 @@ class EpochRecovery {
    * --recovery-timeout command line option.
    */
   void startMutationAndCleaningTimer();
+
+  /**
+   * @return   if mutation can happen on _shard_; i.e., the shard is writable.
+   */
+  bool canMutateShard(ShardID shard) const;
 
   // true if the log is tail optimized according to the logs config
   const bool tail_optimized_;
@@ -737,6 +737,8 @@ class EpochRecovery {
 
   // Used for a paranoid consistency check.
   uint64_t last_timestamp_from_seals_ = 0;
+
+  std::shared_ptr<UpdateableNodesConfiguration> nodes_config_;
 
   // used for latency histograms
   std::chrono::steady_clock::time_point activation_time_{

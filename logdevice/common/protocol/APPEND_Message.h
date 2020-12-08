@@ -77,6 +77,9 @@ struct APPEND_Header {
   // stream and can be accepted unconditionally by a sequencer.
   static constexpr APPEND_flags_t WRITE_STREAM_RESUME = 1u << 13; // 8192
 
+  // Append contains serialized PyaloadGroup.
+  static constexpr APPEND_flags_t PAYLOAD_GROUP = 1u << 23; // 8388608
+
   static constexpr APPEND_flags_t FORCE = NO_REDIRECT | REACTIVATE_IF_PREEMPTED;
 } __attribute__((__packed__));
 
@@ -150,6 +153,7 @@ class APPEND_Message : public Message {
   friend class MessageSerializationTest;
   friend class E2ETracingSerializationTest;
   friend class MockStreamAppendRequest;
+  friend class ThriftMessageSerializerTest;
 };
 
 /**

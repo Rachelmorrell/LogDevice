@@ -10,6 +10,7 @@
 #include "logdevice/common/MetaDataTracer.h"
 #include "logdevice/common/configuration/nodes/utils.h"
 #include "logdevice/common/debug.h"
+#include "logdevice/common/nodeset_selection/NodeSetSelector.h"
 #include "logdevice/common/nodeset_selection/NodeSetSelectorFactory.h"
 #include "logdevice/lib/ClientProcessor.h"
 
@@ -29,10 +30,7 @@ operator()(logid_t log_id,
                              /* target_nodeset_size */ folly::none,
                              /* nodeset_seed */ folly::none,
                              nodeset_selector_.get(),
-                             use_storage_set_format_,
-                             provision_if_empty_,
-                             update_if_exists_,
-                             force_update_);
+                             options_);
   if (res == UpdateResult::ONLY_NODESET_PARAMS_CHANGED ||
       res == UpdateResult::NONSUBSTANTIAL_RECONFIGURATION ||
       res == UpdateResult::CREATED ||
@@ -130,10 +128,7 @@ UpdateResult updateMetaDataIfNeeded(
     folly::Optional<nodeset_size_t> target_nodeset_size,
     folly::Optional<uint64_t> nodeset_seed,
     NodeSetSelector* nodeset_selector,
-    bool use_storage_set_format,
-    bool provision_if_empty,
-    bool update_if_exists,
-    bool force_update) {
+    const EpochMetaData::Updater::Options& options) {
   const auto logcfg = config.getLogGroupByIDShared(log_id);
   if (!logcfg) {
     err = E::NOTFOUND;
@@ -143,7 +138,7 @@ UpdateResult updateMetaDataIfNeeded(
   // If the given metadata is empty, provision it with an initial metadata
   // Otherwise, update the metadata given
   const bool prev_metadata_exists = metadata && !metadata->isEmpty();
-  if (!prev_metadata_exists && !provision_if_empty) {
+  if (!prev_metadata_exists && !options.provisionIfEmpty()) {
     RATELIMIT_INFO(std::chrono::seconds(10),
                    10,
                    "Metadata not found for log %lu",
@@ -152,7 +147,7 @@ UpdateResult updateMetaDataIfNeeded(
     return UpdateResult::FAILED;
   }
 
-  if (prev_metadata_exists && !update_if_exists) {
+  if (prev_metadata_exists && !options.updateIfExists()) {
     ld_error("Metadata already provisioned for log %lu", log_id.val_);
     err = E::EXISTS;
     return UpdateResult::FAILED;
@@ -194,7 +189,7 @@ UpdateResult updateMetaDataIfNeeded(
       target_nodeset_size.value(),
       nodeset_seed.value(),
       prev_metadata_exists ? metadata.get() : nullptr,
-      nullptr);
+      NodeSetSelector::Options{});
 
   UpdateResult result =
       prev_metadata_exists ? UpdateResult::UNCHANGED : UpdateResult::CREATED;
@@ -227,7 +222,7 @@ UpdateResult updateMetaDataIfNeeded(
       // No change in nodeset. Any change is due to change in the config.
       result = processConfigChanges(metadata,
                                     replication,
-                                    force_update,
+                                    options.forceUpdate(),
                                     metadata_version,
                                     target_nodeset_size,
                                     nodeset_seed,
@@ -247,7 +242,7 @@ UpdateResult updateMetaDataIfNeeded(
         // Figure out what else changed on the log config or the nodeset params.
         UpdateResult configResult = processConfigChanges(metadata,
                                                          replication,
-                                                         force_update,
+                                                         options.forceUpdate(),
                                                          metadata_version,
                                                          target_nodeset_size,
                                                          nodeset_seed,
@@ -320,7 +315,7 @@ UpdateResult updateMetaDataIfNeeded(
   // clear the DISABLED flag as well
   metadata->h.flags &= ~MetaDataLogRecordHeader::DISABLED;
 
-  if (use_storage_set_format) {
+  if (options.useStorageSetFormat()) {
     // Enable the new copyset serialization format
     metadata->h.flags |= MetaDataLogRecordHeader::HAS_STORAGE_SET;
   } else {
@@ -486,15 +481,18 @@ operator()(logid_t log_id,
     if (provisioning_enabled && provisioning_allowed) {
       ld_check(config_);
       ld_check(nodes_configuration_);
-      res = updateMetaDataIfNeeded(log_id,
-                                   info,
-                                   *config_,
-                                   *nodes_configuration_,
-                                   folly::none,
-                                   folly::none,
-                                   /* nodeset_selector */ nullptr,
-                                   use_storage_set_format_,
-                                   provision_if_empty_);
+      res = updateMetaDataIfNeeded(
+          log_id,
+          info,
+          *config_,
+          *nodes_configuration_,
+          folly::none,
+          folly::none,
+          /* nodeset_selector */ nullptr,
+          EpochMetaData::Updater::Options()
+              .setUseStorageSetFormat(options_.useStorageSetFormat())
+              .setProvisionIfEmpty(options_.provisionIfEmpty())
+              .setUpdateIfExists());
       if (res == UpdateResult::FAILED) {
         return res;
       }

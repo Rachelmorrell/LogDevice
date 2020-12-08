@@ -13,10 +13,10 @@
 #include <folly/io/async/EventBaseThread.h>
 
 #include "logdevice/common/WorkerType.h"
+#include "logdevice/server/ServerSettings.h"
 
 namespace facebook { namespace logdevice {
 
-class AdminServer;
 class ConnectionListener;
 class EventLoop;
 class EventLogStateMachine;
@@ -29,6 +29,7 @@ class ServerProcessor;
 class ShardedStorageThreadPool;
 class ShardedRocksDBLocalLogStore;
 class SequencerPlacement;
+class LogDeviceThriftServer;
 class UnreleasedRecordDetector;
 class Worker;
 
@@ -43,27 +44,31 @@ class ClusterMaintenanceStateMachine;
  *   1. If fast_shutdown is set to false, call requestFailover on the
  *      SequencerPlacement object to failover currently handled shards to a
  *      different server.
- *   2. Destroys ConnectionListener, CommandListener, GossipListener,
+ *   2. Stop admitting new requests into API and admin Thrift servers
+ *   3. Destroys ConnectionListener, CommandListener, GossipListener,
  *      SSL connection and command listeners to stop accepting new
  *      connections.
- *   3. accepting_work_ is set to false on all Workers. This prevents worker
+ *   4. accepting_work_ is set to false on all Workers. This prevents worker
  *      threads from taking new work.
- *   4. ShardedStorageThreadPool's shutdown() method is called. All queued tasks
+ *   5. ShardedStorageThreadPool's shutdown() method is called. All queued tasks
  *      are processed before threads exit.
- *   5. Waits until all workers complete any Requests they may still have
+ *   6. Waits until all workers complete any Requests they may still have
  *      that are active.
- *   6. Finally, destroys the Processor object, taking down all worker threads.
+ *   7. Finally, destroys the Processor object, taking down all worker threads.
  *
  */
 void shutdown_server(
-    std::unique_ptr<AdminServer>& admin_server,
+    std::unique_ptr<LogDeviceThriftServer>& admin_server,
+    std::unique_ptr<LogDeviceThriftServer>& s2s_thrift_api_server,
+    std::unique_ptr<LogDeviceThriftServer>& c2s_thrift_api_server,
     std::unique_ptr<Listener>& connection_listener,
+    std::map<ServerSettings::ClientNetworkPriority, std::unique_ptr<Listener>>&
+        listeners_per_priority,
     std::unique_ptr<Listener>& gossip_listener,
     std::unique_ptr<Listener>& ssl_connection_listener,
     std::unique_ptr<Listener>& server_to_server_listener,
     std::unique_ptr<folly::EventBaseThread>& connection_listener_loop,
     std::unique_ptr<folly::EventBaseThread>& gossip_listener_loop,
-    std::unique_ptr<folly::EventBaseThread>& ssl_connection_listener_loop,
     std::unique_ptr<folly::EventBaseThread>& server_to_server_listener_loop,
     std::unique_ptr<LogStoreMonitor>& logstore_monitor,
     std::shared_ptr<ServerProcessor>& processor,
@@ -76,7 +81,8 @@ void shutdown_server(
     std::shared_ptr<UnreleasedRecordDetector>& unreleased_record_detector,
     std::unique_ptr<maintenance::ClusterMaintenanceStateMachine>&
         cluster_maintenance_state_machine,
-    bool fast_shutdown);
+    bool fast_shutdown,
+    uint64_t& shutdown_duration_ms);
 
 /**
  * Helper function to post a request with a semaphore on workers with the

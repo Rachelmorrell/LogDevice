@@ -12,7 +12,7 @@
 #include "logdevice/common/Connection.h"
 #include "logdevice/common/FlowGroup.h"
 #include "logdevice/common/Sockaddr.h"
-#include "logdevice/common/SocketDependencies.h"
+#include "logdevice/common/SocketNetworkDependencies.h"
 #include "logdevice/common/network/AsyncSocketAdapter.h"
 #include "logdevice/common/settings/Settings.h"
 
@@ -41,9 +41,8 @@ std::unique_ptr<Connection> AsyncSocketConnectionFactory::createConnection(
     NodeID node_id,
     SocketType socket_type,
     ConnectionType connection_type,
-    PeerType peer_type,
     FlowGroup& flow_group,
-    std::unique_ptr<SocketDependencies> deps) {
+    std::unique_ptr<SocketNetworkDependencies> deps) {
   std::unique_ptr<AsyncSocketAdapter> sock_adapter;
   if (connection_type != ConnectionType::SSL &&
       (forceSSLSockets() && socket_type != SocketType::GOSSIP)) {
@@ -60,7 +59,6 @@ std::unique_ptr<Connection> AsyncSocketConnectionFactory::createConnection(
   auto connection = std::make_unique<Connection>(node_id,
                                                  socket_type,
                                                  connection_type,
-                                                 peer_type,
                                                  flow_group,
                                                  std::move(deps),
                                                  std::move(sock_adapter));
@@ -84,7 +82,8 @@ std::unique_ptr<Connection> AsyncSocketConnectionFactory::createConnection(
     SocketType type,
     ConnectionType connection_type,
     FlowGroup& flow_group,
-    std::unique_ptr<SocketDependencies> deps) const {
+    std::unique_ptr<SocketNetworkDependencies> deps,
+    ConnectionKind connection_kind) const {
   if (connection_type != ConnectionType::SSL &&
       (forceSSLSockets() && type != SocketType::GOSSIP)) {
     connection_type = ConnectionType::SSL;
@@ -108,6 +107,7 @@ std::unique_ptr<Connection> AsyncSocketConnectionFactory::createConnection(
                                       connection_type,
                                       flow_group,
                                       std::move(deps),
-                                      std::move(sock_adapter));
+                                      std::move(sock_adapter),
+                                      connection_kind);
 }
 }} // namespace facebook::logdevice

@@ -27,12 +27,17 @@
 #include "logdevice/common/ConstructorFailed.h"
 #include "logdevice/common/EventHandler.h"
 #include "logdevice/common/FlowGroup.h"
+#include "logdevice/common/PrincipalIdentity.h"
 #include "logdevice/common/ProtocolHandler.h"
 #include "logdevice/common/ResourceBudget.h"
+#include "logdevice/common/SSLPrincipalParser.h"
 #include "logdevice/common/SocketCallback.h"
-#include "logdevice/common/SocketDependencies.h"
+#include "logdevice/common/SocketNetworkDependencies.h"
+#include "logdevice/common/configuration/ServerConfig.h"
+#include "logdevice/common/configuration/nodes/NodesConfiguration.h"
 #include "logdevice/common/debug.h"
 #include "logdevice/common/network/MessageReader.h"
+#include "logdevice/common/network/SessionInjectorCallback.h"
 #include "logdevice/common/network/SocketAdapter.h"
 #include "logdevice/common/network/SocketConnectCallback.h"
 #include "logdevice/common/protocol/Compatibility.h"
@@ -75,20 +80,24 @@ getTimeDiff(std::chrono::steady_clock::time_point& start_time) {
   return std::chrono::duration_cast<std::chrono::milliseconds>(diff);
 }
 
-Connection::Connection(std::unique_ptr<SocketDependencies>& deps,
+class Connection::HandshakeTimeout : public folly::HHWheelTimer::Callback {
+ public:
+  explicit HandshakeTimeout(Connection& connection) : connection_(connection) {}
+  void timeoutExpired() noexcept override {
+    bumpEventHandersCalled();
+    connection_.onHandshakeTimeout();
+    bumpEventHandlersCompleted();
+  }
+  Connection& connection_;
+};
+
+Connection::Connection(std::unique_ptr<SocketNetworkDependencies>& deps,
                        Address peer_name,
                        const Sockaddr& peer_sockaddr,
                        SocketType type,
                        ConnectionType conntype,
                        FlowGroup& flow_group)
-    : peer_name_(peer_name),
-      peer_sockaddr_(peer_sockaddr),
-      conn_description_(peer_name.toString() + "(" +
-                        (peer_sockaddr_.valid() ? peer_sockaddr_.toString()
-                                                : std::string("UNKNOWN")) +
-                        ")"),
-      flow_group_(flow_group),
-      type_(type),
+    : flow_group_(flow_group),
       socket_ref_holder_(std::make_shared<bool>(true), this),
       impl_(new SocketImpl),
       deps_(std::move(deps)),
@@ -96,11 +105,9 @@ Connection::Connection(std::unique_ptr<SocketDependencies>& deps,
       drain_pos_(0),
       connected_(false),
       handshaken_(false),
-      proto_(getSettings().max_protocol),
-      our_name_at_peer_(ClientID::INVALID),
       outbuf_overflow_(getSettings().outbuf_overflow_kb * 1024),
       outbufs_min_budget_(getSettings().outbuf_socket_min_kb * 1024),
-      handshake_timeout_event_(deps_->getEvBase()),
+      handshake_timeout_event_(std::make_unique<HandshakeTimeout>(*this)),
       first_attempt_(true),
       tcp_sndbuf_cache_({128 * 1024, std::chrono::steady_clock::now()}),
       tcp_rcvbuf_size_(128 * 1024),
@@ -108,43 +115,27 @@ Connection::Connection(std::unique_ptr<SocketDependencies>& deps,
       num_messages_sent_(0),
       num_messages_received_(0),
       num_bytes_received_(0),
-      end_stream_rewind_event_(deps_->getEvBase()),
+      info_(peer_name, peer_sockaddr, type, conntype),
       retry_receipt_of_message_(deps_->getEvBase()),
-      sched_write_chain_(deps_->getEvBase()) {
-  conntype_ = conntype;
-
+      sched_write_chain_(deps_->getEvBase()),
+      last_used_time_(SteadyTimestamp::now()),
+      pre_handshake_proto_(getSettings().max_protocol) {
+  conn_description_ = info_.describe();
   if (!peer_sockaddr.valid()) {
     ld_check(!peer_name.isClientAddress());
-    if (conntype_ == ConnectionType::SSL) {
+    if (info_.connection_type == ConnectionType::SSL) {
       err = E::NOSSLCONFIG;
       RATELIMIT_ERROR(std::chrono::seconds(10),
                       2,
                       "Recipient %s is not configured for SSL connections.",
-                      peer_name_.toString().c_str());
+                      info_.peer_name.toString().c_str());
     } else {
       err = E::NOTINCONFIG;
       RATELIMIT_ERROR(std::chrono::seconds(10),
                       2,
                       "Invalid address for %s.",
-                      peer_name_.toString().c_str());
+                      info_.peer_name.toString().c_str());
     }
-    throw ConstructorFailed();
-  }
-
-  handshake_timeout_event_.attachCallback([this] {
-    bumpEventHandersCalled();
-    onHandshakeTimeout();
-    bumpEventHandlersCompleted();
-  });
-  end_stream_rewind_event_.attachCallback([this] {
-    bumpEventHandersCalled();
-    endStreamRewind();
-    bumpEventHandlersCompleted();
-  });
-
-  int rv = end_stream_rewind_event_.setPriority(EventLoop::PRIORITY_HIGH);
-  if (rv != 0) {
-    err = E::INTERNAL;
     throw ConstructorFailed();
   }
 }
@@ -152,30 +143,25 @@ Connection::Connection(std::unique_ptr<SocketDependencies>& deps,
 Connection::Connection(NodeID server_name,
                        SocketType socket_type,
                        ConnectionType connection_type,
-                       PeerType peer_type,
                        FlowGroup& flow_group,
-                       std::unique_ptr<SocketDependencies> deps)
-    : Connection(deps,
-                 Address(server_name),
-                 deps->getNodeSockaddr(server_name,
-                                       socket_type,
-                                       connection_type,
-                                       peer_type),
-                 socket_type,
-                 connection_type,
-                 flow_group) {}
+                       std::unique_ptr<SocketNetworkDependencies> deps)
+    : Connection(
+          deps,
+          Address(server_name),
+          deps->getNodeSockaddr(server_name, socket_type, connection_type),
+          socket_type,
+          connection_type,
+          flow_group) {}
 
 Connection::Connection(NodeID server_name,
                        SocketType socket_type,
                        ConnectionType connection_type,
-                       PeerType peer_type,
                        FlowGroup& flow_group,
-                       std::unique_ptr<SocketDependencies> deps,
+                       std::unique_ptr<SocketNetworkDependencies> deps,
                        std::unique_ptr<SocketAdapter> sock_adapter)
     : Connection(server_name,
                  socket_type,
                  connection_type,
-                 peer_type,
                  flow_group,
                  std::move(deps)) {
   proto_handler_ = std::make_shared<ProtocolHandler>(
@@ -191,7 +177,8 @@ Connection::Connection(int fd,
                        SocketType type,
                        ConnectionType conntype,
                        FlowGroup& flow_group,
-                       std::unique_ptr<SocketDependencies> deps)
+                       std::unique_ptr<SocketNetworkDependencies> deps,
+                       ConnectionKind connection_kind)
     : Connection(deps,
                  Address(client_name),
                  client_addr,
@@ -201,11 +188,11 @@ Connection::Connection(int fd,
   ld_check(fd >= 0);
   ld_check(client_name.valid());
   ld_check(client_addr.valid());
+  connection_kind_ = connection_kind;
+  info_.is_active->store(true);
 
   // note that caller (Sender.addClient()) does not close(fd) on error.
   // If you add code here that throws ConstructorFailed you must close(fd)!
-
-  conn_closed_ = std::make_shared<std::atomic<bool>>(false);
   conn_incoming_token_ = std::move(conn_token);
 
   addHandshakeTimeoutEvent();
@@ -214,11 +201,7 @@ Connection::Connection(int fd,
   peer_shuttingdown_ = false;
   fd_ = fd;
 
-  STAT_INCR(deps_->getStats(), num_connections);
-  STAT_DECR(deps_->getStats(), num_backlog_connections);
-  if (isSSL()) {
-    STAT_INCR(deps_->getStats(), num_ssl_connections);
-  }
+  updateOpenConnectionStats();
 }
 
 Connection::Connection(int fd,
@@ -228,8 +211,9 @@ Connection::Connection(int fd,
                        SocketType type,
                        ConnectionType conntype,
                        FlowGroup& flow_group,
-                       std::unique_ptr<SocketDependencies> deps,
-                       std::unique_ptr<SocketAdapter> sock_adapter)
+                       std::unique_ptr<SocketNetworkDependencies> deps,
+                       std::unique_ptr<SocketAdapter> sock_adapter,
+                       ConnectionKind connection_kind)
     : Connection(fd,
                  client_name,
                  client_addr,
@@ -237,13 +221,14 @@ Connection::Connection(int fd,
                  type,
                  conntype,
                  flow_group,
-                 std::move(deps)) {
+                 std::move(deps),
+                 connection_kind) {
   proto_handler_ = std::make_shared<ProtocolHandler>(
       this, std::move(sock_adapter), conn_description_, deps_->getEvBase());
   sock_write_cb_ = SocketWriteCallback(proto_handler_.get());
   proto_handler_->getSentEvent()->attachCallback([this] { drainSendQueue(); });
   // Set the read callback.
-  read_cb_.reset(new MessageReader(*proto_handler_, proto_));
+  read_cb_.reset(new MessageReader(*proto_handler_, getProto()));
   proto_handler_->sock()->setReadCB(read_cb_.get());
 }
 
@@ -253,8 +238,111 @@ Connection::~Connection() {
   close(E::SHUTDOWN);
 }
 
+bool Connection::isNodeConnectionAddressOrGenerationOutdated() const {
+  if (info_.peer_name.valid() && info_.peer_name.isNodeAddress()) {
+    auto nodes_config = deps_->getNodesConfiguration();
+    auto node_id = info_.peer_name.asNodeID();
+    auto node_idx = node_id.index();
+
+    if (!nodes_config->isNodeInServiceDiscoveryConfig(node_idx)) {
+      ld_info("Node %s is no longer in cluster configuration.",
+              node_id.toString().c_str());
+      return true;
+    }
+
+    auto expected_address = deps_->getNodeSockaddr(
+        node_id, info_.socket_type, info_.connection_type);
+    auto expected_generation = nodes_config->getNodeGeneration(node_idx);
+
+    if (expected_address != info_.peer_address ||
+        expected_generation != node_id.generation()) {
+      ld_info("Configuration change detected for node %s. Expected address: "
+              "%s, generation: %d, found address %s, generation %d.",
+              node_id.toString().c_str(),
+              expected_address.toString().c_str(),
+              expected_generation,
+              info_.peer_address.toString().c_str(),
+              node_id.generation());
+      return true;
+    }
+  }
+
+  return false;
+}
+
+void Connection::updateOpenConnectionStats() {
+  STAT_DECR(deps_->getStats(), num_backlog_connections);
+  if (isSSL()) {
+    STAT_INCR(deps_->getStats(), num_ssl_connections);
+  }
+  STAT_INCR(deps_->getStats(), num_connections);
+
+  if (!connection_kind_.has_value()) {
+    return;
+  }
+
+  switch (connection_kind_.value()) {
+    case ConnectionKind::DATA:
+      STAT_INCR(deps_->getStats(), num_connections_incoming_data);
+      break;
+    case ConnectionKind::DATA_LOW_PRIORITY:
+      STAT_INCR(deps_->getStats(), num_connections_incoming_data_low_priority);
+      break;
+    case ConnectionKind::DATA_HIGH_PRIORITY:
+      STAT_INCR(deps_->getStats(), num_connections_incoming_data_high_priority);
+      break;
+    case ConnectionKind::DATA_SSL:
+      STAT_INCR(deps_->getStats(), num_connections_incoming_data_ssl);
+      break;
+    case ConnectionKind::GOSSIP:
+      STAT_INCR(deps_->getStats(), num_connections_incoming_gossip);
+      break;
+    case ConnectionKind::SERVER_TO_SERVER:
+      STAT_INCR(deps_->getStats(), num_connections_incoming_server_to_server);
+      break;
+    case ConnectionKind::MAX:
+      ld_check(false);
+      break;
+  }
+}
+
+void Connection::updateCloseConnectionStats() {
+  if (isSSL()) {
+    STAT_DECR(deps_->getStats(), num_ssl_connections);
+  }
+  STAT_DECR(deps_->getStats(), num_connections);
+
+  if (!connection_kind_.has_value()) {
+    return;
+  }
+
+  switch (connection_kind_.value()) {
+    case ConnectionKind::DATA:
+      STAT_DECR(deps_->getStats(), num_connections_incoming_data);
+      break;
+    case ConnectionKind::DATA_LOW_PRIORITY:
+      STAT_DECR(deps_->getStats(), num_connections_incoming_data_low_priority);
+      break;
+    case ConnectionKind::DATA_HIGH_PRIORITY:
+      STAT_DECR(deps_->getStats(), num_connections_incoming_data_high_priority);
+      break;
+    case ConnectionKind::DATA_SSL:
+      STAT_DECR(deps_->getStats(), num_connections_incoming_data_ssl);
+      break;
+    case ConnectionKind::GOSSIP:
+      STAT_DECR(deps_->getStats(), num_connections_incoming_gossip);
+      break;
+    case ConnectionKind::SERVER_TO_SERVER:
+      STAT_DECR(deps_->getStats(), num_connections_incoming_server_to_server);
+      break;
+    case ConnectionKind::MAX:
+      ld_check(false);
+      break;
+  }
+}
+
 int Connection::preConnectAttempt() {
-  if (peer_name_.isClientAddress()) {
+  if (info_.peer_name.isClientAddress()) {
     if (!isClosed()) {
       ld_check(connected_);
       err = E::ISCONN;
@@ -360,7 +448,7 @@ folly::Future<Status> Connection::asyncConnect() {
   auto connect_timeout_retry_multiplier =
       getSettings().connect_timeout_retry_multiplier;
   folly::SocketOptionMap options(getDefaultSocketOptions(
-      peer_sockaddr_.getSocketAddress(), getSettings()));
+      info_.peer_address.getSocketAddress(), getSettings()));
 
   for (size_t retry_count = 1; retry_count < max_retries; ++retry_count) {
     timeout += std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -368,16 +456,25 @@ folly::Future<Status> Connection::asyncConnect() {
         pow(connect_timeout_retry_multiplier, retry_count));
   }
 
-  auto connect_cb = std::make_unique<SocketConnectCallback>();
-
+  auto socket_connect_cb = std::make_unique<SocketConnectCallback>();
   /* TODO(gauresh) : Go to worker in future. using unsafe future for now.
   auto executor = worker_ != nullptr ? worker_->getExecutor()
                                      : &folly::InlineExecutor::instance();
                                      */
-  auto fut = connect_cb->getConnectStatus().toUnsafeFuture();
+  auto fut = socket_connect_cb->getConnectStatus().toUnsafeFuture();
+
+  std::unique_ptr<folly::AsyncSocket::ConnectCallback> connect_cb =
+      std::move(socket_connect_cb);
+
+  if (isSSL() && getSettings().ssl_use_session_resumption) {
+    connect_cb =
+        std::make_unique<SessionInjectorCallback>(std::move(connect_cb),
+                                                  &deps_->getSSLSessionCache(),
+                                                  proto_handler_->sock());
+  }
 
   proto_handler_->sock()->connect(connect_cb.get(),
-                                  peer_sockaddr_.getSocketAddress(),
+                                  info_.peer_address.getSocketAddress(),
                                   timeout.count(),
                                   options);
 
@@ -410,10 +507,11 @@ int Connection::connect() {
     return rv;
   }
 
+  last_used_time_ = SteadyTimestamp::now();
   auto fut = asyncConnect();
 
   fd_ = proto_handler_->sock()->getNetworkSocket().toFd();
-  conn_closed_ = std::make_shared<std::atomic<bool>>(false);
+  info_.is_active->store(true);
   next_pos_ = 0;
   drain_pos_ = 0;
 
@@ -426,7 +524,7 @@ int Connection::connect() {
     auto g = folly::makeGuard(deps_->setupContextGuard());
     if (st == E::ISCONN) {
       transitionToConnected();
-      read_cb_.reset(new MessageReader(*proto_handler_, proto_));
+      read_cb_.reset(new MessageReader(*proto_handler_, getProto()));
       proto_handler_->sock()->setReadCB(read_cb_.get());
     }
   };
@@ -444,17 +542,13 @@ int Connection::connect() {
                   10,
                   "Connected %s socket via %s channel to %s, immediate_connect "
                   "%d, immediate_fail %d",
-                  getSockType() == SocketType::DATA ? "DATA" : "GOSSIP",
-                  getConnType() == ConnectionType::SSL ? "SSL" : "PLAIN",
-                  peerSockaddr().toString().c_str(),
+                  socketTypeToString(info_.socket_type),
+                  connectionTypeToString(info_.connection_type),
+                  info_.peer_address.toString().c_str(),
                   connected_,
                   !proto_handler_->good());
 
-  STAT_INCR(deps_->getStats(), num_connections);
-  if (isSSL()) {
-    STAT_INCR(deps_->getStats(), num_ssl_connections);
-  }
-
+  updateOpenConnectionStats();
   return 0;
 }
 
@@ -529,7 +623,8 @@ void Connection::onSent(std::unique_ptr<Envelope> e,
 
   if (!deps_->shuttingDown()) {
     deps_->noteBytesDrained(e->cost(), getPeerType(), e->message().type_);
-    deps_->onSent(e->moveMessage(), peer_name_, reason, e->birthTime(), cm);
+    deps_->onSent(
+        e->moveMessage(), info_.peer_name, reason, e->birthTime(), cm);
     ld_check(!e->haveMessage());
   }
 }
@@ -544,9 +639,26 @@ void Connection::onHandshakeTimeout() {
   STAT_INCR(deps_->getStats(), handshake_timeouts);
 }
 
+void Connection::setInfo(ConnectionInfo&& new_info) {
+  checkNewInfo(new_info);
+  info_ = std::move(new_info);
+}
+
+void Connection::checkNewInfo(const ConnectionInfo& new_info) const {
+  // Peer name is not allowed to change
+  ld_check(info_.peer_name == new_info.peer_name);
+
+  if (*new_info.principal != *info_.principal) {
+    // Only incoming connections are authenticated
+    ld_check(new_info.peer_name.isClientAddress());
+    // No changes to principal apart from one-time upgrade from empty
+    ld_check(info_.principal->isEmpty());
+  }
+}
+
 void Connection::setDSCP(uint8_t dscp) {
   int rc = 0;
-  rc = deps_->setDSCP(fd_, peer_sockaddr_.family(), dscp);
+  rc = deps_->setDSCP(fd_, info_.peer_address.family(), dscp);
 
   // DSCP is used for external traffic shaping. Allow the connection to
   // continue to operate, but warn about the failure.
@@ -571,6 +683,16 @@ void Connection::setSoMark(uint32_t so_mark) {
   }
 }
 
+bool Connection::isIdleAfter(SteadyTimestamp watermark) {
+  // If connection has any on_close listeners set we consider it as "not idle"
+  // assuming that active listener indicates waiting for some data to arrive
+  // through this connection in the future.
+  if (!impl_->on_close_.empty()) {
+    return false;
+  }
+  return last_used_time_ <= watermark;
+}
+
 void Connection::close(Status reason) {
   auto g = folly::makeGuard(deps_->setupContextGuard());
   ld_debug("Closing Socket %s, reason %s ",
@@ -589,16 +711,17 @@ void Connection::close(Status reason) {
     return;
   }
 
-  *conn_closed_ = true;
+  info_.is_active->store(false);
 
-  RATELIMIT_LEVEL((reason == E::CONNFAILED || reason == E::TIMEDOUT)
-                      ? dbg::Level::DEBUG
-                      : dbg::Level::INFO,
-                  std::chrono::seconds(10),
-                  10,
-                  "Closing socket %s. Reason: %s",
-                  conn_description_.c_str(),
-                  error_description(reason));
+  RATELIMIT_LEVEL(
+      (reason == E::CONNFAILED || reason == E::TIMEDOUT || reason == E::IDLE)
+          ? dbg::Level::DEBUG
+          : dbg::Level::INFO,
+      std::chrono::seconds(10),
+      10,
+      "Closing socket %s. Reason: %s",
+      conn_description_.c_str(),
+      error_description(reason));
 
   if (getBytesPending() > 0) {
     ld_debug("Socket %s had %zu bytes pending when closed.",
@@ -609,10 +732,12 @@ void Connection::close(Status reason) {
              deps_->getBytesPending() - getBytesPending());
   }
 
-  endStreamRewind();
-
-  if (connect_throttle_ && (peer_shuttingdown_ || reason != E::SHUTDOWN)) {
-    if (peer_shuttingdown_ && !peer_name_.isClientAddress()) {
+  bool connection_failed = reason != E::SHUTDOWN && reason != E::IDLE;
+  // Mark down the server only if
+  // 1) connection has been broken or
+  // 2) the remote server reported itself as being shutdown
+  if (connect_throttle_ && (peer_shuttingdown_ || connection_failed)) {
+    if (peer_shuttingdown_ && !info_.peer_name.isClientAddress()) {
       reason = E::SHUTDOWN;
     }
     connect_throttle_->connectFailed();
@@ -634,23 +759,18 @@ void Connection::close(Status reason) {
 
   markDisconnectedOnClose();
   clearConnQueues(reason);
-  STAT_DECR(deps_->getStats(), num_connections);
-  if (isSSL()) {
-    STAT_DECR(deps_->getStats(), num_ssl_connections);
-  }
+  updateCloseConnectionStats();
 }
 void Connection::markDisconnectedOnClose() {
   // socket was just closed; make sure it's properly accounted for
   conn_incoming_token_.release();
   conn_external_token_.release();
 
-  our_name_at_peer_ = ClientID::INVALID;
+  info_.our_name_at_peer = folly::none;
   connected_ = false;
   handshaken_ = false;
-  peer_config_version_ = config_version_t(0);
 
-  handshake_timeout_event_.cancelTimeout();
-  end_stream_rewind_event_.cancelTimeout();
+  handshake_timeout_event_->cancelTimeout();
 }
 
 void Connection::clearConnQueues(Status close_reason) {
@@ -709,14 +829,13 @@ void Connection::clearConnQueues(Status close_reason) {
 
     // on_close_ is an intrusive list, pop_front() removes cb from list but
     // does not call any destructors. cb is now not on any callback lists.
-    cb(close_reason, peer_name_);
+    cb(close_reason, info_.peer_name);
   }
 }
 
 bool Connection::isClosed() const {
   auto g = folly::makeGuard(deps_->setupContextGuard());
-  if (conn_closed_ != nullptr &&
-      !conn_closed_->load(std::memory_order_relaxed)) {
+  if (info_.is_active->load(std::memory_order_relaxed)) {
     return false;
   }
   ld_check(!connected_);
@@ -748,40 +867,13 @@ bool Connection::isChecksummingEnabled(MessageType msgtype) {
 }
 
 std::unique_ptr<folly::IOBuf> Connection::serializeMessage(const Message& msg) {
-  const bool compute_checksum =
-      ProtocolHeader::needChecksumInHeader(msg.type_, proto_) &&
-      isChecksummingEnabled(msg.type_);
-
-  const size_t protohdr_bytes = ProtocolHeader::bytesNeeded(msg.type_, proto_);
-  auto io_buf = folly::IOBuf::create(IOBUF_ALLOCATION_UNIT);
-  ld_check(protohdr_bytes <= IOBUF_ALLOCATION_UNIT);
-  io_buf->advance(protohdr_bytes);
-
-  ProtocolWriter writer(msg.type_, io_buf.get(), proto_);
-
-  msg.serialize(writer);
-  ssize_t bodylen = writer.result();
-  if (bodylen <= 0) { // unlikely
-    RATELIMIT_CRITICAL(std::chrono::seconds(1),
-                       2,
-                       "INTERNAL ERROR: Failed to serialize a message of "
-                       "type %s into evbuffer",
-                       messageTypeNames()[msg.type_].c_str());
-    ld_check(0);
-    err = E::INTERNAL;
+  auto result = msg.serialize(getProto(), isChecksummingEnabled(msg.type_));
+  if (!result) {
+    // The error code is set by serialize
     close(err);
     return nullptr;
   }
-
-  ProtocolHeader protohdr;
-  protohdr.cksum = compute_checksum ? writer.computeChecksum() : 0;
-  protohdr.cksum += shouldTamperChecksum(); // For Tests only
-  protohdr.type = msg.type_;
-  io_buf->prepend(protohdr_bytes);
-  protohdr.len = io_buf->computeChainDataLength();
-
-  memcpy(static_cast<void*>(io_buf->writableData()), &protohdr, protohdr_bytes);
-  return io_buf;
+  return result;
 }
 
 Connection::SendStatus
@@ -794,7 +886,8 @@ Connection::sendBuffer(std::unique_ptr<folly::IOBuf>&& io_buf) {
       sendChain_ = std::move(io_buf);
       ld_check(!sched_write_chain_.isScheduled());
       sched_write_chain_.attachCallback([this]() { scheduleWriteChain(); });
-      sched_write_chain_.scheduleTimeout(0);
+      sched_write_chain_.scheduleTimeout(
+          getSettings().socket_batching_time_trigger);
       sched_start_time_ = SteadyTimestamp::now();
     }
   }
@@ -873,38 +966,6 @@ int Connection::serializeMessage(std::unique_ptr<Envelope>&& envelope) {
   return 0;
 }
 
-bool Connection::injectAsyncMessageError(std::unique_ptr<Envelope>&& e) {
-  auto error_chance_percent =
-      getSettings().message_error_injection_chance_percent;
-  auto error_status = getSettings().message_error_injection_status;
-  if (error_chance_percent != 0 &&
-      error_status != E::CBREGISTERED && // Must be synchronously delivered
-      !isHandshakeMessage(e->message().type_) && !closing_ &&
-      !message_error_injection_rewinding_stream_) {
-    if (folly::Random::randDouble(0, 100.0) <= error_chance_percent) {
-      message_error_injection_rewinding_stream_ = true;
-      // Turn off the rewind when the deferred event queue is drained.
-      // Ensure this happens even if no other deferred events are added
-      // for this socket during the current event loop cycle.
-      end_stream_rewind_event_.activate(EV_WRITE, 0);
-      ld_error("Rewinding Stream on Socket (%p) - %jd passed, %01.8f%% chance",
-               this,
-               (intmax_t)message_error_injection_pass_count_,
-               error_chance_percent);
-      message_error_injection_pass_count_ = 0;
-    }
-  }
-
-  if (message_error_injection_rewinding_stream_) {
-    message_error_injection_rewound_count_++;
-    onSent(std::move(e), error_status, Message::CompletionMethod::DEFERRED);
-    return true;
-  }
-
-  message_error_injection_pass_count_++;
-  return false;
-}
-
 int Connection::preSendCheck(const Message& msg) {
   if (isClosed()) {
     err = E::NOTCONN;
@@ -912,7 +973,7 @@ int Connection::preSendCheck(const Message& msg) {
   }
 
   if (!handshaken_) {
-    if (peer_name_.isClientAddress() && !isACKMessage(msg.type_)) {
+    if (info_.peer_name.isClientAddress() && !isACKMessage(msg.type_)) {
       RATELIMIT_ERROR(std::chrono::seconds(1),
                       10,
                       "attempt to send a message of type %s to client %s "
@@ -922,7 +983,7 @@ int Connection::preSendCheck(const Message& msg) {
       err = E::UNREACHABLE;
       return -1;
     }
-  } else if (msg.getMinProtocolVersion() > proto_) {
+  } else if (msg.getMinProtocolVersion() > getProto()) {
     if (msg.warnAboutOldProtocol()) {
       RATELIMIT_WARNING(
           std::chrono::seconds(1),
@@ -933,14 +994,14 @@ int Connection::preSendCheck(const Message& msg) {
           messageTypeNames()[msg.type_].c_str(),
           conn_description_.c_str(),
           msg.getMinProtocolVersion(),
-          proto_);
+          getProto());
     }
 
     if (isHandshakeMessage(msg.type_)) {
       ld_critical("INTERNAL ERROR: getMinProtocolVersion() is expected to "
                   "return a protocol version <= %hu for a message of type %s,"
                   " but it returns %hu instead.",
-                  proto_,
+                  getProto(),
                   messageTypeNames()[msg.type_].c_str(),
                   msg.getMinProtocolVersion());
       close(E::INTERNAL);
@@ -976,7 +1037,7 @@ void Connection::send(std::unique_ptr<Envelope> envelope) {
     // compute the message length only when 1) handshaken is completed and
     // negotiaged proto_ is known; or 2) message is a handshaken message
     // therefore its size does not depend on the protocol
-    const auto msglen = msg.size(proto_);
+    const auto msglen = msg.size(getProto());
     if (msglen > Message::MAX_LEN + sizeof(ProtocolHeader)) {
       RATELIMIT_ERROR(
           std::chrono::seconds(10),
@@ -986,13 +1047,6 @@ void Connection::send(std::unique_ptr<Envelope> envelope) {
           conn_description_.c_str());
       err = E::TOOBIG;
       onSent(std::move(envelope), err);
-      return;
-    }
-
-    // Offer up the message for error injection first. If the message
-    // is accepted for injected error delivery, our responsibility for
-    // sending the message ends.
-    if (injectAsyncMessageError(std::move(envelope))) {
       return;
     }
 
@@ -1008,6 +1062,8 @@ void Connection::send(std::unique_ptr<Envelope> envelope) {
 
 Envelope* FOLLY_NULLABLE
 Connection::registerMessage(std::unique_ptr<Message>&& msg) {
+  last_used_time_ = SteadyTimestamp::now();
+
   if (preSendCheck(*msg) != 0) {
     return nullptr;
   }
@@ -1018,19 +1074,21 @@ Connection::registerMessage(std::unique_ptr<Message>&& msg) {
   // establishment.
   if (!isHandshakeMessage(msg->type_) && sizeLimitsExceeded()) {
     STAT_INCR(deps_->getStats(), sock_write_event_nobufs);
-    RATELIMIT_WARNING(
-        std::chrono::seconds(1),
-        10,
-        "ENOBUFS for Socket %s. Current socket usage: %zu, max: %zu",
-        conn_description_.c_str(),
-        getBytesPending(),
-        outbuf_overflow_);
+    RATELIMIT_WARNING(std::chrono::seconds(1),
+                      10,
+                      "ENOBUFS for Socket %s. Current socket usage: %zu, max: "
+                      "%zu, SNDBUF: %zd / %zu",
+                      conn_description_.c_str(),
+                      getBytesPending(),
+                      outbuf_overflow_,
+                      getTcpSendBufOccupancy(),
+                      getTcpSendBufSize());
 
     RATELIMIT_INFO(std::chrono::seconds(60),
                    1,
                    "Messages queued to %s: %s",
-                   peer_name_.toString().c_str(),
-                   deps_->dumpQueuedMessages(peer_name_).c_str());
+                   info_.peer_name.toString().c_str(),
+                   deps_->dumpQueuedMessages(info_.peer_name).c_str());
     err = E::NOBUFS;
     return nullptr;
   }
@@ -1087,7 +1145,7 @@ void Connection::sendHello() {
   // HELLO should be the first message to be sent on this socket.
   ld_check(getBytesPending() == 0);
 
-  auto hello = deps_->createHelloMessage(peer_name_.asNodeID());
+  auto hello = deps_->createHelloMessage(info_.peer_name.asNodeID());
   auto envelope = registerMessage(std::move(hello));
   ld_check(envelope);
   releaseMessage(*envelope);
@@ -1136,7 +1194,7 @@ void Connection::onBytesAdmittedToSend(size_t nbytes) {
       ld_check_eq(drain_pos_, 0);
       ld_check_eq(num_messages, 0);
 
-      if (!peer_name_.isClientAddress()) {
+      if (!info_.peer_name.isClientAddress()) {
         // It's an outgoing connection, and we're sending HELLO.
         // Socket doesn't allow enqueueing messages until we get an ACK,
         // so the queue should be empty.
@@ -1145,7 +1203,7 @@ void Connection::onBytesAdmittedToSend(size_t nbytes) {
       }
     } else {
       ld_check(handshaken_);
-      if (!our_name_at_peer_.valid()) {
+      if (!info_.our_name_at_peer.hasValue()) {
         // It's an incoming connection. The first message we send must be ACK.
         ld_check(drain_pos_ > 0 || num_messages > 0);
       }
@@ -1214,27 +1272,13 @@ void Connection::drainSendQueue() {
   }
 }
 
-void Connection::endStreamRewindCallback(void* instance, short) {
-  auto self = reinterpret_cast<Connection*>(instance);
-  self->endStreamRewind();
-}
-
-void Connection::endStreamRewind() {
-  if (message_error_injection_rewinding_stream_) {
-    ld_error("Ending Error Injection on Socket (%p) - %jd diverted",
-             this,
-             (intmax_t)message_error_injection_rewound_count_);
-    message_error_injection_rewound_count_ = 0;
-    message_error_injection_rewinding_stream_ = false;
-  }
-}
-
 bool Connection::verifyChecksum(ProtocolHeader ph, ProtocolReader& reader) {
   size_t protocol_bytes_already_read =
-      ProtocolHeader::bytesNeeded(ph.type, proto_);
+      ProtocolHeader::bytesNeeded(ph.type, getProto());
 
   auto enabled = isChecksummingEnabled(ph.type) &&
-      ProtocolHeader::needChecksumInHeader(ph.type, proto_) && ph.cksum != 0;
+      ProtocolHeader::needChecksumInHeader(ph.type, getProto()) &&
+      ph.cksum != 0;
 
   if (!enabled) {
     return true;
@@ -1252,7 +1296,7 @@ bool Connection::verifyChecksum(ProtocolHeader ph, ProtocolReader& reader) {
                   cksum_recvd,
                   cksum_computed,
                   ph.len,
-                  proto_,
+                  getProto(),
                   protocol_bytes_already_read);
 
   if (cksum_recvd != cksum_computed) {
@@ -1286,9 +1330,9 @@ bool Connection::validateReceivedMessage(const Message* msg) const {
     }
   }
   /* verify that gossip sockets don't receive non-gossip messages
-   * exceptions: handshake, config synchronization, shutdown
+   * exceptions: handshake, shutdown
    */
-  if (type_ == SocketType::GOSSIP) {
+  if (info_.socket_type == SocketType::GOSSIP) {
     if (!(msg->type_ == MessageType::SHUTDOWN ||
           allowedOnGossipConnection(msg->type_))) {
       RATELIMIT_WARNING(std::chrono::seconds(1),
@@ -1306,7 +1350,7 @@ bool Connection::validateReceivedMessage(const Message* msg) const {
 bool Connection::processHandshakeMessage(const Message* msg) {
   switch (msg->type_) {
     case MessageType::ACK: {
-      deps_->processACKMessage(msg, &our_name_at_peer_, &proto_);
+      deps_->processACKMessage(*msg, info_);
       if (connect_throttle_) {
         connect_throttle_->connectSucceeded();
       } else {
@@ -1319,7 +1363,7 @@ bool Connection::processHandshakeMessage(const Message* msg) {
       // of a handshake message may set peer_node_id_ (if the client
       // connection is in fact from another node in the cluster), which is why
       // the check is not done earlier.
-      if (peerIsClient() &&
+      if (info_.isPeerClient() &&
           !(conn_external_token_ =
                 deps_->getConnBudgetExternal().acquireToken())) {
         RATELIMIT_WARNING(std::chrono::seconds(10),
@@ -1335,16 +1379,18 @@ bool Connection::processHandshakeMessage(const Message* msg) {
         err = E::TOOMANY;
         return false;
       }
-      proto_ = deps_->processHelloMessage(msg);
+      deps_->processHelloMessage(*msg, info_);
       break;
     default:
       ld_check(false); // unreachable.
   };
 
-  ld_check(proto_ >= Compatibility::MIN_PROTOCOL_SUPPORTED);
-  ld_check(proto_ <= Compatibility::MAX_PROTOCOL_SUPPORTED);
-  ld_assert(proto_ <= getSettings().max_protocol);
-  ld_spew("%s negotiated protocol %d", conn_description_.c_str(), proto_);
+  ld_check(info_.protocol.hasValue());
+  uint16_t protocol = info_.protocol.value();
+  ld_check(protocol >= Compatibility::MIN_PROTOCOL_SUPPORTED);
+  ld_check(protocol <= Compatibility::MAX_PROTOCOL_SUPPORTED);
+  ld_assert(protocol <= getSettings().max_protocol);
+  ld_spew("%s negotiated protocol %d", conn_description_.c_str(), protocol);
 
   // Now that we know what protocol we are speaking with the other end,
   // we can serialize pending messages. Messages that are not compatible
@@ -1368,7 +1414,7 @@ int Connection::dispatchMessageBody(ProtocolHeader header,
   };
 
   size_t protocol_bytes_already_read =
-      ProtocolHeader::bytesNeeded(ph.type, proto_);
+      ProtocolHeader::bytesNeeded(ph.type, getProto());
   size_t payload_size = ph.len - protocol_bytes_already_read;
 
   // Request reservation to add this message into the system.
@@ -1399,10 +1445,11 @@ int Connection::dispatchMessageBody(ProtocolHeader header,
     return -1;
   }
 
-  ProtocolReader reader(ph.type, std::move(inbuf), proto_);
+  ProtocolReader reader(ph.type, std::move(inbuf), getProto());
 
   ++num_messages_received_;
   num_bytes_received_ += ph.len;
+  last_used_time_ = SteadyTimestamp::now();
 
   // 1. compute and verify checksum in header.
 
@@ -1434,7 +1481,7 @@ int Connection::dispatchMessageBody(ProtocolHeader header,
                  "%s has invalid format. proto_:%hu",
                  messageTypeNames()[ph.type].c_str(),
                  conn_description_.c_str(),
-                 proto_);
+                 getProto());
         err = E::BADMSG;
         return -1;
 
@@ -1478,7 +1525,7 @@ int Connection::dispatchMessageBody(ProtocolHeader header,
   if (isHandshakeMessage(ph.type)) {
     handshaken_ = true;
     first_attempt_ = false;
-    handshake_timeout_event_.cancelTimeout();
+    handshake_timeout_event_->cancelTimeout();
   }
 
   MESSAGE_TYPE_STAT_INCR(deps_->getStats(), ph.type, message_received);
@@ -1493,7 +1540,7 @@ int Connection::dispatchMessageBody(ProtocolHeader header,
   // 4. Dispatch message to state machines for processing.
 
   Message::Disposition disp = deps_->onReceived(
-      msg.get(), peer_name_, principal_, std::move(resource_token));
+      msg.get(), info_.peer_name, info_.principal, std::move(resource_token));
 
   // 5. Dispose off message according to state machine's request.
   switch (disp) {
@@ -1650,7 +1697,8 @@ uint64_t Connection::getNumBytesReceived() const {
 void Connection::addHandshakeTimeoutEvent() {
   std::chrono::milliseconds timeout = getSettings().handshake_timeout;
   if (timeout.count() > 0) {
-    handshake_timeout_event_.scheduleTimeout(timeout);
+    auto evb = deps_->getEvBase()->getEventBase();
+    evb->timer().scheduleTimeout(handshake_timeout_event_.get(), timeout);
   }
 }
 
@@ -1677,8 +1725,8 @@ void Connection::handshakeTimeoutCallback(void* arg, short) {
   reinterpret_cast<Connection*>(arg)->onHandshakeTimeout();
 }
 
-int Connection::checkConnection(ClientID* our_name_at_peer) {
-  if (!our_name_at_peer_.valid()) {
+int Connection::checkServerConnection() {
+  if (!info_.our_name_at_peer.hasValue()) {
     // socket is either not connected or we're still waiting for a handshake
     // to complete
     ld_check(connect_throttle_);
@@ -1686,7 +1734,7 @@ int Connection::checkConnection(ClientID* our_name_at_peer) {
       ld_check(!connected_);
       ld_check(isClosed());
       err = E::DISABLED;
-    } else if (peer_name_.isClientAddress()) {
+    } else if (info_.peer_name.isClientAddress()) {
       err = E::INVALID_PARAM;
     } else if (!isClosed()) {
       err = E::ALREADY;
@@ -1701,10 +1749,6 @@ int Connection::checkConnection(ClientID* our_name_at_peer) {
     }
 
     return -1;
-  }
-
-  if (our_name_at_peer) {
-    *our_name_at_peer = our_name_at_peer_;
   }
 
   return 0;
@@ -1736,7 +1780,7 @@ void Connection::getDebugInfo(InfoSocketsTable& table) const {
   auto total_sndbuf_limited_time = health_stats_.sndbuf_limited_time_.count();
   table.next()
       .set<0>(state)
-      .set<1>(deps_->describeConnection(peer_name_))
+      .set<1>(deps_->describeConnection(info_.peer_name))
       .set<2>(getBytesPending() / 1024.0)
       .set<3>(available / 1024.0)
       .set<4>(num_bytes_received_ / 1048576.0)
@@ -1750,24 +1794,34 @@ void Connection::getDebugInfo(InfoSocketsTable& table) const {
       .set<10>(total_busy_time == 0
                    ? 0
                    : 100.0 * total_sndbuf_limited_time / total_busy_time)
-      .set<11>(proto_)
+      .set<11>(getProto())
       .set<12>(this->getTcpSendBufSize())
-      .set<13>(getPeerConfigVersion().val())
-      .set<14>(isSSL())
-      .set<15>(fd_);
+      .set<13>(isSSL())
+      .set<14>(fd_);
 }
 
-bool Connection::peerIsClient() const {
-  return peer_type_ == PeerType::CLIENT;
-}
-
-folly::ssl::X509UniquePtr Connection::getPeerCert() const {
+folly::Optional<PrincipalIdentity> Connection::extractPeerIdentity() {
   ld_check(isSSL());
-  auto sock_peer_cert = proto_handler_->sock()->getPeerCertificate();
-  if (sock_peer_cert) {
-    return sock_peer_cert->getX509();
+
+  SSL* ssl = const_cast<SSL*>(proto_handler_->sock()->getSSL());
+
+  // This means this should always return a valid ssl context.
+  ld_check(ssl);
+
+  folly::ssl::X509UniquePtr cert(SSL_get_peer_certificate(ssl));
+
+  auto principal_parser = deps_->getPrincipalParser();
+  if (principal_parser == nullptr) {
+    return folly::none;
   }
-  return nullptr;
+
+  auto principal = principal_parser->getPrincipal(cert.get());
+
+  // Now that the principal parser is extracted, we no longer need to keep the
+  // certificates in memory. Allow the SSL plugin to do cleanups if any.
+  principal_parser->clearCertificates(ssl);
+
+  return principal;
 }
 
 SocketDrainStatusType
@@ -1875,7 +1929,7 @@ SocketDrainStatusType Connection::checkSocketHealth() {
                    5,
                    "[%s]: Oldest msg %lums old, throughput %.3fKBps, active "
                    "time %.3fs, decision %s, net %u%%, rwnd %u%%, sndbuf %u%%",
-                   peer_name_.toString().c_str(),
+                   info_.peer_name.toString().c_str(),
                    age_in_ms,
                    rateKBps,
                    s.active_time_.count() / 1e3,
@@ -1887,7 +1941,7 @@ SocketDrainStatusType Connection::checkSocketHealth() {
     ld_debug(
         "[%s] : Oldest msg age %lums, throughput %.3fKBps, active time %3.fs, "
         "decision %s",
-        peer_name_.toString().c_str(),
+        info_.peer_name.toString().c_str(),
         age_in_ms,
         rateKBps,
         s.active_time_.count() / 1e3,

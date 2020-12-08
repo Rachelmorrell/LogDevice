@@ -14,7 +14,6 @@
 #include <folly/Random.h>
 #include <gtest/gtest.h>
 
-#include "event2/buffer.h"
 #include "logdevice/common/Appender.h"
 #include "logdevice/common/MetaDataLogWriter.h"
 #include "logdevice/common/NoopTraceLogger.h"
@@ -26,11 +25,11 @@
 #include "logdevice/common/Timer.h"
 #include "logdevice/common/Worker.h"
 #include "logdevice/common/configuration/UpdateableConfig.h"
-#include "logdevice/common/libevent/compat.h"
 #include "logdevice/common/protocol/STORE_Message.h"
 #include "logdevice/common/request_util.h"
 #include "logdevice/common/settings/Settings.h"
 #include "logdevice/common/stats/Stats.h"
+#include "logdevice/common/test/SenderTestProxy.h"
 #include "logdevice/common/test/TestUtil.h"
 
 using namespace facebook::logdevice;
@@ -359,7 +358,8 @@ class MockAppender : public Appender {
     return epoch_sequencer_->getState() == EpochSequencer::State::DRAINING;
   }
 
-  int registerOnSocketClosed(NodeID /*nid*/, SocketCallback& /*cb*/) override {
+  int registerOnConnectionClosed(NodeID /*nid*/,
+                                 SocketCallback& /*cb*/) override {
     return 0;
   }
 
@@ -399,8 +399,7 @@ class MockAppender : public Appender {
 // copyset. ony useful for the config "sequencer_test.conf"
 class TestCopySetSelector : public CopySetSelector {
  public:
-  CopySetSelector::Result select(copyset_size_t, /* extras, unused */
-                                 StoreChainLink copyset_out[],
+  CopySetSelector::Result select(StoreChainLink copyset_out[],
                                  copyset_size_t* copyset_size_out,
                                  bool*, /* chain_out, unused */
                                  State* /*selector_state*/,
@@ -443,7 +442,8 @@ void EpochSequencerTest::setUp() {
   dbg::currentLevel = log_level_;
 
   updateable_config_ = std::make_shared<UpdateableConfig>(
-      Configuration::fromJsonFile(TEST_CONFIG_FILE("sequencer_test.conf")));
+      Configuration::fromJsonFile(TEST_CONFIG_FILE("sequencer_test.conf"))
+          ->withNodesConfiguration(createSimpleNodesConfig(1)));
 
   std::shared_ptr<configuration::LocalLogsConfig> logs_config =
       std::make_shared<configuration::LocalLogsConfig>(
@@ -478,6 +478,12 @@ void EpochSequencerTest::setUp() {
   settings_.num_workers = num_workers_;
   // turn on byte offsets
   settings_.byte_offsets = true;
+
+  // TODO the following 2 settings are required to make the NCPublisher pick
+  // the NCM NodesConfiguration. Should be removed when NCM is the default.
+  settings_.enable_nodes_configuration_manager = true;
+  settings_.use_nodes_configuration_manager_nodes_configuration = true;
+
   processor_ =
       make_test_processor(settings_, updateable_config_, &stats_, NodeID(1, 1));
   ASSERT_NE(nullptr, processor_.get());

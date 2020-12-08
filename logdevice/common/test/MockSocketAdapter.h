@@ -7,6 +7,7 @@
  */
 #pragma once
 #include <folly/io/SocketOptionMap.h>
+#include <folly/ssl/SSLSession.h>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
@@ -58,6 +59,10 @@ class MockSocketAdapter : public SocketAdapter {
   MOCK_METHOD1(setRecvBufSize, int(size_t));
   MOCK_METHOD4(getSockOptVirtual, int(int, int, void*, socklen_t*));
   MOCK_METHOD4(setSockOptVirtual, int(int, int, void const*, socklen_t));
+
+  MOCK_CONST_METHOD0(getSSLSessionReused, bool());
+  MOCK_METHOD0(getSSLSession, std::shared_ptr<folly::ssl::SSLSession>());
+  MOCK_METHOD1(setSSLSession, void(std::shared_ptr<folly::ssl::SSLSession>));
 };
 
 }} // namespace facebook::logdevice

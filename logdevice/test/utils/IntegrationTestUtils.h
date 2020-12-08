@@ -29,11 +29,15 @@
 #include "logdevice/common/debug.h"
 #include "logdevice/common/event_log/EventLogRecord.h"
 #include "logdevice/common/replicated_state_machine/RsmVersionTypes.h"
+#include "logdevice/common/test/NodesConfigurationTestUtil.h"
 #include "logdevice/common/test/TestUtil.h"
 #include "logdevice/include/ClientSettings.h"
 #include "logdevice/include/LogsConfigTypes.h"
 #include "logdevice/include/types.h"
+#include "logdevice/test/utils/AdminServer.h"
 #include "logdevice/test/utils/MetaDataProvisioner.h"
+#include "logdevice/test/utils/NodesConfigurationFileUpdater.h"
+#include "logdevice/test/utils/ParamMaps.h"
 #include "logdevice/test/utils/port_selection.h"
 
 namespace facebook { namespace logdevice {
@@ -69,6 +73,9 @@ namespace facebook { namespace logdevice {
  * LOGDEVICE_TEST_BINARY controls which binary to run as the server.  If not
  * set, _bin/logdevice/server/logdeviced is used.
  *
+ * LOGDEVICE_TEST_ADMIN_SERVER_BINARY controls which binary to run as the admin
+ * server.  If not set, _bin/logdevice/ops/admin_server/ld-admin-server is used.
+
  * LOGDEVICE_TEST_USE_TCP        use TCP ports instead of UNIX domain sockets
  *
  * LOGDEVICE_LOG_LEVEL           set the default log level used by tests
@@ -86,7 +93,6 @@ class Client;
 class EpochStore;
 class FileConfigSource;
 class ShardedLocalLogStore;
-class NodesConfigurationPublisher;
 
 namespace configuration { namespace nodes {
 class NodesConfigurationStore;
@@ -104,33 +110,6 @@ namespace IntegrationTestUtils {
 class Cluster;
 class Node;
 
-// scope in which command line parameters that applies to different
-// types of nodes. Must be defined continuously.
-enum class ParamScope : uint8_t { ALL = 0, SEQUENCER = 1, STORAGE_NODE = 2 };
-
-using ParamValue = folly::Optional<std::string>;
-using ParamMap = std::unordered_map<std::string, ParamValue>;
-using ParamMaps = std::map<ParamScope, ParamMap>;
-
-class ParamSpec {
- public:
-  std::string key_;
-  folly::Optional<std::string> value_;
-  ParamScope scope_;
-
-  /* implicit */ ParamSpec(std::string key, ParamScope scope = ParamScope::ALL)
-      : key_(key), scope_(scope) {
-    ld_check(!key_.empty());
-  }
-
-  ParamSpec(std::string key,
-            std::string value,
-            ParamScope scope = ParamScope::ALL)
-      : ParamSpec(key, scope) {
-    value_ = value;
-  }
-};
-
 // used to specify the type of rockdb local logstore for storage
 // nodes in the cluster
 enum class RocksDBType : uint8_t { SINGLE, PARTITIONED };
@@ -142,6 +121,8 @@ enum class NodesConfigurationSourceOfTruth { NCM, SERVER_CONFIG };
  */
 class ClusterFactory {
  public:
+  ClusterFactory();
+
   /**
    * Creates a Cluster object, configured with logs 1 and 2.
    *
@@ -284,8 +265,8 @@ class ClusterFactory {
   /**
    * If called, create() will use specified node configs.
    */
-  ClusterFactory& setNodes(Configuration::Nodes nodes) {
-    node_configs_ = std::move(nodes);
+  ClusterFactory& setNodes(std::shared_ptr<const NodesConfiguration> nodes) {
+    nodes_config_ = std::move(nodes);
     return *this;
   }
 
@@ -315,24 +296,16 @@ class ClusterFactory {
    */
   ClusterFactory& setRocksDBType(RocksDBType db_type) {
     rocksdb_type_ = db_type;
+    setParam("--rocksdb-partitioned",
+             db_type == RocksDBType::PARTITIONED ? "true" : "false");
     return *this;
   }
 
   /**
-   * Sets the node that is designated to run
-   * maintenance manager
+   * Sets whether the standalone admin server will be running or not.
    */
-  ClusterFactory& runMaintenanceManagerOn(node_index_t n) {
-    maintenance_manager_node_ = n;
-
-    // Maintenance manager usually responds to events (like maintenance log
-    // deltas, event log deltas, nodes config updates) quickly, but sometimes,
-    // due to some race conditions, it seems to miss an event and goes to sleep
-    // for maintenance-manager-reevaluation-timeout. Decrease it so that tests
-    // don't time out.
-    // TODO (#54454518): Maybe make MaintenanceManager not do that.
-    setParam("--maintenance-manager-reevaluation-timeout", "5s");
-
+  ClusterFactory& useStandaloneAdminServer(bool enable) {
+    use_standalone_admin_server_ = enable;
     return *this;
   }
 
@@ -342,19 +315,6 @@ class ClusterFactory {
    */
   ClusterFactory& doPreProvisionEpochMetaData() {
     provision_epoch_metadata_ = true;
-    return *this;
-  }
-
-  /**
-   * If called, nodes configuration store won't be provisioned.
-   */
-  ClusterFactory& doNotPreProvisionNodesConfigurationStore() {
-    provision_nodes_configuration_store_ = false;
-    return *this;
-  }
-
-  ClusterFactory& doNotSyncServerConfigToNodesConfiguration() {
-    sync_server_config_to_nodes_configuration_ = false;
     return *this;
   }
 
@@ -373,30 +333,6 @@ class ClusterFactory {
    */
   ClusterFactory& doNotLetSequencersProvisionEpochMetaData() {
     let_sequencers_provision_metadata_ = false;
-    return *this;
-  }
-
-  /**
-   * By default, the cluster factory generates a single config file that is
-   * shared among all nodes. When this option is set, the factory will generate
-   * one config file per node in their own directory. They will initially be
-   * identical. but this allows testing with inconsistent configurations.
-   * In paritcular this option is required to simulate netwrok paritioning (see
-   * partition method below)
-   * Note: expand/shrink/replace and maybe some other functionalities are not
-   * compatible with this setting yet.
-   *
-   * TODO T52924503: currently oneConfigPerNode() is not compatible with
-   * NodesConfiguration with NCM source-of-truth. We will add test utilities to
-   * simulate config divergence in NCM.
-   */
-  ClusterFactory& oneConfigPerNode() {
-    one_config_per_node_ = true;
-
-    setNodesConfigurationSourceOfTruth(
-        NodesConfigurationSourceOfTruth::SERVER_CONFIG);
-    setParam("--enable-config-synchronization", "false");
-
     return *this;
   }
 
@@ -484,14 +420,41 @@ class ClusterFactory {
    */
   ClusterFactory& setParam(std::string key,
                            ParamScope scope = ParamScope::ALL) {
-    return setParam(ParamSpec{key, scope});
+    return setParam(ParamSpec{key, "true", scope});
   }
 
   /**
    * Same as setParam(key, value, scope) or setParam(key, scope) as appropriate.
    */
   ClusterFactory& setParam(ParamSpec spec) {
-    cmd_param_[spec.scope_][spec.key_] = spec.value_;
+    // If the scope is ParamScope::ALL, we can safely add this to the server
+    // config instead of command line args.
+    // TODO: Codemod all the usages of ParamScope::ALL to use setServerSettings
+    // directly.
+    if (spec.scope_ == ParamScope::ALL) {
+      // Trim the "--" prefix from the command line arg name.
+      auto& key = spec.key_;
+      ld_check(key.substr(0, 2) == "--");
+      setServerSetting(spec.key_.substr(2), spec.value_);
+    } else {
+      cmd_param_[spec.scope_][spec.key_] = spec.value_;
+    }
+    return *this;
+  }
+
+  /**
+   * Sets a config setting for logdeviced processes.
+   */
+  ClusterFactory& setServerSetting(std::string key, std::string value) {
+    server_settings_[std::move(key)] = std::move(value);
+    return *this;
+  }
+
+  /**
+   * Sets a config setting for clients
+   */
+  ClusterFactory& setClientSetting(std::string key, std::string value) {
+    client_settings_[std::move(key)] = std::move(value);
     return *this;
   }
 
@@ -599,6 +562,15 @@ class ClusterFactory {
   }
 
   /**
+   * Sets the path to the admin server binary (relative to the build root) to
+   * use if a custom one is needed.
+   */
+  ClusterFactory& setAdminServerBinary(std::string path) {
+    admin_server_binary_ = path;
+    return *this;
+  }
+
+  /**
    * By default, the cluster will use a traffic shaping configuration which is
    * designed for coverage of the traffic shaping logic in tests, but limits
    * throughput.  This method allows traffic shaping to be turned off in cases
@@ -646,14 +618,15 @@ class ClusterFactory {
 
  private:
   folly::Optional<logsconfig::LogAttributes> log_attributes_;
-  folly::Optional<Configuration::Nodes> node_configs_;
+  std::shared_ptr<const NodesConfiguration> nodes_config_;
   folly::Optional<Configuration::MetaDataLogsConfig> meta_config_;
   bool enable_logsconfig_manager_ = false;
-  bool one_config_per_node_{false};
 
   configuration::InternalLogs internal_logs_;
 
   ParamMaps cmd_param_;
+  ServerConfig::SettingsConfig server_settings_;
+  ServerConfig::SettingsConfig client_settings_;
 
   // If set to true, allocate tcp ports to be used by the tests for the nodes'
   // protocol and command ports instead of unix domain sockets.
@@ -671,9 +644,6 @@ class ClusterFactory {
   // Provision the inital epoch metadata in epoch store and storage nodes
   // that store metadata
   bool provision_epoch_metadata_ = false;
-
-  // Provision the inital nodes configuration store
-  bool provision_nodes_configuration_store_ = true;
 
   // Controls whether the cluster should also update the NodesConfiguration
   // whenver the ServerConfig change. This is there only during the migration
@@ -722,8 +692,8 @@ class ClusterFactory {
   // if unset, use a random choice between the two sources
   folly::Optional<NodesConfigurationSourceOfTruth> nodes_configuration_sot_;
 
-  // The node designated to run a instance of MaintenanceManager
-  node_index_t maintenance_manager_node_ = -1;
+  // Whether to start the standalone admin server or not.
+  bool use_standalone_admin_server_ = false;
 
   // Type of rocksdb local log store
   RocksDBType rocksdb_type_ = RocksDBType::PARTITIONED;
@@ -733,6 +703,9 @@ class ClusterFactory {
 
   // Server binary if setServerBinary() was called
   folly::Optional<std::string> server_binary_;
+
+  // Server binary if setAdminServerBinary() was called
+  folly::Optional<std::string> admin_server_binary_;
 
   std::string cluster_name_ = "integration_test";
 
@@ -747,13 +720,25 @@ class ClusterFactory {
 
   static logsconfig::LogAttributes createLogAttributesStub(int nstorage_nodes);
 
-  // Figures out the full path to the server binary, considering in order of
-  // precedence:
-  //
-  // - the environment variable LOGDEVICED_TEST_BINARY,
-  // - setServerBinary() override
-  // - a default path
+  /**
+   * Figures out the full path to the server binary, considering in order of
+   * precedence:
+   *
+   * - the environment variable LOGDEVICE_TEST_BINARY,
+   * - setServerBinary() override
+   * - a default path
+   */
   std::string actualServerBinary() const;
+
+  /**
+   * Figures out the full path to the server binary, considering in order of
+   * precedence:
+   *
+   * - the environment variable LOGDEVICE_ADMIN_SERVER_BINARY,
+   * - setAdminServerBinary() override
+   * - a default path
+   */
+  std::string actualAdminServerBinary() const;
 
   // Set the attributes of an internal log.
   void setInternalLogAttributes(const std::string& name,
@@ -766,31 +751,47 @@ class ClusterFactory {
    */
   std::unique_ptr<client::LogGroup>
   createLogsConfigManagerLogs(std::unique_ptr<Cluster>& cluster);
+
+  void populateDefaultServerSettings();
+
+  std::shared_ptr<const NodesConfiguration>
+  provisionNodesConfiguration(int nnodes) const;
 };
 
 // All ports logdeviced can listen on.
 struct ServerAddresses {
-  static constexpr size_t COUNT = 7;
+  static constexpr size_t COUNT = 11;
 
   Sockaddr protocol;
   Sockaddr gossip;
   Sockaddr admin;
   Sockaddr server_to_server;
   Sockaddr protocol_ssl;
+  Sockaddr server_thrift_api;
+  Sockaddr client_thrift_api;
+  Sockaddr data_low_priority;
+  Sockaddr data_medium_priority;
 
   // If we're holding open sockets on the above ports, this list contains the
   // fd-s of these sockets. This list is cleared (and sockets closed) just
   // before starting the server process.
   std::vector<detail::PortOwner> owners;
 
-  void toNodeConfig(configuration::Node& node, bool ssl) {
-    node.address = protocol;
+  void toNodeConfig(configuration::nodes::NodeServiceDiscovery& node,
+                    bool ssl) {
+    using Priority =
+        configuration::nodes::NodeServiceDiscovery::ClientNetworkPriority;
+    node.default_client_data_address = protocol;
     node.gossip_address = gossip;
     if (ssl) {
       node.ssl_address.assign(protocol_ssl);
     }
     node.admin_address.assign(admin);
     node.server_to_server_address.assign(server_to_server);
+    node.server_thrift_api_address.assign(server_thrift_api);
+    node.client_thrift_api_address.assign(client_thrift_api);
+    node.addresses_per_priority = {{Priority::LOW, data_low_priority},
+                                   {Priority::MEDIUM, data_medium_priority}};
   }
 
   static ServerAddresses withTCPPorts(std::vector<detail::PortOwner> ports) {
@@ -802,6 +803,10 @@ struct ServerAddresses {
     r.admin = Sockaddr(addr, ports[3].port);
     r.protocol_ssl = Sockaddr(addr, ports[4].port);
     r.server_to_server = Sockaddr(addr, ports[6].port);
+    r.server_thrift_api = Sockaddr(addr, ports[7].port);
+    r.client_thrift_api = Sockaddr(addr, ports[8].port);
+    r.data_low_priority = Sockaddr(addr, ports[9].port);
+    r.data_medium_priority = Sockaddr(addr, ports[10].port);
 
     r.owners = std::move(ports);
 
@@ -815,6 +820,10 @@ struct ServerAddresses {
     r.admin = Sockaddr(path + "/socket_admin");
     r.server_to_server = Sockaddr(path + "/socket_server_to_server");
     r.protocol_ssl = Sockaddr(path + "/ssl_socket_main");
+    r.server_thrift_api = Sockaddr(path + "/server_thrift_api");
+    r.client_thrift_api = Sockaddr(path + "/client_thrift_api");
+    r.data_low_priority = Sockaddr(path + "/socket_data_low_pri");
+    r.data_medium_priority = Sockaddr(path + "/socket_data_medium_pri");
     return r;
   }
 };
@@ -845,19 +854,42 @@ class Cluster {
   void stop();
 
   /**
+   * DEPRECATED, Will be removed and replaced by the implementation of
+   * expandViaAdminServer in the future.
+   *
    * Expand the cluster by adding nodes with the given indices.
    * @return 0 on success, -1 on error.
    */
-  int expand(std::vector<node_index_t> new_indices,
-             bool start = true,
-             bool bump_config_version = true);
+  int expand(std::vector<node_index_t> new_indices, bool start = true);
+
+  /**
+   * Expand the cluster by adding `nnodes` with consecutive indices after the
+   * highest existing one.
+   *
+   * The newly added nodes will be distributed among the configured number
+   * of racks in this cluster.
+   * @return 0 on success, -1 on error.
+   */
+  int expand(int nnodes, bool start = true);
+
+  /**
+   * Expand the cluster by adding nodes with the given indices.
+   * @return 0 on success, -1 on error.
+   */
+  int expandViaAdminServer(thrift::AdminAPIAsyncClient& admin_client,
+                           std::vector<node_index_t> new_indices,
+                           bool start = true,
+                           int num_racks = 1);
 
   /**
    * Expand the cluster by adding `nnodes` with consecutive indices after the
    * highest existing one.
    * @return 0 on success, -1 on error.
    */
-  int expand(int nnodes, bool start = true, bool bump_config_version = true);
+  int expandViaAdminServer(thrift::AdminAPIAsyncClient& admin_client,
+                           int nnodes,
+                           bool start_nodes = true,
+                           int num_racks = 1);
 
   /**
    * Shrink the cluster by removing the given nodes.
@@ -875,7 +907,23 @@ class Cluster {
    */
   int shrink(int nnodes);
 
-  std::shared_ptr<UpdateableConfig> getConfig() {
+  /**
+   * Shrink the cluster by removing nodes with the given indices.
+   * @return 0 on success, -1 on error.
+   */
+  int shrinkViaAdminServer(thrift::AdminAPIAsyncClient& admin_client,
+                           std::vector<node_index_t> new_indices);
+
+  /**
+   * Shrink the cluster by removing `nnodes` last nodes.
+   *
+   * Note that these nodes must already be fully disabled/drained and stopped.
+   * @return 0 on success, -1 on error.
+   */
+  int shrinkViaAdminServer(thrift::AdminAPIAsyncClient& admin_client,
+                           int nnodes);
+
+  std::shared_ptr<UpdateableConfig> getConfig() const {
     return config_;
   }
 
@@ -906,6 +954,13 @@ class Cluster {
 
   const Nodes& getNodes() const {
     return nodes_;
+  }
+
+  /**
+   * Returns the admin server instance if started.
+   */
+  AdminServer* FOLLY_NULLABLE getAdminServer() {
+    return admin_server_.get();
   }
 
   Node& getNode(node_index_t index) {
@@ -1000,27 +1055,38 @@ class Cluster {
                                          bool allow_existing_metadata = true);
 
   /**
-   * Converts the server config into a nodes configuration and writes it to
-   * disk via a FileBasedNodesConfigurationStore.
-   * @param server_config                  the server config to convert
+   * Updates the NC on disk via FileBasedNodesConfigurationStore.
+   * @param nodes_config                  the NC to write
    * @return          0 for success, -1 for failure
    */
-  int updateNodesConfigurationFromServerConfig(
-      const ServerConfig* server_config);
+  int updateNodesConfiguration(
+      const configuration::nodes::NodesConfiguration& nodes_config);
 
   /**
    * Replaces the node at the specified index.  Kills the current process if
    * still running, deletes the node's data, then starts up a new one and
    * updates the cluster config.
+   *
    * @return 0 on success, -1 if node fails to start or there are no free ports
    */
   int replace(node_index_t index, bool defer_start = false);
 
   /**
-   * Update the config to bump the generation of node at position `index`.
-   * Also bump the node replacement counter.
+   * Replaces the node at the specified index.  Kills the current process if
+   * still running, deletes the node's data, then starts up a new one and
+   * updates the cluster config using the Admin API.
+   *
+   * @return 0 on success, -1 if node fails to start or there are no free ports
    */
-  int bumpGeneration(node_index_t index);
+  int replaceViaAdminServer(thrift::AdminAPIAsyncClient& admin_client,
+                            node_index_t index,
+                            bool defer_start = false);
+
+  /**
+   * Bumps up the generation using the Admin API.
+   */
+  int bumpGeneration(thrift::AdminAPIAsyncClient& admin_client,
+                     node_index_t index);
 
   /**
    * Update node's attributes in config
@@ -1089,6 +1155,13 @@ class Cluster {
       folly::Optional<std::set<node_index_t>> nodes = folly::none,
       std::chrono::steady_clock::time_point deadline =
           std::chrono::steady_clock::time_point::max());
+
+  /**
+   * Waits until all live nodes and clients have processed the
+   * NodesConfiguration with at least the version passed.
+   */
+  void waitForServersAndClientsToProcessNodesConfiguration(
+      membership::MembershipVersion::Type version);
 
   /**
    * Waits until all live nodes have a view of the config same as getConfig().
@@ -1259,6 +1332,39 @@ class Cluster {
   void partition(std::vector<std::set<int>> partitions);
 
   /**
+   * Requires maintenance manager to be enabled.
+   * This will create an internal maintenance to drain a shard. The created
+   * maintenance will be applied via writing directly to the internal
+   * maintenance log. This might change in the future so the caller should not
+   * rely on this implementation detail.
+   *
+   * Internal maintenances will trigger rebuilding in RESTORE mode.
+   *
+   * @return true if the operation succeeded. On
+   *              `false` the value of `err` is set accordingly.
+   */
+  bool applyInternalMaintenance(Client& client,
+                                node_index_t node_id,
+                                uint32_t shard_idx,
+                                const std::string& reason);
+
+  /**
+   * A quick helper that applies a maintenance (drain by default) to a given
+   * shard.
+   *
+   * Note: this skips safety checks (creates IMMINENT maintenance)
+   *
+   * @return the created maintenance ID
+   */
+  std::string applyMaintenance(thrift::AdminAPIAsyncClient& admin_client,
+                               node_index_t node_id,
+                               uint32_t shard_idx,
+                               const std::string& user = "integration_test",
+                               bool drain = true,
+                               bool force_restore = false,
+                               const std::string& reason = "testing",
+                               bool disable_sequencer = false);
+  /**
    * Gracefully shut down the given nodes. Faster than calling shutdown() on
    * them one by one.
    * @return 0 if all processes returned zero exit status, -1 otherwise.
@@ -1336,11 +1442,10 @@ class Cluster {
           std::string epoch_store_path,
           std::string ncs_path,
           std::string server_binary,
+          std::string admin_server_binary,
           std::string cluster_name,
           bool enable_logsconfig_manager,
-          bool one_config_per_node,
           dbg::Level default_log_level,
-          bool sync_server_config_to_nodes_configuration,
           NodesConfigurationSourceOfTruth nodes_configuration_sot);
 
   // Directory where to store the data for a node (logs, db, sockets).
@@ -1382,6 +1487,10 @@ class Cluster {
   // specified node
   ParamMap commandArgsForNode(const Node& node) const;
 
+  // Creates an admin server instance for this cluster. This does not wait for
+  // the process to start.
+  std::unique_ptr<AdminServer> createAdminServer();
+
   // Helper for createClient() to populate client
   // settings.
   void populateClientSettings(std::unique_ptr<ClientSettings>& settings,
@@ -1403,18 +1512,20 @@ class Cluster {
   // path for the file-based nodes configuration store
   std::string ncs_path_;
   std::string server_binary_;
+  std::string admin_server_binary_;
   std::string cluster_name_;
   bool enable_logsconfig_manager_ = false;
   const NodesConfigurationSourceOfTruth nodes_configuration_sot_;
 
-  bool one_config_per_node_ = false;
   std::shared_ptr<UpdateableConfig> config_;
-  std::unique_ptr<NodesConfigurationPublisher> nodes_configuration_publisher_;
   FileConfigSource* config_source_;
   std::unique_ptr<ClientSettings> client_settings_;
+  std::unique_ptr<NodesConfigurationFileUpdater> nodes_configuration_updater_;
+
   // ordered map for convenience
   Nodes nodes_;
-
+  // The admin server object if standalone admin server is enabled.
+  std::unique_ptr<AdminServer> admin_server_;
   // keep track of node replacement events. for nodes with storage role, the
   // counter should be in sync with the `generation' in its config. For nodes
   // without storage role, counter is only used for tracking/directory keeping
@@ -1428,9 +1539,6 @@ class Cluster {
 
   // type of rocksdb local log store
   RocksDBType rocksdb_type_ = RocksDBType::PARTITIONED;
-
-  // The node designated to run a instance of MaintenanceManager
-  node_index_t maintenance_manager_node_ = -1;
 
   // See ClusterFactory::hash_based_sequencer_assignment_
   bool hash_based_sequencer_assignment_{false};
@@ -1481,7 +1589,6 @@ class Node {
 
   bool is_storage_node_ = true;
   bool is_sequencer_node_ = true;
-  bool should_run_maintenance_manager_ = false;
 
   Node();
   ~Node() {
@@ -1578,11 +1685,6 @@ class Node {
    * --disable-rebuilding=false
    */
   int waitUntilNodeStateReady();
-  /**
-   * Waits until the ClusterMaintenanceStateMachine is fully loaded on that
-   * machine.
-   */
-  int waitUntilMaintenanceRSMReady();
 
   /**
    * Waits for the server to start accepting connections.
@@ -1692,6 +1794,7 @@ class Node {
    * use waitUntilEventLogSynced() for that.
    */
   lsn_t waitUntilAllShardsFullyAuthoritative(std::shared_ptr<Client> client);
+
   /**
    * Wait until all shards of this node are authoritative empty.
    * Returns the lsn of the last update.
@@ -1699,6 +1802,26 @@ class Node {
    * use waitUntilEventLogSynced() for that.
    */
   lsn_t waitUntilAllShardsAuthoritativeEmpty(std::shared_ptr<Client> client);
+
+  /**
+   * Waits until all internal maintenances are removed for this particular
+   * node.
+   */
+  bool waitUntilInternalMaintenances(
+      thrift::AdminAPIAsyncClient& admin_client,
+      folly::Function<bool(const std::vector<thrift::MaintenanceDefinition>&)>
+          predicate,
+      const std::string& reason,
+      std::chrono::steady_clock::time_point deadline =
+          std::chrono::steady_clock::time_point::max());
+
+  bool waitUntilShardState(
+      thrift::AdminAPIAsyncClient& admin_client,
+      shard_index_t shard,
+      folly::Function<bool(const thrift::ShardState&)> predicate,
+      const std::string& reason,
+      std::chrono::steady_clock::time_point deadline =
+          std::chrono::steady_clock::time_point::max());
 
   /**
    * Sends admin command `command' to command port and returns the result.
@@ -1914,6 +2037,12 @@ class Node {
    * a map of dirty shard to dirty time ranges.
    */
   std::map<shard_index_t, RebuildingRangesMetadata> dirtyShardInfo() const;
+
+  /**
+   * Issues a INFO SHARD command to the node and returns the "Rebuilding state"
+   * field per shard.
+   */
+  std::map<shard_index_t, std::string> rebuildingStateInfo() const;
 
   // Issues LOGSDB CREATE command. Returns PARTITION_INVALID if it failed.
   partition_id_t createPartition(uint32_t shard);

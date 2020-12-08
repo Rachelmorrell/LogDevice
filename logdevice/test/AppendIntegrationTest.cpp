@@ -504,21 +504,11 @@ TEST_F(AppendIntegrationTest, NoSequencer) {
   auto log_attrs = logsconfig::LogAttributes().with_replicationFactor(3);
   logs_config->insert(EXTRA_LOG_ID.val_, "test_log_log", log_attrs);
 
-  auto client_config = std::make_shared<UpdateableConfig>();
-  client_config->updateableServerConfig()->update(
-      cluster_config->serverConfig());
-  client_config->updateableLogsConfig()->update(logs_config);
-  auto plugin_registry =
-      std::make_shared<PluginRegistry>(getClientPluginProviders());
-  std::shared_ptr<Client> client = std::make_shared<ClientImpl>(
-      client_config->get()->serverConfig()->getClusterName(),
-      client_config,
-      "",
-      "",
-      this->testTimeout(),
-      std::unique_ptr<ClientSettings>(),
-      plugin_registry);
-  ASSERT_TRUE((bool)client);
+  std::shared_ptr<Client> client = cluster->createClient();
+  ClientImpl* client_impl = static_cast<ClientImpl*>(client.get());
+  ld_check(client_impl);
+  client_impl->getConfig()->updateableLogsConfig()->update(
+      std::move(logs_config));
 
   // make an appendSync() call for the new log. Expect "no sequencer for log"
   char data[20];
@@ -553,6 +543,8 @@ TEST_F(AppendIntegrationTest, LogIdNotInServerConfig) {
   auto client_config = std::make_shared<UpdateableConfig>();
   client_config->updateableServerConfig()->update(
       cluster_config->serverConfig());
+  client_config->updateableNodesConfiguration()->update(
+      cluster_config->getNodesConfiguration());
   client_config->updateableLogsConfig()->update(logs_config);
   auto plugin_registry =
       std::make_shared<PluginRegistry>(getClientPluginProviders());
@@ -849,16 +841,14 @@ TEST_F(AppendIntegrationTest, WriteAfterReplace) {
   std::shared_ptr<Client> client = cluster->createClient();
 
   // We expect this to be a 1 seqencer + 1 storage node setup
-  ld_check(cluster->getConfig()
-               ->get()
-               ->serverConfig()
-               ->getNode(0)
-               ->isSequencingEnabled());
-  ld_check(cluster->getConfig()
-               ->get()
-               ->serverConfig()
-               ->getNode(1)
-               ->isReadableStorageNode());
+  EXPECT_TRUE(cluster->getConfig()
+                  ->getNodesConfiguration()
+                  ->getSequencerMembership()
+                  ->isSequencingEnabled(0));
+  EXPECT_TRUE(cluster->getConfig()
+                  ->getNodesConfiguration()
+                  ->getStorageMembership()
+                  ->hasShardShouldReadFrom(1));
 
   const logid_t LOG_ID(1);
   Payload payload("123", 3);
@@ -1110,4 +1100,101 @@ TEST_F(AppendIntegrationTest, Stats) {
 
 TEST_F(AppendIntegrationTest, StatsWithSequencerBatching) {
   AppendIntegrationTest_Stats_impl(true);
+}
+
+TEST_F(AppendIntegrationTest, AppendOversizedPayloadGroup) {
+  const logid_t logid{1};
+
+  auto cluster = IntegrationTestUtils::ClusterFactory().create(1);
+  // Make sure that sequencer won't reactivate.
+  cluster->waitForMetaDataLogWrites();
+
+  std::shared_ptr<Client> client = cluster->createClient();
+  ASSERT_NE(client, nullptr);
+
+  // Construct payload, which exceeds limit (here payload group encoding
+  // overhead makes it oversized)
+  std::string data(client->getMaxPayloadSize(), 'a');
+  PayloadGroup payload_group(
+      {{1, folly::IOBuf::wrapBufferAsValue(data.data(), data.size())}});
+
+  int rv;
+  rv = client->append(logid,
+                      std::move(payload_group),
+                      [&](Status, const DataRecord&) { ADD_FAILURE(); });
+  EXPECT_NE(0, rv);
+  // payload_group should not be moved-out
+  EXPECT_FALSE(payload_group.empty());
+}
+
+TEST_F(AppendIntegrationTest, AppendPayloadGroup) {
+  const logid_t logid{1};
+
+  auto cluster = IntegrationTestUtils::ClusterFactory().create(1);
+  // Make sure that sequencer won't reactivate.
+  cluster->waitForMetaDataLogWrites();
+
+  std::shared_ptr<Client> client = cluster->createClient();
+  ASSERT_NE(client, nullptr);
+
+  const std::string data1 = "payload";
+  const std::string data2 = data1 + data1;
+  const PayloadKey key1 = 0;
+  const PayloadKey key2 = 11;
+  PayloadGroup payload_group(
+      {{key1, folly::IOBuf::wrapBufferAsValue(data1.data(), data1.size())},
+       {key2, folly::IOBuf::wrapBufferAsValue(data2.data(), data2.size())}});
+
+  Semaphore async_append_sem;
+
+  // Write payload group using async and sync APIs, which should succeed
+  int rv;
+  rv = client->append(
+      logid, folly::copy(payload_group), [&](Status st, const DataRecord& r) {
+        if (st != E::OK) {
+          ld_error("Async append failed with status %s", error_description(st));
+        }
+        EXPECT_EQ(E::OK, st);
+        EXPECT_EQ(logid, r.logid);
+        EXPECT_NE(LSN_INVALID, r.attrs.lsn);
+        // Original payload should be preserved in the record
+        EXPECT_EQ(r.payloads.size(), payload_group.size());
+        EXPECT_EQ(data1.size(), r.payloads.at(key1).computeChainDataLength());
+        EXPECT_EQ(data2.size(), r.payloads.at(key2).computeChainDataLength());
+        // r.payload should be an alias to r.payloads[0]
+        EXPECT_EQ(data1, r.payload.toString());
+
+        async_append_sem.post();
+      });
+  EXPECT_EQ(0, rv);
+
+  lsn_t lsn;
+  lsn = client->appendSync(logid, folly::copy(payload_group));
+  EXPECT_NE(LSN_INVALID, lsn);
+
+  async_append_sem.wait();
+
+  // Suspend sequencer and check how appends fail
+  client->setTimeout(std::chrono::milliseconds(100));
+  cluster->getSequencerNode().suspend();
+
+  rv = client->append(
+      logid, folly::copy(payload_group), [&](Status st, const DataRecord& r) {
+        EXPECT_EQ(E::TIMEDOUT, st);
+        EXPECT_EQ(logid, r.logid);
+        EXPECT_EQ(LSN_INVALID, r.attrs.lsn);
+        // Original payload should be preserved in the record
+        EXPECT_EQ(r.payloads.size(), payload_group.size());
+        EXPECT_EQ(data1.size(), r.payloads.at(key1).computeChainDataLength());
+        EXPECT_EQ(data2.size(), r.payloads.at(key2).computeChainDataLength());
+        // r.payload should be an alias to r.payloads[0]
+        EXPECT_EQ(data1, r.payload.toString());
+
+        async_append_sem.post();
+      });
+  EXPECT_EQ(0, rv);
+  async_append_sem.wait();
+
+  lsn = client->appendSync(logid, folly::copy(payload_group));
+  EXPECT_EQ(LSN_INVALID, lsn);
 }

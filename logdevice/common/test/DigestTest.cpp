@@ -40,7 +40,7 @@ using RecordType = DigestTestUtil::RecordType;
 constexpr epoch_t TEST_EPOCH(42);
 constexpr logid_t TEST_LOG(2);
 
-std::unique_ptr<DataRecordOwnsPayload> create_record(
+std::unique_ptr<RawDataRecord> create_record(
     esn_t esn,
     RecordType type,
     uint32_t wave_or_seal_epoch,
@@ -64,33 +64,28 @@ class DigestTest : public ::testing::Test {
     dbg::assertOnData = true;
 
     // initialize the cluster config
-    Configuration::Nodes nodes;
-    addNodes(&nodes, 1, 1, "rg1.dc0.cl0.ro0.rk0", 1); // 0
-    addNodes(&nodes, 4, 1, "rg1.dc0.cl0.ro0.rk1", 2); // 1-4
-    addNodes(&nodes, 2, 1, "rg1.dc0.cl0..", 1);       // 5-6
-    addNodes(&nodes, 2, 1, "rg2.dc0.cl0.ro0.rk1", 1); // 7-8
-    addNodes(&nodes, 2, 1, "....", 1);                // 9-10
-
-    Configuration::NodesConfig nodes_config(std::move(nodes));
-
-    config_ =
-        ServerConfig::fromDataTest("digest_test", std::move(nodes_config));
+    nodes_config_ = std::make_shared<const NodesConfiguration>();
+    addNodes(nodes_config_, 1, 1, "rg1.dc0.cl0.ro0.rk0", 1); // 0
+    addNodes(nodes_config_, 4, 1, "rg1.dc0.cl0.ro0.rk1", 2); // 1-4
+    addNodes(nodes_config_, 2, 1, "rg1.dc0.cl0..", 1);       // 5-6
+    addNodes(nodes_config_, 2, 1, "rg2.dc0.cl0.ro0.rk1", 1); // 7-8
+    addNodes(nodes_config_, 2, 1, "....", 1);                // 9-10
   }
 
   void setUp() {
-    ld_check(config_ != nullptr);
-    digest_ = std::make_unique<Digest>(
-        TEST_LOG,
-        TEST_EPOCH,
-        EpochMetaData(nodeset_, replication_),
-        seal_epoch_,
-        config_->getNodesConfigurationFromServerConfigSource(),
-        Digest::Options({bridge_for_empty_epoch_}));
+    ld_check(nodes_config_ != nullptr);
+    digest_ =
+        std::make_unique<Digest>(TEST_LOG,
+                                 TEST_EPOCH,
+                                 EpochMetaData(nodeset_, replication_),
+                                 seal_epoch_,
+                                 nodes_config_,
+                                 Digest::Options({bridge_for_empty_epoch_}));
   }
 
  public:
   const logid_t TEST_LOG{2};
-  std::shared_ptr<ServerConfig> config_;
+  std::shared_ptr<const NodesConfiguration> nodes_config_;
   StorageSet nodeset_{N0, N1, N2, N3};
   ReplicationProperty replication_{{NodeLocationScope::NODE, 3}};
   epoch_t seal_epoch_{50};
@@ -152,35 +147,35 @@ class DigestTest : public ::testing::Test {
 #define ASSERT_CONFLICT_SET(...) \
   ASSERT_RESULT_SET(conflict_copies_, __VA_ARGS__);
 
-#define ASSERT_RECORD(_entry_, _rtype_, _wave_)                        \
-  do {                                                                 \
-    ASSERT_NE(nullptr, (_entry_).record);                              \
-    ASSERT_NE(nullptr, (_entry_).record->extra_metadata_);             \
-    ASSERT_EQ(_wave_, (_entry_).record->extra_metadata_->header.wave); \
-    auto flags = (_entry_).record->flags_;                             \
-    switch (_rtype_) {                                                 \
-      case RecordType::NORMAL:                                         \
-        ASSERT_FALSE(flags& RECORD_Header::WRITTEN_BY_RECOVERY);       \
-        ASSERT_FALSE(flags& RECORD_Header::HOLE);                      \
-        ASSERT_TRUE((_entry_).getPayload().size() > 0);                \
-        break;                                                         \
-      case RecordType::MUTATED:                                        \
-        ASSERT_TRUE(flags& RECORD_Header::WRITTEN_BY_RECOVERY);        \
-        ASSERT_FALSE(flags& RECORD_Header::HOLE);                      \
-        ASSERT_TRUE((_entry_).getPayload().size() > 0);                \
-        break;                                                         \
-      case RecordType::HOLE:                                           \
-        ASSERT_TRUE(flags& RECORD_Header::WRITTEN_BY_RECOVERY);        \
-        ASSERT_TRUE(flags& RECORD_Header::HOLE);                       \
-        ASSERT_TRUE((_entry_).isHolePlug());                           \
-        break;                                                         \
-      case RecordType::BRIDGE:                                         \
-        ASSERT_TRUE(flags& RECORD_Header::WRITTEN_BY_RECOVERY);        \
-        ASSERT_TRUE(flags& RECORD_Header::HOLE);                       \
-        ASSERT_TRUE(flags& RECORD_Header::BRIDGE);                     \
-        ASSERT_TRUE((_entry_).isHolePlug());                           \
-        break;                                                         \
-    }                                                                  \
+#define ASSERT_RECORD(_entry_, _rtype_, _wave_)                       \
+  do {                                                                \
+    ASSERT_NE(nullptr, (_entry_).record);                             \
+    ASSERT_NE(nullptr, (_entry_).record->extra_metadata);             \
+    ASSERT_EQ(_wave_, (_entry_).record->extra_metadata->header.wave); \
+    auto flags = (_entry_).record->flags;                             \
+    switch (_rtype_) {                                                \
+      case RecordType::NORMAL:                                        \
+        ASSERT_FALSE(flags& RECORD_Header::WRITTEN_BY_RECOVERY);      \
+        ASSERT_FALSE(flags& RECORD_Header::HOLE);                     \
+        ASSERT_TRUE((_entry_).getPayload().size() > 0);               \
+        break;                                                        \
+      case RecordType::MUTATED:                                       \
+        ASSERT_TRUE(flags& RECORD_Header::WRITTEN_BY_RECOVERY);       \
+        ASSERT_FALSE(flags& RECORD_Header::HOLE);                     \
+        ASSERT_TRUE((_entry_).getPayload().size() > 0);               \
+        break;                                                        \
+      case RecordType::HOLE:                                          \
+        ASSERT_TRUE(flags& RECORD_Header::WRITTEN_BY_RECOVERY);       \
+        ASSERT_TRUE(flags& RECORD_Header::HOLE);                      \
+        ASSERT_TRUE((_entry_).isHolePlug());                          \
+        break;                                                        \
+      case RecordType::BRIDGE:                                        \
+        ASSERT_TRUE(flags& RECORD_Header::WRITTEN_BY_RECOVERY);       \
+        ASSERT_TRUE(flags& RECORD_Header::HOLE);                      \
+        ASSERT_TRUE(flags& RECORD_Header::BRIDGE);                    \
+        ASSERT_TRUE((_entry_).isHolePlug());                          \
+        break;                                                        \
+    }                                                                 \
   } while (0)
 
 TEST_F(DigestTest, Basic) {
@@ -868,10 +863,9 @@ TEST_F(DigestTest, recomputeOffsetWithinEpoch) {
         ASSERT_RECORD(entry, RecordType::NORMAL, 4);
         checkMutation(entry, /*complete_digest*/ true);
         ASSERT_TRUE(needs_mutation_);
-        EXPECT_EQ(
-            payload_size,
-            entry.record->extra_metadata_->offsets_within_epoch.getCounter(
-                BYTE_OFFSET));
+        EXPECT_EQ(payload_size,
+                  entry.record->extra_metadata->offsets_within_epoch.getCounter(
+                      BYTE_OFFSET));
         break;
       case 2:
         checkMutation(entry);
@@ -880,10 +874,9 @@ TEST_F(DigestTest, recomputeOffsetWithinEpoch) {
         ASSERT_SUCCESS_SET(N0, N2, N3);
         ASSERT_CONFLICT_SET();
         ASSERT_RECORD(entry, RecordType::MUTATED, seal_epoch_.val_);
-        EXPECT_EQ(
-            payload_size * 2,
-            entry.record->extra_metadata_->offsets_within_epoch.getCounter(
-                BYTE_OFFSET));
+        EXPECT_EQ(payload_size * 2,
+                  entry.record->extra_metadata->offsets_within_epoch.getCounter(
+                      BYTE_OFFSET));
         break;
       case 3:
         checkMutation(entry);
@@ -892,10 +885,9 @@ TEST_F(DigestTest, recomputeOffsetWithinEpoch) {
         ASSERT_SUCCESS_SET(N3);
         ASSERT_CONFLICT_SET();
         ASSERT_RECORD(entry, RecordType::HOLE, seal_epoch_.val_);
-        EXPECT_EQ(
-            payload_size * 2,
-            entry.record->extra_metadata_->offsets_within_epoch.getCounter(
-                BYTE_OFFSET));
+        EXPECT_EQ(payload_size * 2,
+                  entry.record->extra_metadata->offsets_within_epoch.getCounter(
+                      BYTE_OFFSET));
         break;
       case 4:
         checkMutation(entry);
@@ -904,10 +896,9 @@ TEST_F(DigestTest, recomputeOffsetWithinEpoch) {
         ASSERT_SUCCESS_SET();
         ASSERT_CONFLICT_SET(N1, N3);
         ASSERT_RECORD(entry, RecordType::MUTATED, 49);
-        EXPECT_EQ(
-            payload_size * 3,
-            entry.record->extra_metadata_->offsets_within_epoch.getCounter(
-                BYTE_OFFSET));
+        EXPECT_EQ(payload_size * 3,
+                  entry.record->extra_metadata->offsets_within_epoch.getCounter(
+                      BYTE_OFFSET));
         break;
       case 5:
         checkMutation(entry);
@@ -916,10 +907,9 @@ TEST_F(DigestTest, recomputeOffsetWithinEpoch) {
         ASSERT_SUCCESS_SET();
         ASSERT_CONFLICT_SET();
         ASSERT_RECORD(entry, RecordType::MUTATED, seal_epoch_.val_);
-        EXPECT_EQ(
-            payload_size * 4,
-            entry.record->extra_metadata_->offsets_within_epoch.getCounter(
-                BYTE_OFFSET));
+        EXPECT_EQ(payload_size * 4,
+                  entry.record->extra_metadata->offsets_within_epoch.getCounter(
+                      BYTE_OFFSET));
         break;
       default:
         break;

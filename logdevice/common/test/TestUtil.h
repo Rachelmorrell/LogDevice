@@ -16,6 +16,7 @@
 #include <thread>
 
 #include <boost/filesystem.hpp>
+#include <folly/experimental/TestUtil.h>
 
 #include "logdevice/common/configuration/Configuration.h"
 #include "logdevice/common/configuration/UpdateableConfig.h"
@@ -51,61 +52,19 @@ int overwriteConfigFile(const char* path, const std::string& contents);
  */
 int overwriteConfig(const char* path, const ServerConfig*, const LogsConfig*);
 
-inline void writeSimpleConfig(const char* path, int server_generation) {
-  std::string contents = "{\n"
-                         "  \"cluster\": \"SimpleConfig\",\n"
-                         "  \"nodes\": [ {\n"
-                         "    \"node_id\": 0,\n"
-                         "    \"host\": \"127.0.0.1:4444\",\n"
-                         "    \"gossip_address\": 4445,\n"
-                         "    \"roles\": [\n"
-                         "      \"sequencer\",\n"
-                         "      \"storage\"\n"
-                         "    ],\n"
-                         "    \"sequencer\": true,\n"
-                         "    \"weight\": 1,\n"
-                         "    \"num_shards\": 2,\n"
-                         "    \"generation\": " +
-      std::to_string(server_generation) +
-      "\n"
-      "  } ],\n"
-      "  \"logs\": [],\n"
-      "  \"metadata_logs\": {\n"
-      "     \"nodeset\": [0],\n"
-      "     \"replication_factor\": 1\n"
-      "  },\n"
-      "  \"server_settings\": {\n"
-      "     \"enable-logsconfig-manager\": \"false\"\n"
-      "  },\n"
-      "  \"client_settings\": {\n"
-      "     \"enable-logsconfig-manager\": \"false\"\n"
-      "  }\n"
-      "}\n";
-  overwriteConfigFile(path, contents);
-}
-
-ServerConfig::NodesConfig createSimpleNodesConfig(size_t nnodes);
+std::shared_ptr<const NodesConfiguration>
+createSimpleNodesConfig(size_t nnodes,
+                        shard_size_t num_shards = 2,
+                        bool all_metadata = false,
+                        int replication_factor = 1);
 
 /**
- * Create a MetaDataLogsConfig object from an existing NodesConfig. Nodes
- * are selected from the beginning of nodes in @nodes with non-zero weight
- * until either max_metadata_nodes is reached or all nodes are picked.
- *
- * @param nodes                 NodesConfigObject given
- * @param max_metadata_nodes    maximum nodes to store metadata logs,
- *                              the actual number of nodes is also capped by
- *                              the number of non-zero weight nodes in
- *                              NodesConfig.
- * @param max_replication       maximum replication factor for metadata logs,
- *                              the actual replication factor is also capped by
- *                              the actual metadata nodeset size
- * @return                      Configuration::MetaDataLogsConfig object
+ * Provisions a temporary directory and writes the passed NodesConfig there.
+ * The returned temp directory path can be then passed to the
+ * nodes-configuration-file-store-dir setting.
  */
-ServerConfig::MetaDataLogsConfig createMetaDataLogsConfig(
-    const ServerConfig::NodesConfig& nodes,
-    size_t max_metadata_nodes,
-    size_t max_replication,
-    NodeLocationScope sync_replication_scope = NodeLocationScope::NODE);
+std::unique_ptr<folly::test::TemporaryDirectory>
+provisionTempNodesConfiguration(const NodesConfiguration& nodes_config);
 
 /**
  * Create a MetaDataLogsConfig object from an existing list of node
@@ -130,16 +89,6 @@ ServerConfig::MetaDataLogsConfig createMetaDataLogsConfig(
  *   @param logs    how many logs to use (1..logs)
  */
 std::shared_ptr<Configuration> createSimpleConfig(size_t nodes, size_t logs);
-
-/**
- * Creates a simple config with the given node configuration and the target
- * number of logs.
- *
- *  @param nodes    node configuration
- *  @param logs     how many logs to use (1..logs)
- */
-std::shared_ptr<Configuration>
-createSimpleConfig(ServerConfig::NodesConfig nodes, size_t logs);
 
 /**
  * Waits until a condition is satisfied.  The condition is periodically

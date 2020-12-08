@@ -24,6 +24,7 @@
 #include "logdevice/common/protocol/GOSSIP_Message.h"
 #include "logdevice/common/request_util.h"
 #include "logdevice/common/settings/GossipSettings.h"
+#include "logdevice/common/test/NodesConfigurationTestUtil.h"
 #include "logdevice/common/test/TestUtil.h"
 #include "logdevice/server/ServerProcessor.h"
 #include "logdevice/server/ServerSettings.h"
@@ -57,12 +58,11 @@ class MockFailureDetector : public FailureDetector {
                                ServerProcessor* p)
       : FailureDetector(std::move(settings), p, /* stats */ nullptr),
         my_node_id_(p->getMyNodeID()),
-        config_(p->config_->get()->serverConfig()),
-        cluster_state_(new ClusterState(
-            1000,
-            nullptr,
-            *config_->getNodesConfigurationFromServerConfigSource()
-                 ->getServiceDiscovery())) {
+        nodes_config_(p->config_->getNodesConfiguration()),
+        cluster_state_(
+            new ClusterState(1000,
+                             nullptr,
+                             *nodes_config_->getServiceDiscovery())) {
     // Hijack the FailureDetector's startup sequence to not do anything on a
     // worker and to not start any timers.
     // In real code you would call FailureDetector::start(), which would
@@ -83,7 +83,7 @@ class MockFailureDetector : public FailureDetector {
   }
   std::shared_ptr<const configuration::nodes::NodesConfiguration>
   getNodesConfiguration() const override {
-    return config_->getNodesConfigurationFromServerConfigSource();
+    return nodes_config_;
   }
   NodeID getMyNodeID() const override {
     return my_node_id_;
@@ -92,8 +92,10 @@ class MockFailureDetector : public FailureDetector {
     return cluster_state_.get();
   }
 
-  Connection* getServerConnection(node_index_t /*idx*/) override {
-    return nullptr;
+  void resetServerSocketConnectThrottle(node_index_t) override {}
+
+  int checkServerConnection(node_index_t) override {
+    return 0;
   }
 
   std::vector<std::pair<NodeID, std::unique_ptr<GOSSIP_Message>>> messages_;
@@ -110,6 +112,14 @@ class MockFailureDetector : public FailureDetector {
     report_logsconfig_loaded_.store(val);
   }
 
+  void setLastGossipReceivedTS(SteadyTimestamp ts) {
+    last_gossip_received_ts_ = ts;
+  }
+
+  SteadyTimestamp getLastGossipReceivedTS() {
+    return last_gossip_received_ts_;
+  }
+
  protected:
   bool isLogsConfigLoaded() override {
     return report_logsconfig_loaded_.load();
@@ -122,7 +132,7 @@ class MockFailureDetector : public FailureDetector {
 
   MockBoycottTracker mock_tracker_;
   NodeID my_node_id_;
-  std::shared_ptr<ServerConfig> config_;
+  std::shared_ptr<const NodesConfiguration> nodes_config_;
   std::unique_ptr<ClusterState> cluster_state_;
   std::atomic<bool> report_logsconfig_loaded_{true};
 };
@@ -143,27 +153,21 @@ class FailureDetectorTest : public testing::Test {
 };
 
 // generates a dummy config consisting of num_nodes sequencers
-std::shared_ptr<ServerConfig> gen_config(size_t num_nodes,
-                                         node_index_t this_node) {
+std::shared_ptr<Configuration> gen_config(size_t num_nodes) {
   configuration::Nodes nodes;
   for (node_index_t i = 0; i < num_nodes; ++i) {
-    auto& node = nodes[i];
-    node.address =
-        Sockaddr(get_localhost_address_str(), folly::to<std::string>(1337 + i));
-    node.generation = 1;
-    node.addSequencerRole();
-    node.addStorageRole();
+    nodes[i] = configuration::Node::withTestDefaults(i)
+                   .addStorageRole()
+                   .setIsMetadataNode(true);
   }
-
-  Configuration::NodesConfig nodes_config(std::move(nodes));
-
   // metadata stored on all nodes with max replication factor 3
-  configuration::MetaDataLogsConfig meta_config =
-      createMetaDataLogsConfig(nodes_config, nodes_config.getNodes().size(), 3);
+  auto nodes_configuration = NodesConfigurationTestUtil::provisionNodes(
+      std::move(nodes), ReplicationProperty{{NodeLocationScope::NODE, 3}});
 
-  std::shared_ptr<ServerConfig> config =
-      ServerConfig::fromDataTest(__FILE__, nodes_config, meta_config);
-  return config;
+  return std::make_shared<Configuration>(
+      ServerConfig::fromDataTest(__FILE__),
+      std::make_shared<configuration::LocalLogsConfig>(),
+      std::move(nodes_configuration));
 }
 
 std::pair<std::shared_ptr<ServerProcessor>, MockFailureDetector*>
@@ -177,14 +181,17 @@ make_processor_with_detector(node_index_t nid,
   main_settings.num_workers = 1;
   main_settings.worker_request_pipe_capacity = 1000000;
 
+  // TODO the following 2 settings are required to make the NCPublisher pick
+  // the NCM NodesConfiguration. Should be removed when NCM is the default.
+  main_settings.enable_nodes_configuration_manager = true;
+  main_settings.use_nodes_configuration_manager_nodes_configuration = true;
+
   if (!create_monitor)
     main_settings.enable_health_monitor = false;
 
   /* make config for this index */
   std::shared_ptr<UpdateableConfig> uconfig =
-      std::make_shared<UpdateableConfig>(std::make_shared<Configuration>(
-          gen_config(num_nodes, nid),
-          std::make_shared<configuration::LocalLogsConfig>()));
+      std::make_shared<UpdateableConfig>(gen_config(num_nodes));
 
   auto processor_builder = TestServerProcessorBuilder{main_settings}
                                .setServerSettings(server_settings)
@@ -699,6 +706,64 @@ TEST_F(FailureDetectorTest, ClusterStateUpdate) {
     EXPECT_EQ(NodeHealthStatus::OVERLOADED,
               detectors[idx]->getClusterState()->getNodeStatus(1));
   }
+
+  shutdown_processors(processors);
+}
+
+// Simulate a node failing to process gossip messages for some time while
+// still able to send out gossips. Such a node should be marked as dead.
+TEST_F(FailureDetectorTest, StalledGossipProcessor) {
+  const int num_nodes = 2;
+
+  GossipSettings settings = create_default_settings<GossipSettings>();
+  settings.gossip_intervals_without_processing_threshold = 30;
+  settings.suspect_duration = std::chrono::milliseconds(0);
+
+  settings.mode = GossipSettings::SelectionMode::ROUND_ROBIN;
+  UpdateableSettings<GossipSettings> updateable(settings);
+  std::vector<std::shared_ptr<ServerProcessor>> processors;
+  detector_list_t detectors;
+
+  std::tie(processors, detectors) =
+      create_processors_and_detectors(num_nodes, settings);
+
+  // gossip until both nodes are aware that the other is alive
+  for (int i = 0; i <= settings.min_gossips_for_stable_state; ++i) {
+    gossip_round(detectors[0], detectors[1]);
+  }
+
+  for (node_index_t idx = 0; idx < num_nodes; ++idx) {
+    EXPECT_TRUE(detectors[0]->isAlive(idx));
+    EXPECT_TRUE(detectors[1]->isAlive(idx));
+  }
+
+  // override the last time N0 processed a gossip message to
+  // exceed the allowed threshold of gossip_intervals passed without
+  // processing.
+  auto last_time = SteadyTimestamp::now() -
+      (settings.gossip_interval *
+       (settings.gossip_intervals_without_processing_threshold + 5));
+  detectors[0]->setLastGossipReceivedTS(last_time);
+
+  gossip_round(detectors[0], detectors[1]);
+  gossip_round(detectors[0], detectors[1]);
+
+  // N0 still thinks its alive and N1 is alive
+  EXPECT_TRUE(detectors[0]->isAlive(node_index_t(0)));
+  EXPECT_TRUE(detectors[0]->isAlive(node_index_t(1)));
+
+  EXPECT_LT(
+      std::chrono::duration_cast<std::chrono::seconds>(
+          SteadyTimestamp::now() - detectors[0]->getLastGossipReceivedTS())
+          .count(),
+      1);
+
+  // N1 notices the flag set by N0 indicating it hasn't been processing
+  // and sets it to dead.
+  EXPECT_FALSE(detectors[1]->isAlive(node_index_t(0)));
+  EXPECT_TRUE(detectors[1]->isAlive(node_index_t(1)));
+  EXPECT_EQ(NodeHealthStatus::UNHEALTHY,
+            detectors[1]->getClusterState()->getNodeStatus(0));
 
   shutdown_processors(processors);
 }

@@ -21,12 +21,11 @@
 
 #include "logdevice/common/AllSequencers.h"
 #include "logdevice/common/AppendRequest.h"
+#include "logdevice/common/ConnectionKind.h"
 #include "logdevice/common/EpochMetaDataUpdater.h"
-#include "logdevice/common/FileEpochStore.h"
 #include "logdevice/common/MetaDataLogWriter.h"
 #include "logdevice/common/NoopTraceLogger.h"
 #include "logdevice/common/PermissionChecker.h"
-#include "logdevice/common/PrincipalParser.h"
 #include "logdevice/common/Processor.h"
 #include "logdevice/common/ReaderImpl.h"
 #include "logdevice/common/ResourceBudget.h"
@@ -34,7 +33,6 @@
 #include "logdevice/common/SequencerLocator.h"
 #include "logdevice/common/StaticSequencerLocator.h"
 #include "logdevice/common/Worker.h"
-#include "logdevice/common/configuration/NodesConfigParser.h"
 #include "logdevice/common/configuration/UpdateableConfig.h"
 #include "logdevice/common/debug.h"
 #include "logdevice/common/nodeset_selection/NodeSetSelector.h"
@@ -42,12 +40,14 @@
 #include "logdevice/common/settings/Settings.h"
 #include "logdevice/common/settings/SettingsUpdater.h"
 #include "logdevice/common/settings/util.h"
+#include "logdevice/common/test/NodesConfigurationTestUtil.h"
 #include "logdevice/common/test/TestUtil.h"
 #include "logdevice/include/Err.h"
 #include "logdevice/include/Record.h"
 #include "logdevice/server/ConnectionListener.h"
 #include "logdevice/server/ServerProcessor.h"
 #include "logdevice/server/ServerSettings.h"
+#include "logdevice/server/epoch_store/FileEpochStore.h"
 #include "logdevice/server/locallogstore/LocalLogStore.h"
 #include "logdevice/server/locallogstore/test/TemporaryLogStore.h"
 #include "logdevice/server/read_path/LogStorageStateMap.h"
@@ -170,6 +170,7 @@ void UnreleasedRecordDetectorTest::SetUp() {
   // Someone may try and fail to connect before we start the listener. Make sure
   // it doesn't cause connection errors later.
   settings.connect_throttle.initial_delay = std::chrono::milliseconds(0);
+
   usettings_ =
       std::make_unique<UpdateableSettings<Settings>>(std::move(settings));
   ServerSettings server_settings(create_default_settings<ServerSettings>());
@@ -203,34 +204,31 @@ void UnreleasedRecordDetectorTest::SetUp() {
       nullptr);
   ld_notify("ShardedStorageThreadPool created.");
 
+  auto socketPath = temp_dir_path + "/socket";
+
+  configuration::Node node = configuration::Node::withTestDefaults(0);
+  node.setAddress(Sockaddr(socketPath));
+  node.addStorageRole(1);
+  node.setIsMetadataNode(true);
+
+  configuration::Nodes nodes;
+  nodes[0] = std::move(node);
+
+  auto nodes_configuration = NodesConfigurationTestUtil::provisionNodes(
+      std::move(nodes), ReplicationProperty{{NodeLocationScope::NODE, 1}});
+
   // create config from file
   config_ = std::make_shared<UpdateableConfig>(
-      Configuration::fromJsonFile(CONFIG_PATH));
+      Configuration::fromJsonFile(CONFIG_PATH)
+          ->withNodesConfiguration(std::move(nodes_configuration)));
+
   ASSERT_NE(nullptr, config_);
   ASSERT_NE(nullptr, config_->getServerConfig());
   ld_notify("UpdateableConfig created from file %s.", CONFIG_PATH);
 
-  // override node address with path to unix domain socket in temp directory
-  std::string socketPath(temp_dir_path);
-  socketPath.append("/socket");
-  auto* const node =
-      const_cast<configuration::Node*>(config_->getServerConfig()->getNode(0));
-  ASSERT_TRUE(configuration::parser::parseHostString(
-      socketPath, node->address, "host"));
-
-  // do the same thing for NodesConfiguration
-  auto nodes_configuration =
-      config_->getNodesConfigurationFromServerConfigSource();
-  ASSERT_NE(nullptr, nodes_configuration);
-  const auto* serv_disc = nodes_configuration->getNodeServiceDiscovery(0);
-  ASSERT_NE(nullptr, serv_disc);
-  const_cast<configuration::nodes::NodeServiceDiscovery*>(serv_disc)->address =
-      node->address;
-
   // create processor
   processor_ =
-      ServerProcessor::create(/* audit log */ nullptr,
-                              sharded_storage_thread_pool_.get(),
+      ServerProcessor::create(sharded_storage_thread_pool_.get(),
                               /* log storage state map */ nullptr,
                               *userver_settings_,
                               *ugossip_settings_,
@@ -252,20 +250,23 @@ void UnreleasedRecordDetectorTest::SetUp() {
   connection_listener_loop_ = std::make_unique<folly::EventBaseThread>(
       true,
       nullptr,
-      ConnectionListener::listenerTypeNames()
-          [ConnectionListener::ListenerType::DATA]);
+      ConnectionListener::connectionKindToThreadName(ConnectionKind::DATA));
   connection_listener_ = std::make_unique<ConnectionListener>(
       Listener::InterfaceDef(std::move(socketPath), false),
       folly::getKeepAliveToken(connection_listener_loop_->getEventBase()),
       std::make_shared<ConnectionListener::SharedState>(),
-      ConnectionListener::ListenerType::DATA,
-      budget_);
+      ConnectionKind::DATA,
+      budget_,
+      /* enable_dscp_reflection= */ true);
   connection_listener_->setProcessor(processor_.get());
   ld_notify("ConnectionListener created.");
 
   // initialize and provision the epoch store
-  auto epoch_store = std::make_unique<FileEpochStore>(
-      temp_dir_path, processor_.get(), config_->updateableNodesConfiguration());
+  auto epoch_store =
+      std::make_unique<FileEpochStore>(temp_dir_path,
+                                       processor_->getRequestExecutor(),
+                                       processor_->getOptionalMyNodeID(),
+                                       config_->updateableNodesConfiguration());
   std::shared_ptr<NodeSetSelector> selector =
       NodeSetSelectorFactory::create(NodeSetSelectorType::SELECT_ALL);
   auto log_store_factory = [this](node_index_t nid) {
@@ -279,8 +280,11 @@ void UnreleasedRecordDetectorTest::SetUp() {
   int rv = provisioner->provisionEpochMetaData(std::move(selector), true, true);
   ASSERT_EQ(0, rv);
 
-  epoch_store = std::make_unique<FileEpochStore>(
-      temp_dir_path, processor_.get(), config_->updateableNodesConfiguration());
+  epoch_store =
+      std::make_unique<FileEpochStore>(temp_dir_path,
+                                       processor_->getRequestExecutor(),
+                                       processor_->getOptionalMyNodeID(),
+                                       config_->updateableNodesConfiguration());
 
   processor_->allSequencers().setEpochStore(std::move(epoch_store));
   ld_notify("FileEpochStore created and initialized in directory %s.",

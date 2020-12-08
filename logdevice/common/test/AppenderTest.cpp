@@ -16,7 +16,6 @@
 #include "logdevice/common/LinearCopySetSelector.h"
 #include "logdevice/common/NoopTraceLogger.h"
 #include "logdevice/common/PassThroughCopySetManager.h"
-#include "logdevice/common/Sender.h"
 #include "logdevice/common/Worker.h"
 #include "logdevice/common/configuration/Configuration.h"
 #include "logdevice/common/configuration/LocalLogsConfig.h"
@@ -28,6 +27,8 @@
 #include "logdevice/common/protocol/STORED_Message.h"
 #include "logdevice/common/protocol/STORE_Message.h"
 #include "logdevice/common/test/CopySetSelectorTestUtil.h"
+#include "logdevice/common/test/NodesConfigurationTestUtil.h"
+#include "logdevice/common/test/SenderTestProxy.h"
 #include "logdevice/common/test/TestUtil.h"
 
 namespace facebook { namespace logdevice {
@@ -109,7 +110,6 @@ class AppenderTest : public ::testing::Test {
   Status nodeset_status_{E::OK};
 
   copyset_size_t replication_{3};
-  copyset_size_t extras_{2};
   copyset_size_t synced_{0};
 
   // Used by tests to determine what the next calls to
@@ -120,13 +120,14 @@ class AppenderTest : public ::testing::Test {
   // return.
   bool is_accepting_work_{true};
 
-  // Keep track of the state of the Appender's timers.
-  // Note that instead of mocking the timers directly, this test suite will call
+  // Keep track of the state of the store timer.
+  // Note that instead of mocking the timer directly, this test suite will call
   // the onTimeout() method of Appender directly.
-  // These values are only used to assert that the timers have been activated
-  // through calls to activateStoreTimer() and activateRetryTimer(), and
+  // This value is only used to assert that the timer has been activated
+  // through call to activateStoreTimer()
   bool store_timer_active_{false};
-  bool retry_timer_active_{false};
+  // Indicates that immediate retry wave was scheduled after send failure.
+  bool retry_wave_scheduled_{false};
 
   // Keep track of which nodes are not available following Appender calling
   // setNotAvailableUntil(). Used by checkNotAvailableUntil() to inform the
@@ -143,11 +144,10 @@ class AppenderTest : public ::testing::Test {
   // Used to mock LinearCopySetSelector::Iterator.
   int first_candidate_idx_{0};
 
-  // Keep track of received STORE/DELETE/RELEASE messages.
+  // Keep track of received STORE/RELEASE messages.
   // Tests can use several macros to check the content of these maps for a given
   // NodeID.
   message_map_t<STORE_Message> store_msgs_;
-  message_map_t<DELETE_Message> delete_msgs_;
   message_map_t<RELEASE_Message> release_msgs_;
 
   // Store the APPENDED header sent by Appender (if any).
@@ -189,6 +189,9 @@ class AppenderTest : public ::testing::Test {
   // call Appender::onTimeout().
   void triggerTimeout();
 
+  // Sends previously scheduled retry wave
+  void triggerRetryWave();
+
   // Trigger the on socket close callback for `nid`.
   void triggerOnSocketClosed(ShardID shard);
 
@@ -202,7 +205,6 @@ class AppenderTest : public ::testing::Test {
   void checkNoStoreMsg();
   void onStoredSent(Status status, uint32_t wave, std::set<ShardID> shards);
   void checkAppended(Status status);
-  void checkDeleteMsg(std::set<ShardID> shards);
   void checkReleaseMsg(std::set<ShardID> shards);
   void checkRetired() {
     ASSERT_TRUE(retired_);
@@ -214,8 +216,9 @@ class AppenderTest : public ::testing::Test {
  private:
   // Map a NodeID to a list of SocketCallback. (this mocks some logic in
   // Recipient which registers a socket callback to the socket by calling
-  // registerOnSocketClosed()). Tests can call triggerOnSocketClosed(ShardID) to
-  // simulate the callback being called for a NodeID.
+  // registerOnConnectionClosed()). Tests can call
+  // triggerOnSocketClosed(ShardID) to simulate the callback being called for a
+  // NodeID.
   std::unordered_map<
       NodeID,
       folly::IntrusiveList<SocketCallback, &SocketCallback::listHook_>,
@@ -244,7 +247,9 @@ class AppenderTest::TestCopySetSelectorDeps
   }
 
  private:
-  int checkConnection(NodeID nid, ClientID* our_name_at_peer) const override {
+  int checkConnection(node_index_t id,
+                      ClientID* our_name_at_peer) const override {
+    NodeID nid(id);
     auto it = node_status_.find(nid);
     if (it != node_status_.end() &&
         it->second.connection_state_ != Status::OK) {
@@ -282,7 +287,7 @@ class AppenderTest::TestCopySetSelectorDeps
     return true;
   }
 
-  int connect(NodeID /*nid*/) const override {
+  int connect(node_index_t /*nid*/) const override {
     // Called by when checkNode() sees a node that's not
     // connected. Ignored.
     return 0;
@@ -453,24 +458,17 @@ class AppenderTest::MockAppender : public Appender {
   void checkWorkerThread() override {}
 
   void initStoreTimer() override {}
-  void initRetryTimer() override {}
   void cancelStoreTimer() override {
     test_->store_timer_active_ = false;
   }
   bool storeTimerIsActive() override {
     return test_->store_timer_active_;
   }
-  void cancelRetryTimer() override {
-    test_->retry_timer_active_ = false;
-  }
-  void activateRetryTimer() override {
-    test_->retry_timer_active_ = true;
-  }
   void activateStoreTimer(std::chrono::milliseconds) override {
     test_->store_timer_active_ = true;
   }
-  bool retryTimerIsActive() override {
-    return test_->retry_timer_active_;
+  void sendRetryWave() override {
+    test_->retry_wave_scheduled_ = true;
   }
   bool isNodeAlive(NodeID node) override {
     // if we can't find the node in dead_nodes_, it is alive.
@@ -482,10 +480,6 @@ class AppenderTest::MockAppender : public Appender {
 
   NodeLocationScope getCurrentBiggestReplicationScope() const override {
     return NodeLocationScope::NODE;
-  }
-
-  copyset_size_t getExtras() const override {
-    return test_->extras_;
   }
 
   std::shared_ptr<CopySetManager> getCopySetManager() const override {
@@ -542,10 +536,6 @@ class AppenderTest::MockAppender : public Appender {
       case MessageType::STORE:
         onMessageReceived<STORE_Message>(
             msg, test_->store_msgs_, ShardID(nid.index(), 0));
-        break;
-      case MessageType::DELETE:
-        onMessageReceived<DELETE_Message>(
-            msg, test_->delete_msgs_, ShardID(nid.index(), 0));
         break;
       case MessageType::RELEASE:
         onMessageReceived<RELEASE_Message>(
@@ -606,22 +596,18 @@ class AppenderTest::MockAppender : public Appender {
   bool noteAppenderReaped(Appender::FullyReplicated replicated,
                           lsn_t reaped_lsn,
                           std::shared_ptr<TailRecord> tail_record,
-                          epoch_t* last_released_epoch_out,
-                          bool* lng_changed_out) override {
+                          epoch_t* last_released_epoch_out) override {
     if (lsn_to_epoch(reaped_lsn) <= test_->preempted_epoch_) {
       err = E::PREEMPTED;
-      *lng_changed_out = false;
       return false;
     }
 
     if (replicated != Appender::FullyReplicated::YES) {
       err = E::ABORTED;
-      *lng_changed_out = false;
       return false;
     }
 
     *last_released_epoch_out = test_->last_released_epoch_;
-    *lng_changed_out = true;
     return true;
   }
 
@@ -636,7 +622,7 @@ class AppenderTest::MockAppender : public Appender {
     return &stats_;
   }
 
-  int registerOnSocketClosed(NodeID nid, SocketCallback& cb) override {
+  int registerOnConnectionClosed(NodeID nid, SocketCallback& cb) override {
     test_->on_close_cb_map_[nid].push_back(cb);
     return 0;
   }
@@ -679,42 +665,31 @@ void AppenderTest::start(bool stream_message) {
 void AppenderTest::updateConfig() {
   configuration::Nodes nodes;
   for (ShardID shard : shards_) {
-    node_index_t nid = shard.node();
-    ld_check(!nodes.count(nid));
-    Configuration::Node& node = nodes[nid];
-    node.address = Sockaddr("::1", folly::to<std::string>(4440 + nid));
-    node.generation = 1;
-    node.addStorageRole();
-    node.addSequencerRole();
+    nodes.emplace(shard.node(),
+                  configuration::Node::withTestDefaults(shard.node())
+                      .setIsMetadataNode(true));
   }
+  auto nodes_configuration = NodesConfigurationTestUtil::provisionNodes(
+      std::move(nodes), ReplicationProperty{{NodeLocationScope::NODE, 3}});
 
   auto log_attrs =
       logsconfig::LogAttributes().with_replicationFactor(replication_);
 
-  Configuration::NodesConfig nodes_config(nodes);
   auto logs_config = std::make_unique<configuration::LocalLogsConfig>();
   logs_config->insert(boost::icl::right_open_interval<logid_t::raw_type>(
                           LOG_ID.val_, LOG_ID.val_ + 1),
                       "mylog",
                       log_attrs);
 
-  // metadata stored on all nodes with max replication factor 3
-  Configuration::MetaDataLogsConfig meta_config =
-      createMetaDataLogsConfig(nodes_config, nodes_config.getNodes().size(), 3);
-
   std::shared_ptr<ServerConfig> server_cfg =
-      ServerConfig::fromDataTest(__FILE__, nodes_config, meta_config);
+      ServerConfig::fromDataTest(__FILE__);
   config_.updateableServerConfig()->update(server_cfg);
   config_.updateableNodesConfiguration()->update(
-      server_cfg->getNodesConfigurationFromServerConfigSource());
+      std::move(nodes_configuration));
   config_.updateableLogsConfig()->update(std::move(logs_config));
 
-  StorageSet shards;
-  for (const auto& it : nodes) {
-    for (shard_index_t s = 0; s < it.second.getNumShards(); ++s) {
-      shards.push_back(ShardID(it.first, s));
-    }
-  }
+  StorageSet shards =
+      config_.getNodesConfiguration()->getStorageMembership()->getAllShards();
   std::sort(shards.begin(), shards.end());
   auto nodeset_state = std::make_shared<MockNodeSetState>(
       this, shards, LOG_ID, NodeSetState::HealthCheck::DISABLED);
@@ -732,10 +707,14 @@ const STORE_Header& AppenderTest::getHeader(const STORE_Message* msg) {
 }
 
 void AppenderTest::triggerTimeout() {
-  ASSERT_TRUE(retry_timer_active_ || store_timer_active_);
-  retry_timer_active_ = false;
+  ASSERT_TRUE(store_timer_active_);
   store_timer_active_ = false;
   appender_->onTimeout();
+}
+
+void AppenderTest::triggerRetryWave() {
+  ASSERT_TRUE(retry_wave_scheduled_);
+  appender_->sendWave();
 }
 
 void AppenderTest::triggerOnSocketClosed(ShardID shard) {
@@ -834,34 +813,6 @@ void AppenderTest::checkStoreMsgAndTriggerOnSent(Status status,
 void AppenderTest::checkNoStoreMsg() {
   ASSERT_TRUE(store_msgs_.empty());
 }
-
-// Check that all/only the given shards have received a DELETE message.
-#define CHECK_DELETE_MSG(...)                                          \
-  {                                                                    \
-    for (auto shard : {__VA_ARGS__}) {                                 \
-      auto it = delete_msgs_.find(shard);                              \
-      ASSERT_NE(delete_msgs_.end(), it);                               \
-      ASSERT_EQ(lsn_to_epoch(LSN), it->second->getHeader().rid.epoch); \
-      ASSERT_EQ(lsn_to_esn(LSN), it->second->getHeader().rid.esn);     \
-      ASSERT_EQ(LOG_ID, it->second->getHeader().rid.logid);            \
-      delete_msgs_.erase(it);                                          \
-    }                                                                  \
-    ASSERT_TRUE(delete_msgs_.empty());                                 \
-  }
-
-void AppenderTest::checkDeleteMsg(std::set<ShardID> shards) {
-  for (auto shard : shards) {
-    auto it = delete_msgs_.find(shard);
-    ASSERT_NE(delete_msgs_.end(), it);
-    ASSERT_EQ(lsn_to_epoch(LSN), it->second->getHeader().rid.epoch);
-    ASSERT_EQ(lsn_to_esn(LSN), it->second->getHeader().rid.esn);
-    ASSERT_EQ(LOG_ID, it->second->getHeader().rid.logid);
-    delete_msgs_.erase(it);
-  }
-  ASSERT_TRUE(delete_msgs_.empty());
-}
-
-#define CHECK_NO_DELETE_MSG() ASSERT_TRUE(delete_msgs_.empty())
 
 // Check that all/only the given shards have received a RELEASE message for wave
 // `wave`.
@@ -972,81 +923,74 @@ TEST_F(AppenderTest, Simple) {
   updateConfig();
   first_candidate_idx_ = 0;
   start();
-  CHECK_STORE_MSG(1, N4S0);
-  CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 1, N0S0, N1S0, N2S0, N3S0);
+  CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 1, N0S0, N1S0, N2S0);
   CHECK_NO_STORE_MSG();
-  ON_STORED_SENT(E::OK, 1, N0S0, N1S0, N3S0);
+  ON_STORED_SENT(E::OK, 1, N0S0, N1S0, N2S0);
   CHECK_APPENDED(E::OK);
   ASSERT_TRUE(retired_);
-  CHECK_DELETE_MSG(N2S0, N4S0);
   Appender::Reaper()(appender_);
-  CHECK_RELEASE_MSG(N0S0, N1S0, N3S0);
+  CHECK_RELEASE_MSG(N0S0, N1S0, N2S0);
 }
 
 TEST_F(AppenderTest, SimpleStream) {
   updateConfig();
   first_candidate_idx_ = 0;
   start(true);
-  CHECK_STORE_MSG(1, N4S0);
-  CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 1, N0S0, N1S0, N2S0, N3S0);
+  CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 1, N0S0, N1S0, N2S0);
   CHECK_NO_STORE_MSG();
-  ON_STORED_SENT(E::OK, 1, N0S0, N1S0, N3S0);
+  ON_STORED_SENT(E::OK, 1, N0S0, N1S0, N2S0);
   ASSERT_TRUE(retired_);
-  CHECK_DELETE_MSG(N2S0, N4S0);
   ASSERT_FALSE(reply_.has_value());
   Appender::Reaper()(appender_);
   CHECK_APPENDED(E::OK);
-  CHECK_RELEASE_MSG(N0S0, N1S0, N3S0);
+  CHECK_RELEASE_MSG(N0S0, N1S0, N2S0);
 }
 
-// A first wave is sent but we reach a point where we failed to store on too
-// many nodes in the recipient set such that we know we should start a new wave
-// immediately. During the first wave, Appender received a negative reply from a
-// node with E::NOSPC. We check that this node is discarded by pickDestinations
-// for the new wave. We also check that a stale reply for wave 1 is discarded
-// when waiting for replies for wave 2.
-TEST_F(AppenderTest, NotEnoughRepliesExpectedTryNewWave) {
+// A first wave is sent but one of the recipients replies with NOSPC. We start a
+// second wave. Here we validate 3 things:
+// * The copyset for the 2nd wave does not include that recipient
+// * A stale reply from the copyset in the first wave does not causet he
+//   appender to send APPENDE
+// * In the 2nd wave, once all 3 recipients have STORED, the appended sends
+//   APPENDED
+TEST_F(AppenderTest, NOSPCTryNewWave) {
   updateConfig();
   first_candidate_idx_ = 0;
 
   start();
 
-  // The Appender sent a STORE message to {0, 1, 2, 3, 4}
-  // STORE could be sent to 4 nodes.
-  CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 1, N0S0, N1S0, N2S0, N4S0);
-  // The STORE message could not be sent to one recipient.
-  CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::TIMEDOUT, 1, N3S0);
+  // The Appender sent a STORE message to {0, 1, 2}
+  // STORE could be sent to all 3 nodes.
+  CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 1, N0S0, N1S0, N2S0);
   CHECK_NO_STORE_MSG();
   // One recipient successfully stored its copy.
   ON_STORED_SENT(E::OK, 1, N0S0);
-  // Two recipients reply with an error.
-  ON_STORED_SENT(E::NOSPC, 1, N4S0);
-  ON_STORED_SENT(E::FAILED, 1, N2S0);
+  // One recipient replied with an error
+  ON_STORED_SENT(E::NOSPC, 1, N2S0);
 
-  // At this point, Appender should give up this wave because 3 out of 5 nodes
-  // could not store a copy of the record, meaning that there is not enough
-  // nodes left to fully replicate it. The retry timer is activated.
+  // At this point, Appender should give up this wave.
+  // The retry wave is scheduled.
 
   // Check that Appender notified NodeSetState that N4S0 has no space.
-  CHECK_NOT_AVAILABLE(N4S0, NO_SPC);
+  CHECK_NOT_AVAILABLE(N2S0, NO_SPC);
 
-  // The candidate iterator will propose N4S0 first but pickDestinations should
+  // The candidate iterator will propose N2S0 first but pickDestinations should
   // discard it.
-  first_candidate_idx_ = 4;
-  // Retry timer is triggered.
-  triggerTimeout();
-  // STORE could be sent to 5 nodes with wave 2.
-  CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 2, N5S0, N6S0, N7S0, N8S0, N0S0);
+  first_candidate_idx_ = 2;
+  // Triggers retry
+  ASSERT_TRUE(retry_wave_scheduled_);
+  triggerRetryWave();
+  CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 2, N3S0, N4S0, N5S0);
   CHECK_NO_STORE_MSG();
 
   // 2 recipients reply.
-  ON_STORED_SENT(E::OK, 2, N8S0, N0S0);
+  ON_STORED_SENT(E::OK, 2, N3S0, N4S0);
   // 1 recipient replies for the previous wave. This should not cause APPENDED
   // to be sent.
   ON_STORED_SENT(E::OK, 1, N1S0);
   ASSERT_FALSE(reply_.has_value());
   // A third recipient replies.
-  ON_STORED_SENT(E::OK, 2, N7S0);
+  ON_STORED_SENT(E::OK, 2, N5S0);
 
   // Check that we got an APPENDED message.
   CHECK_APPENDED(E::OK);
@@ -1057,7 +1001,7 @@ TEST_F(AppenderTest, NotEnoughRepliesExpectedTryNewWave) {
   Appender::Reaper()(appender_);
 
   // Check that the Appender sent RELEASE messages to the 3 nodes.
-  CHECK_RELEASE_MSG(N8S0, N0S0, N7S0);
+  CHECK_RELEASE_MSG(N3S0, N4S0, N5S0);
 }
 
 // Check that if the store timeout expires, a new wave is started.
@@ -1065,7 +1009,7 @@ TEST_F(AppenderTest, StoreTimeoutTryNewWave) {
   updateConfig();
   first_candidate_idx_ = 0;
   start();
-  CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 1, N0S0, N1S0, N2S0, N3S0, N4S0);
+  CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 1, N0S0, N1S0, N2S0);
   CHECK_NO_STORE_MSG();
 
   // 2 nodes reply in time but the store timeout triggers.
@@ -1073,18 +1017,17 @@ TEST_F(AppenderTest, StoreTimeoutTryNewWave) {
   first_candidate_idx_ = 5;
   triggerTimeout();
 
-  CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 2, N5S0, N6S0, N7S0, N8S0, N0S0);
+  CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 2, N5S0, N6S0, N7S0);
   CHECK_NO_STORE_MSG();
   // STORED is received from previous wave and discarded.
-  ON_STORED_SENT(E::OK, 1, N4S0, N3S0, N2S0);
+  ON_STORED_SENT(E::OK, 1, N2S0);
   ASSERT_FALSE(reply_.has_value());
   // 3 nodes reply in time this time.
-  ON_STORED_SENT(E::OK, 2, N7S0, N5S0, N6S0);
+  ON_STORED_SENT(E::OK, 2, N5S0, N6S0, N7S0);
   CHECK_APPENDED(E::OK);
-  CHECK_DELETE_MSG(N8S0, N0S0);
   ASSERT_TRUE(retired_);
   Appender::Reaper()(appender_);
-  CHECK_RELEASE_MSG(N7S0, N5S0, N6S0);
+  CHECK_RELEASE_MSG(N5S0, N6S0, N7S0);
 }
 
 // If all receiving nodes respond negatively, none will be greylisted.
@@ -1092,21 +1035,20 @@ TEST_F(AppenderTest, StoreTimeoutRelaxedGraylisting) {
   updateConfig();
   first_candidate_idx_ = 0;
   start();
-  CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 1, N0S0, N1S0, N2S0, N3S0, N4S0);
+  CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 1, N0S0, N1S0, N2S0);
   CHECK_NO_STORE_MSG();
 
   // None of the nodes replies in time (before store timeout triggers).
   triggerTimeout();
 
-  CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 2, N0S0, N1S0, N2S0, N3S0, N4S0);
+  CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 2, N0S0, N1S0, N2S0);
   CHECK_NO_STORE_MSG();
   // STORED is received from previous wave and discarded.
-  ON_STORED_SENT(E::OK, 1, N4S0, N3S0, N2S0, N1S0, N0S0);
+  ON_STORED_SENT(E::OK, 1, N2S0, N1S0, N0S0);
   ASSERT_FALSE(reply_.has_value());
   // 3 nodes reply on time.
   ON_STORED_SENT(E::OK, 2, N0S0, N1S0, N2S0);
   CHECK_APPENDED(E::OK);
-  CHECK_DELETE_MSG(N3S0, N4S0);
   ASSERT_TRUE(retired_);
   Appender::Reaper()(appender_);
   CHECK_RELEASE_MSG(N0S0, N1S0, N2S0);
@@ -1123,14 +1065,13 @@ TEST_F(AppenderTest, SocketBufferLimit) {
     deps_->setConnectionError(shard.asNodeID(), E::NOBUFS);
   }
   start();
-  CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 1, N0S0, N3S0, N4S0, N5S0, N6S0);
+  CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 1, N0S0, N3S0, N4S0);
   CHECK_NO_STORE_MSG();
-  ON_STORED_SENT(E::OK, 1, N0S0, N5S0, N6S0);
+  ON_STORED_SENT(E::OK, 1, N0S0, N3S0, N4S0);
   CHECK_APPENDED(E::OK);
-  CHECK_DELETE_MSG(N3S0, N4S0);
   ASSERT_TRUE(retired_);
   Appender::Reaper()(appender_);
-  CHECK_RELEASE_MSG(N0S0, N5S0, N6S0);
+  CHECK_RELEASE_MSG(N0S0, N3S0, N4S0);
 }
 
 // Test chain sending.
@@ -1145,20 +1086,18 @@ TEST_F(AppenderTest, ChainSending) {
   CHECK_NO_STORE_MSG();
 
   // 3 nodes reply.
-  ON_STORED_SENT(E::OK, 1, N0S0, N1S0, N3S0);
+  ON_STORED_SENT(E::OK, 1, N0S0, N1S0, N2S0);
   CHECK_APPENDED(E::OK);
-  CHECK_DELETE_MSG(N2S0, N4S0);
   ASSERT_TRUE(retired_);
   Appender::Reaper()(appender_);
-  CHECK_RELEASE_MSG(N0S0, N1S0, N3S0);
+  CHECK_RELEASE_MSG(N0S0, N1S0, N2S0);
 }
 
-// Test chain sending failures. Even though we are notified we cannot send
-// STORE to only one node, we should still start another wave immediately as
-// this other node was supposed to forward to others.
+// Test chain sending failures.
+// We are notified we cannot send to the first link in the chain. We should
+// start another wave immediately.
 TEST_F(AppenderTest, ChainSendingFail) {
   settings_.disable_chain_sending = false;
-  extras_ = 1;
   updateConfig();
   first_candidate_idx_ = 0;
   start();
@@ -1168,21 +1107,18 @@ TEST_F(AppenderTest, ChainSendingFail) {
   CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::NOBUFS, 1, N0S0);
   CHECK_NO_STORE_MSG();
 
-  // Since this is a chain sending, one node not reachable should be enough for
-  // deciding to immediately retry a new wave after the retry timer triggers.
   ASSERT_FALSE(store_timer_active_);
-  ASSERT_TRUE(retry_timer_active_);
+  ASSERT_TRUE(retry_wave_scheduled_);
 
-  // Retry timer triggers, we start another wave.
+  // Retry wave triggers, we start another wave.
   first_candidate_idx_ = 2;
-  triggerTimeout();
+  triggerRetryWave();
 
   // Second wave, use chain sending again and N2S0 is the first recipient.
   CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 2, N2S0);
   CHECK_NO_STORE_MSG();
   ON_STORED_SENT(E::OK, 2, N2S0, N3S0, N4S0);
   CHECK_APPENDED(E::OK);
-  CHECK_DELETE_MSG(N5S0);
   ASSERT_TRUE(retired_);
   Appender::Reaper()(appender_);
   CHECK_RELEASE_MSG(N2S0, N3S0, N4S0);
@@ -1191,7 +1127,6 @@ TEST_F(AppenderTest, ChainSendingFail) {
 // One of the storage nodes in the chain fails to forward the STORE to the next
 // link. We should start another wave immediately when this happens.
 TEST_F(AppenderTest, ChainSendingForwardingFailure) {
-  extras_ = 0;
   settings_.disable_chain_sending = false;
   updateConfig();
   first_candidate_idx_ = 0;
@@ -1211,12 +1146,12 @@ TEST_F(AppenderTest, ChainSendingForwardingFailure) {
   // wave immediately.
   ON_STORED_SENT(E::FORWARD, 1, N1S0);
 
-  // The retry timer is activated so that we retry another wave immediately.
+  // The retry wave is scheduled so that we retry another wave immediately.
   ASSERT_FALSE(store_timer_active_);
-  ASSERT_TRUE(retry_timer_active_);
+  ASSERT_TRUE(retry_wave_scheduled_);
   // The new wave has the following chain link: N2S0 -> N3S0 -> N4S0
   first_candidate_idx_ = 2;
-  triggerTimeout();
+  triggerRetryWave();
 
   // Second wave, use chain sending again and N2S0 is the first recipient.
   CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 2, N2S0);
@@ -1232,7 +1167,6 @@ TEST_F(AppenderTest, ChainSendingForwardingFailure) {
 // We fail to send STORE to the first node in the chain. This should immediately
 // trigger another wave.
 TEST_F(AppenderTest, ChainSendingFailToSendFirstNode) {
-  extras_ = 0;
   settings_.disable_chain_sending = false;
   updateConfig();
   first_candidate_idx_ = 0;
@@ -1243,12 +1177,12 @@ TEST_F(AppenderTest, ChainSendingFailToSendFirstNode) {
   CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::NOBUFS, 1, N0S0);
   CHECK_NO_STORE_MSG();
 
-  // The retry timer is activated so that we retry another wave immediately.
+  // The retry wave is scheduled so that we retry another wave immediately.
   ASSERT_FALSE(store_timer_active_);
-  ASSERT_TRUE(retry_timer_active_);
+  ASSERT_TRUE(retry_wave_scheduled_);
   // The new wave has the following chain link: N2S0 -> N3S0 -> N4S0
   first_candidate_idx_ = 2;
-  triggerTimeout();
+  triggerRetryWave();
 
   // Second wave, use chain sending again and N2S0 is the first recipient.
   CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 2, N2S0);
@@ -1258,33 +1192,6 @@ TEST_F(AppenderTest, ChainSendingFailToSendFirstNode) {
   ASSERT_TRUE(retired_);
   Appender::Reaper()(appender_);
   CHECK_RELEASE_MSG(N2S0, N3S0, N4S0);
-}
-
-// Check that Appender will not fail if the number of recipients available is
-// smaller than R + E but still greater than R.
-TEST_F(AppenderTest, NotEnoughExtras) {
-  updateConfig();
-  first_candidate_idx_ = 0;
-
-  // Simulate 6 nodes being unavailable.
-  // There are still `replication` recipients available so the Appender should
-  // try to start a wave anyway.
-  SET_NOT_AVAILABLE(OVERLOADED, N3S0, N4S0, N8S0);
-  SET_NOT_AVAILABLE(NO_SPC, N5S0);
-  SET_NOT_AVAILABLE(UNROUTABLE, N0S0, N6S0);
-  start();
-
-  // N1S0, N2S0, N7S0 are still available and should have been picked by
-  // pickDestinations().
-  CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 1, N1S0, N2S0, N7S0);
-  CHECK_NO_STORE_MSG();
-  ON_STORED_SENT(E::OK, 1, N1S0, N2S0, N7S0);
-  CHECK_APPENDED(E::OK);
-  // There are no nodes to send DELETE to.
-  CHECK_NO_DELETE_MSG();
-  ASSERT_TRUE(retired_);
-  Appender::Reaper()(appender_);
-  CHECK_RELEASE_MSG(N1S0, N2S0, N7S0);
 }
 
 // Check that Appender will try again after the store timeout if it fails to
@@ -1302,24 +1209,20 @@ TEST_F(AppenderTest, NotEnoughDestinationsRetry) {
   start();
 
   CHECK_NO_STORE_MSG();
-  CHECK_NO_DELETE_MSG();
   CHECK_NO_RELEASE_MSG();
 
-  // In addition to N1S0, N2S0, N3S0 and N5S0 are available. The next wave will
-  // have 1 extra.
-  // Note: the current implementation causes the next wave to be wave 3.
+  // Now 2 more nodes are available.
   SET_AVAILABLE(N3S0, N5S0);
   triggerTimeout();
 
-  CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 3, N1S0, N2S0, N3S0, N5S0);
+  CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 3, N1S0, N2S0, N3S0);
   CHECK_NO_STORE_MSG();
-  ON_STORED_SENT(E::OK, 3, N5S0, N2S0, N1S0);
+  ON_STORED_SENT(E::OK, 3, N3S0, N2S0, N1S0);
   CHECK_APPENDED(E::OK);
-  // DELETE is sent to N3S0
-  CHECK_DELETE_MSG(N3S0);
+
   ASSERT_TRUE(retired_);
   Appender::Reaper()(appender_);
-  CHECK_RELEASE_MSG(N1S0, N2S0, N5S0);
+  CHECK_RELEASE_MSG(N1S0, N2S0, N3S0);
 }
 
 TEST_F(AppenderTest, PreemptedSimple) {
@@ -1327,14 +1230,14 @@ TEST_F(AppenderTest, PreemptedSimple) {
   first_candidate_idx_ = 0;
   start();
 
-  CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 1, N0S0, N1S0, N2S0, N3S0, N4S0);
+  CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 1, N0S0, N1S0, N2S0);
   CHECK_NO_STORE_MSG();
 
-  // N2S0, N4S0 reply.
-  ON_STORED_SENT(E::OK, 1, N2S0, N4S0);
+  // N2S0, N1S0 reply.
+  ON_STORED_SENT(E::OK, 1, N2S0, N1S0);
 
-  // N1S0 replies with E::PREEMPTED (sequencer N8 sealed the epoch).
-  ON_STORED_SENT_PREEMPTED(N8, 1, N1S0);
+  // N0S0 replies with E::PREEMPTED (sequencer N8 sealed the epoch).
+  ON_STORED_SENT_PREEMPTED(N8, 1, N0S0);
 
   // APPENDED with E::PREEMPTED should have been sent.
   CHECK_APPENDED_PREEMPTED(N8)
@@ -1352,16 +1255,16 @@ TEST_F(AppenderTest, PreemptedByDeadNode) {
   first_candidate_idx_ = 0;
   start();
 
-  CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 1, N0S0, N1S0, N2S0, N3S0, N4S0);
+  CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 1, N0S0, N1S0, N2S0);
   CHECK_NO_STORE_MSG();
 
-  // N2S0, N4S0 reply.
-  ON_STORED_SENT(E::OK, 1, N2S0, N4S0);
+  // N2S0, N1S0 reply.
+  ON_STORED_SENT(E::OK, 1, N2S0, N1S0);
 
   // pretend N8 is dead
   dead_nodes_.insert(N8);
-  // N1S0 replies with E::PREEMPTED (sequencer N8 sealed the epoch).
-  ON_STORED_SENT_PREEMPTED(N8, 1, N1S0);
+  // N0S0 replies with E::PREEMPTED (sequencer N8 sealed the epoch).
+  ON_STORED_SENT_PREEMPTED(N8, 1, N0S0);
 
   // APPENDED with E::PREEMPTED should have been sent.
   CHECK_APPENDED_PREEMPTED(N8);
@@ -1375,47 +1278,50 @@ TEST_F(AppenderTest, PreemptedByDeadNode) {
   CHECK_NO_RELEASE_MSG();
 }
 
-// Check that STORED with status E::REBUILDING or E::NOSPC makes appender
-// update node state in NodeSetState.
-TEST_F(AppenderTest, NodeSetStateTransientErrors) {
+// Check that STORED with status E::DISABLED update node state in NodeSetState.
+TEST_F(AppenderTest, NodeSetStateTransientErrorDisabled) {
   updateConfig();
   start();
 
-  CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 1, N0S0, N1S0, N2S0, N3S0, N4S0);
-
-  ON_STORED_SENT(E::OK, 1, N2S0, N3S0);
+  CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 1, N0S0, N1S0, N2S0);
+  ON_STORED_SENT(E::OK, 1, N2S0, N1S0);
   ON_STORED_SENT(E::DISABLED, 1, N0S0);
   CHECK_NOT_AVAILABLE(N0S0, STORE_DISABLED);
-  ON_STORED_SENT(E::NOSPC, 1, N1S0);
-  CHECK_NOT_AVAILABLE(N1S0, NO_SPC);
-  ASSERT_FALSE(reply_.has_value());
-  ASSERT_FALSE(retired_);
-  ON_STORED_SENT(E::OK, 1, N4S0);
+
+  first_candidate_idx_ = 0;
+  // Triggers retry
+  ASSERT_TRUE(retry_wave_scheduled_);
+  triggerRetryWave();
+  // N0 should not be picked again
+  CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 2, N1S0, N2S0, N3S0);
+  CHECK_NO_STORE_MSG();
+  // 3 recipients reply.
+  ON_STORED_SENT(E::OK, 2, N1S0, N2S0, N3S0);
   CHECK_APPENDED(E::OK);
   ASSERT_TRUE(retired_);
   Appender::Reaper()(appender_);
-  CHECK_RELEASE_MSG(N2S0, N3S0, N4S0);
+  CHECK_RELEASE_MSG(N1S0, N2S0, N3S0);
 }
 
-// Check that STORED with an error that failes the wave does not graylist
+// Check that STORED with an error that fails the wave does not graylist
 // anything else
 TEST_F(AppenderTest, GraylistingCorrectOnError) {
   updateConfig();
   start();
 
-  CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 1, N0S0, N1S0, N2S0, N3S0, N4S0);
+  CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 1, N0S0, N1S0, N2S0);
 
-  ON_STORED_SENT(E::NOSPC, 1, N2S0, N3S0, N4S0);
-  CHECK_NOT_AVAILABLE(N2S0, NO_SPC);
-  CHECK_NOT_AVAILABLE(N3S0, NO_SPC);
-  CHECK_NOT_AVAILABLE(N4S0, NO_SPC);
-  // check if retry timer is active since we failed a wave
-  ASSERT_TRUE(retry_timer_active_);
-  // retry timer active means timeout would have been called
-  triggerTimeout();
+  ON_STORED_SENT(E::NOSPC, 1, N0S0);
+  CHECK_NOT_AVAILABLE(N0S0, NO_SPC);
+  // check if retry wave is scheduled since we failed a wave
+  ASSERT_TRUE(retry_wave_scheduled_);
+  // Trigger a scheduled retry wave
+  triggerRetryWave();
   // check other nodes not graylisted
-  CHECK_AVAILABLE(N0S0);
   CHECK_AVAILABLE(N1S0);
+  CHECK_AVAILABLE(N2S0);
+  CHECK_AVAILABLE(N3S0);
+  CHECK_AVAILABLE(N4S0);
   Appender::Reaper()(appender_);
 }
 
@@ -1424,14 +1330,15 @@ TEST_F(AppenderTest, GraylistingCorrectOnError) {
 TEST_F(AppenderTest, NodesStoredAmendable) {
   shards_ = {N0S0, N1S0};
   replication_ = 2;
-  extras_ = 0;
   updateConfig();
   start();
 
   CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 1, N0S0, N1S0);
   // FAILED reply should not affect the set
   appender_->onReply(storedHeader(1, E::FAILED, NodeID(), 0 /* flags */), N0S0);
-  triggerTimeout();
+  ASSERT_TRUE(retry_wave_scheduled_);
+  // Trigger a scheduled retry wave
+  triggerRetryWave();
   ASSERT_EQ((std::multiset<ShardID>{}), appender_->getNodesStoredAmendable());
 
   CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 2, N0S0, N1S0);
@@ -1461,7 +1368,6 @@ TEST_F(AppenderTest, NodesStoredAmendable) {
 TEST_F(AppenderTest, SubsequentWavesAmendDirect) {
   shards_ = {N0S0, N1S0, N2S0, N3S0};
   replication_ = 3;
-  extras_ = 0;
   updateConfig();
 
   // Instruct TestCopySetSelector to issue {N0S0, N1S0, N2S0} as the copyset
@@ -1475,7 +1381,8 @@ TEST_F(AppenderTest, SubsequentWavesAmendDirect) {
   // Issue {N3S0, N0S0, N1S0} for the second wave.  N0S0 should get a STORE with
   // the AMEND flag set.
   first_candidate_idx_ = 3;
-  triggerTimeout();
+  ASSERT_TRUE(retry_wave_scheduled_);
+  triggerRetryWave();
   auto STORE_has_amend_flag = [&](ShardID shard) -> bool {
     auto it = store_msgs_.find(shard);
     if (it == store_msgs_.end()) {
@@ -1498,7 +1405,6 @@ TEST_F(AppenderTest, SubsequentWavesAmendDirect) {
 TEST_F(AppenderTest, SubsequentWavesAmendChained) {
   shards_ = {N0S0, N1S0, N2S0, N3S0, N4S0};
   replication_ = 5;
-  extras_ = 0;
   settings_.disable_chain_sending = false;
   updateConfig();
 
@@ -1521,7 +1427,8 @@ TEST_F(AppenderTest, SubsequentWavesAmendChained) {
   appender_->onReply(storedHeader(1, E::OK, NodeID(), 0 /* flags */), N3S0);
   appender_->onReply(storedHeader(1, E::FAILED, NodeID(), 0 /* flags */), N4S0);
 
-  triggerTimeout();
+  ASSERT_TRUE(retry_wave_scheduled_);
+  triggerRetryWave();
   // Because N4S0 failed to store, the second wave is not amendable at all (N4S0
   // needs the payload and is last in the chain)
   {
@@ -1583,12 +1490,11 @@ TEST_F(AppenderTest, SubsequentWavesAmendChained) {
 // Appender should retry a new wave with DRAINING flags
 TEST_F(AppenderTest, SoftPreemptedWhenDraining) {
   replication_ = 3;
-  extras_ = 1;
   updateConfig();
   first_candidate_idx_ = 0;
   start();
 
-  CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 1, N0S0, N1S0, N2S0, N3S0);
+  CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 1, N0S0, N1S0, N2S0);
   CHECK_NO_STORE_MSG();
 
   /// sequencer starts draining appenders
@@ -1606,67 +1512,51 @@ TEST_F(AppenderTest, SoftPreemptedWhenDraining) {
   EXPECT_FALSE(preempted_by_.isNodeID());
   ASSERT_FALSE(reply_.has_value());
 
-  // since the appender may still complete the wave, no new wave should
-  // be started
-  CHECK_NO_STORE_MSG();
-
-  // now N3S0 is also soft preempted
-  appender_->onReply(storedHeader(1, E::PREEMPTED, N8, SOFT), N3S0);
-  // sequencer should NOT be preempted either
-  EXPECT_EQ(EPOCH_INVALID, preempted_epoch_);
-  EXPECT_FALSE(preempted_by_.isNodeID());
-  ASSERT_FALSE(reply_.has_value());
-
-  // there is no hope to finish the wave, the Appender should retry
-  // for a new wave
-  ASSERT_TRUE(retry_timer_active_);
+  // the Appender should retry for a new wave
+  ASSERT_TRUE(retry_wave_scheduled_);
   ASSERT_FALSE(store_timer_active_);
   first_candidate_idx_ = 3;
-  triggerTimeout();
+  triggerRetryWave();
 
   // this checks the DRAINING flag in STORE header
-  CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 2, N3S0, N4S0, N5S0, N6S0);
+  CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 2, N3S0, N4S0, N5S0);
   CHECK_NO_STORE_MSG();
 
-  // simulate N4S0, N5S0, N6S0 replying
-  ON_STORED_SENT(E::OK, 2, N4S0, N5S0, N6S0);
+  // simulate N3S0, N4S0, N5S0 replying
+  ON_STORED_SENT(E::OK, 2, N3S0, N4S0, N5S0);
   // We have `replication` copies. We should have sent APPENDED.
   CHECK_APPENDED(E::OK);
   // we should have retired.
   ASSERT_TRUE(retired_);
-  // simulate N3S0 replying
-  ON_STORED_SENT(E::OK, 2, N3S0);
   // Reap the appender.
   Appender::Reaper()(appender_);
   // Check that the Appender sent RELEASE messages to the 3 nodes.
-  CHECK_RELEASE_MSG(N4S0, N5S0, N6S0);
+  CHECK_RELEASE_MSG(N3S0, N4S0, N5S0);
 }
 
 // similar to the previous test, but test appender in draining can still be
 // preempted by normal seals
 TEST_F(AppenderTest, PremptedByNormalSealWhenDraining) {
   replication_ = 3;
-  extras_ = 1;
   updateConfig();
   first_candidate_idx_ = 0;
   start();
 
-  CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 1, N0S0, N1S0, N2S0, N3S0);
+  CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 1, N0S0, N1S0, N2S0);
   CHECK_NO_STORE_MSG();
   draining_ = true;
   ON_STORED_SENT(E::OK, 1, N1S0);
   // however, N2S0 was soft preempted
   const STORED_flags_t SOFT(STORED_Header::PREMPTED_BY_SOFT_SEAL_ONLY);
   appender_->onReply(storedHeader(1, E::PREEMPTED, N8, SOFT), N2S0);
-  appender_->onReply(storedHeader(1, E::PREEMPTED, N8, SOFT), N3S0);
   EXPECT_EQ(EPOCH_INVALID, preempted_epoch_);
   EXPECT_FALSE(preempted_by_.isNodeID());
   ASSERT_FALSE(reply_.has_value());
-  ASSERT_TRUE(retry_timer_active_);
+  ASSERT_TRUE(retry_wave_scheduled_);
   ASSERT_FALSE(store_timer_active_);
   first_candidate_idx_ = 3;
-  triggerTimeout();
-  CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 2, N3S0, N4S0, N5S0, N6S0);
+  triggerRetryWave();
+  CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 2, N3S0, N4S0, N5S0);
   CHECK_NO_STORE_MSG();
   // in this case, N3S0 sents a NORMAL preemption
   appender_->onReply(storedHeader(2, E::PREEMPTED, N8, 0), N3S0);

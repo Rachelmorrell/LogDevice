@@ -46,7 +46,6 @@ class TailRecord;
 // Settings and log attributes affecting sequencer that EpochSequencer doesn't
 // update on the fly. When these change, sequencer needs to be reactivated.
 struct EpochSequencerImmutableOptions {
-  copyset_size_t extra_copies = 0;
   copyset_size_t synced_copies = 0;
   int window_size = SLIDING_WINDOW_MIN_CAPACITY;
   esn_t esn_max = ESN_MAX;
@@ -237,9 +236,6 @@ class EpochSequencer : public std::enable_shared_from_this<EpochSequencer> {
    *                                 last_released_ is written here, useful for
    *                                 diagnostic messages.
    *
-   * @param lng_changed_out          Set to true if lng_ was changed to
-   *                                 reaped_lsn, set to false otherwise.
-   *
    * @return true iff last_released_ was successfully updated. If false is
    *         returned, err is set to:
    *         - E::PREEMPTED   if epoch `lsn_to_epoch(reaped_lsn)` was preempted;
@@ -252,8 +248,7 @@ class EpochSequencer : public std::enable_shared_from_this<EpochSequencer> {
   bool noteAppenderReaped(Appender::FullyReplicated replicated,
                           lsn_t reaped_lsn,
                           std::shared_ptr<TailRecord> tail_record,
-                          epoch_t* last_released_epoch_out,
-                          bool* lng_changed_out);
+                          epoch_t* last_released_epoch_out);
 
   /**
    * @return sequence number that will be assigned to the next record. If the

@@ -11,6 +11,7 @@
 #include "logdevice/common/SequencerLocator.h"
 #include "logdevice/common/debug.h"
 #include "logdevice/common/test/MockSequencerRouter.h"
+#include "logdevice/common/test/NodeSetTestUtil.h"
 #include "logdevice/common/test/TestUtil.h"
 
 namespace facebook { namespace logdevice {
@@ -45,11 +46,12 @@ class SequencerRouterTest : public ::testing::Test,
   }
 
   std::unique_ptr<SequencerRouter>
-  createRouter(logid_t log_id, std::shared_ptr<const Configuration> config) {
-    cluster_state_ = std::make_unique<MockClusterState>(
-        config->serverConfig()->getNodes().size());
+  createRouter(logid_t log_id,
+               std::shared_ptr<const NodesConfiguration> nodes_config) {
+    cluster_state_ =
+        std::make_unique<MockClusterState>(nodes_config->clusterSize());
     auto router = std::make_unique<MockSequencerRouter>(
-        log_id, this, config->serverConfig(), locator_, cluster_state_.get());
+        log_id, this, nodes_config, locator_, cluster_state_.get());
     return std::move(router);
   }
 
@@ -74,12 +76,11 @@ class SequencerRouterTest : public ::testing::Test,
 // as possible.
 TEST_F(SequencerRouterTest, RoutingToUnavailableNode) {
   const NodeID N0(0, 1);
-  std::shared_ptr<const Configuration> config = createSimpleConfig(4, 1);
 
   // all logs map to N0
   locator_ = std::make_shared<StaticLocator>(N0);
 
-  auto router = createRouter(logid_t(1), std::move(config));
+  auto router = createRouter(logid_t(1), createSimpleNodesConfig(4));
   router->start();
   ASSERT_EQ(std::make_pair(N0, SequencerRouter::flags_t(0)), next_node_);
 
@@ -91,12 +92,11 @@ TEST_F(SequencerRouterTest, RoutingToUnavailableNode) {
 // preemption redirect, but the node it redirected to is unavailable.
 TEST_F(SequencerRouterTest, PreemptedByUnavailableNode) {
   const NodeID N0(0, 1), N1(1, 1);
-  std::shared_ptr<const Configuration> config = createSimpleConfig(4, 1);
 
   // N0 takes care of all logs by default
   locator_ = std::make_shared<StaticLocator>(N0);
 
-  auto router = createRouter(logid_t(1), std::move(config));
+  auto router = createRouter(logid_t(1), createSimpleNodesConfig(4));
   router->start();
   ASSERT_EQ(std::make_pair(N0, SequencerRouter::flags_t(0)), next_node_);
 
@@ -123,12 +123,11 @@ TEST_F(SequencerRouterTest, PreemptedByUnavailableNode) {
 // again either with a regular redirect or preempted redirect.
 TEST_F(SequencerRouterTest, RedirectedToNotReadyNode) {
   const NodeID N0(0, 1), N1(1, 1);
-  std::shared_ptr<const Configuration> config = createSimpleConfig(4, 1);
 
   // N0 takes care of all logs by default
   locator_ = std::make_shared<StaticLocator>(N0);
 
-  auto router = createRouter(logid_t(1), std::move(config));
+  auto router = createRouter(logid_t(1), createSimpleNodesConfig(4));
   router->start();
   ASSERT_EQ(std::make_pair(N0, SequencerRouter::flags_t(0)), next_node_);
 
@@ -150,12 +149,11 @@ TEST_F(SequencerRouterTest, RedirectedToNotReadyNode) {
 // sequencer knows it and sets the REDIRECT_NOT_ALIVE flag
 TEST_F(SequencerRouterTest, PreemptedByDeadNode) {
   const NodeID N0(0, 1), N1(1, 1);
-  std::shared_ptr<const Configuration> config = createSimpleConfig(4, 1);
 
   // N0 takes care of all logs by default
   locator_ = std::make_shared<StaticLocator>(N0);
 
-  auto router = createRouter(logid_t(1), std::move(config));
+  auto router = createRouter(logid_t(1), createSimpleNodesConfig(4));
   router->start();
   ASSERT_EQ(std::make_pair(N0, SequencerRouter::flags_t(0)), next_node_);
 
@@ -184,68 +182,91 @@ TEST_F(SequencerRouterTest, SequencerAffinityTest) {
   auto settings = create_default_settings<Settings>();
 
   // Config with 2 regions each with 1 node
-  std::shared_ptr<Configuration> config = Configuration::fromJsonFile(
-      TEST_CONFIG_FILE("sequencer_affinity_2nodes.conf"));
+  auto nodes_config = std::make_shared<const NodesConfiguration>();
+  NodeSetTestUtil::addNodes(nodes_config, 1, 2, "rgn1.dc1.cl1.row1.rck1");
+  NodeSetTestUtil::addNodes(nodes_config, 1, 2, "rgn2.dc2.cl2.row2.rck2");
+
+  std::shared_ptr<Configuration> config =
+      Configuration::fromJsonFile(
+          TEST_CONFIG_FILE("sequencer_affinity_2nodes.conf"))
+          ->withNodesConfiguration(std::move(nodes_config));
 
   cluster_state_ = std::make_unique<MockClusterState>(
-      config->serverConfig()->getNodes().size());
+      config->getNodesConfiguration()->clusterSize());
 
   settings.use_sequencer_affinity = true;
   locator_ = std::make_unique<MockHashBasedSequencerLocator>(
-      UpdateableConfig(config).updateableServerConfig(),
-      cluster_state_.get(),
-      config,
-      settings);
+      cluster_state_.get(), config, settings);
 
   // Log with id 1 prefers rgn1. N0 is the only node in that region.
-  auto router = std::make_unique<MockSequencerRouter>(
-      logid_t(1), this, config->serverConfig(), locator_, cluster_state_.get());
+  auto router =
+      std::make_unique<MockSequencerRouter>(logid_t(1),
+                                            this,
+                                            config->getNodesConfiguration(),
+                                            locator_,
+                                            cluster_state_.get());
   router->start();
   EXPECT_EQ(std::make_pair(N0, SequencerRouter::flags_t(0)), next_node_);
 
   // Log with id 2 prefers rgn2. N1 is the only node in that region.
-  router = std::make_unique<MockSequencerRouter>(
-      logid_t(2), this, config->serverConfig(), locator_, cluster_state_.get());
+  router =
+      std::make_unique<MockSequencerRouter>(logid_t(2),
+                                            this,
+                                            config->getNodesConfiguration(),
+                                            locator_,
+                                            cluster_state_.get());
   router->start();
   EXPECT_EQ(std::make_pair(N1, SequencerRouter::flags_t(0)), next_node_);
 
   // Log with id 3 prefers rgn3. No nodes are in that region so it chooses a
   // sequencer at random.
-  router = std::make_unique<MockSequencerRouter>(
-      logid_t(3), this, config->serverConfig(), locator_, cluster_state_.get());
+  router =
+      std::make_unique<MockSequencerRouter>(logid_t(3),
+                                            this,
+                                            config->getNodesConfiguration(),
+                                            locator_,
+                                            cluster_state_.get());
   router->start();
   EXPECT_TRUE(std::make_pair(N0, SequencerRouter::flags_t(0)) == next_node_ ||
               std::make_pair(N1, SequencerRouter::flags_t(0)) == next_node_);
 
   settings.use_sequencer_affinity = false;
   locator_ = std::make_unique<MockHashBasedSequencerLocator>(
-      UpdateableConfig(config).updateableServerConfig(),
-      cluster_state_.get(),
-      config,
-      settings);
+      cluster_state_.get(), config, settings);
 
-  router = std::make_unique<MockSequencerRouter>(
-      logid_t(2), this, config->serverConfig(), locator_, cluster_state_.get());
+  router =
+      std::make_unique<MockSequencerRouter>(logid_t(2),
+                                            this,
+                                            config->getNodesConfiguration(),
+                                            locator_,
+                                            cluster_state_.get());
   router->start();
   EXPECT_NE(std::make_pair(N1, SequencerRouter::flags_t(0)), next_node_);
 
   // Config with 3 regions each with 3 nodes
+  nodes_config = std::make_shared<const NodesConfiguration>();
+  NodeSetTestUtil::addNodes(nodes_config, 3, 2, "rgn1.dc1.cl1.row1.rck1");
+  NodeSetTestUtil::addNodes(nodes_config, 3, 2, "rgn2.dc2.cl2.row2.rck2");
+  NodeSetTestUtil::addNodes(nodes_config, 1, 2, "rgn3.dc3.cl3.row3.rck3");
+
   config = Configuration::fromJsonFile(
-      TEST_CONFIG_FILE("sequencer_affinity_7nodes.conf"));
+               TEST_CONFIG_FILE("sequencer_affinity_7nodes.conf"))
+               ->withNodesConfiguration(std::move(nodes_config));
 
   cluster_state_ = std::make_unique<MockClusterState>(
-      config->serverConfig()->getNodes().size());
+      config->getNodesConfiguration()->clusterSize());
 
   settings.use_sequencer_affinity = true;
   locator_ = std::make_unique<MockHashBasedSequencerLocator>(
-      UpdateableConfig(config).updateableServerConfig(),
-      cluster_state_.get(),
-      config,
-      settings);
+      cluster_state_.get(), config, settings);
 
   // Log with id 1 prefers rgn1. This region has 3 nodes.
-  router = std::make_unique<MockSequencerRouter>(
-      logid_t(1), this, config->serverConfig(), locator_, cluster_state_.get());
+  router =
+      std::make_unique<MockSequencerRouter>(logid_t(1),
+                                            this,
+                                            config->getNodesConfiguration(),
+                                            locator_,
+                                            cluster_state_.get());
   router->start();
   EXPECT_EQ(std::make_pair(N1, SequencerRouter::flags_t(0)), next_node_);
   router->onNodeUnavailable(N1, E::CONNFAILED);
@@ -260,19 +281,24 @@ TEST_F(SequencerRouterTest, SequencerAffinityTest) {
 
   // Log with id 3 prefers rgn3 but we disable the use-sequencer-affinity
   // setting.
-  router = std::make_unique<MockSequencerRouter>(
-      logid_t(3), this, config->serverConfig(), locator_, cluster_state_.get());
+  router =
+      std::make_unique<MockSequencerRouter>(logid_t(3),
+                                            this,
+                                            config->getNodesConfiguration(),
+                                            locator_,
+                                            cluster_state_.get());
   router->start();
   EXPECT_EQ(std::make_pair(N6, SequencerRouter::flags_t(0)), next_node_);
 
   settings.use_sequencer_affinity = false;
   locator_ = std::make_unique<MockHashBasedSequencerLocator>(
-      UpdateableConfig(config).updateableServerConfig(),
-      cluster_state_.get(),
-      config,
-      settings);
-  router = std::make_unique<MockSequencerRouter>(
-      logid_t(3), this, config->serverConfig(), locator_, cluster_state_.get());
+      cluster_state_.get(), config, settings);
+  router =
+      std::make_unique<MockSequencerRouter>(logid_t(3),
+                                            this,
+                                            config->getNodesConfiguration(),
+                                            locator_,
+                                            cluster_state_.get());
   router->start();
   // Should pick a sequencer that is not N6 since N6 has very low weight.
   EXPECT_TRUE(std::make_pair(N0, SequencerRouter::flags_t(0)) == next_node_ ||
@@ -289,22 +315,29 @@ TEST_F(SequencerRouterTest, LogNotFound) {
 
   // Config with 2 regions each with 1 node
   // only 3 logs are configured.
-  std::shared_ptr<Configuration> config = Configuration::fromJsonFile(
-      TEST_CONFIG_FILE("sequencer_affinity_2nodes.conf"));
+  auto nodes_config = std::make_shared<const NodesConfiguration>();
+  NodeSetTestUtil::addNodes(nodes_config, 1, 2, "rgn1.dc1.cl1.row1.rck1");
+  NodeSetTestUtil::addNodes(nodes_config, 1, 2, "rgn2.dc2.cl2.row2.rck2");
+
+  std::shared_ptr<Configuration> config =
+      Configuration::fromJsonFile(
+          TEST_CONFIG_FILE("sequencer_affinity_2nodes.conf"))
+          ->withNodesConfiguration(std::move(nodes_config));
 
   cluster_state_ = std::make_unique<MockClusterState>(
-      config->serverConfig()->getNodes().size());
+      config->getNodesConfiguration()->clusterSize());
 
   settings.use_sequencer_affinity = true;
   locator_ = std::make_unique<MockHashBasedSequencerLocator>(
-      UpdateableConfig(config).updateableServerConfig(),
-      cluster_state_.get(),
-      config,
-      settings);
+      cluster_state_.get(), config, settings);
 
   // log ID 4 doesn't exist
-  auto router = std::make_unique<MockSequencerRouter>(
-      logid_t(4), this, config->serverConfig(), locator_, cluster_state_.get());
+  auto router =
+      std::make_unique<MockSequencerRouter>(logid_t(4),
+                                            this,
+                                            config->getNodesConfiguration(),
+                                            locator_,
+                                            cluster_state_.get());
   router->start();
   EXPECT_EQ(E::NOTFOUND, status_);
 }

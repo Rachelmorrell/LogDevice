@@ -18,6 +18,8 @@
 #include "logdevice/common/AdminCommandTable-fwd.h"
 #include "logdevice/common/ClientID.h"
 #include "logdevice/common/ConnectThrottle.h"
+#include "logdevice/common/ConnectionInfo.h"
+#include "logdevice/common/ConnectionKind.h"
 #include "logdevice/common/CostQueue.h"
 #include "logdevice/common/Envelope.h"
 #include "logdevice/common/PrincipalIdentity.h"
@@ -71,7 +73,7 @@ struct Settings;
 // that is currently not needed.
 
 // Defined later in this file.
-class SocketDependencies;
+class SocketNetworkDependencies;
 /**
  * adding multiple classes here which will get renamed/refactored throguh a
  * a stack of diffs to separate different logical component which are now alloc
@@ -106,13 +108,11 @@ class Connection : public TrafficShappingSocket {
    * @param server_name     id of server to connect to
    * @param socket_type     type of socket
    * @param connection_type type of connection
-   * @param peer_type       type of peer
    * @param flow_group      traffic shaping state shared between sockets
    *                        with the same bandwidth constraints.
-   * @params deps           SocketDependencies provides a way to callback into
-   *                        higher layers and provides notification mechanism.
-   *                        It depends on dependencies for stuff like Stats and
-   *                        config and other data.
+   * @params deps           SocketNetworkDependencies provides a way to callback
+   * into higher layers and provides notification mechanism. It depends on
+   * dependencies for stuff like Stats and config and other data.
    *
    * @return  on success, a new fully constructed Connection is returned. It is
    *          expected that the Connection will be registered with the Worker's
@@ -127,9 +127,8 @@ class Connection : public TrafficShappingSocket {
   Connection(NodeID server_name,
              SocketType socket_type,
              ConnectionType connection_type,
-             PeerType peer_type,
              FlowGroup& flow_group,
-             std::unique_ptr<SocketDependencies> deps);
+             std::unique_ptr<SocketNetworkDependencies> deps);
 
   /**
    * Constructs a new Socket, to be connected to a LogDevice
@@ -155,9 +154,8 @@ class Connection : public TrafficShappingSocket {
   Connection(NodeID server_name,
              SocketType socket_type,
              ConnectionType connection_type,
-             PeerType peer_type,
              FlowGroup& flow_group,
-             std::unique_ptr<SocketDependencies> deps,
+             std::unique_ptr<SocketNetworkDependencies> deps,
              std::unique_ptr<SocketAdapter> sock_adapter);
 
   /**
@@ -174,10 +172,9 @@ class Connection : public TrafficShappingSocket {
    * @param type        type of socket
    * @param flow_group  traffic shaping state shared between sockets
    *                    with the same bandwidth constraints.
-   * @params deps       SocketDependencies provides a way to callback into
-   *                    higher layers and provides notification mechanism.
-   *                    It depends on dependencies for stuff like Stats and
-   *                    config and other data.
+   * @params deps       SocketNetworkDependencies provides a way to callback
+   * into higher layers and provides notification mechanism. It depends on
+   * dependencies for stuff like Stats and config and other data.
    *
    * @return  on success, a new fully constructed Connection is returned. On
    *          failure throws ConstructorFailed and sets err to:
@@ -195,7 +192,8 @@ class Connection : public TrafficShappingSocket {
              SocketType type,
              ConnectionType conntype,
              FlowGroup& flow_group,
-             std::unique_ptr<SocketDependencies> deps);
+             std::unique_ptr<SocketNetworkDependencies> deps,
+             ConnectionKind connection_kind);
 
   /**
    * Constructs a new Connection from a TCP socket fd that was returned by
@@ -230,8 +228,9 @@ class Connection : public TrafficShappingSocket {
              SocketType type,
              ConnectionType conntype,
              FlowGroup& flow_group,
-             std::unique_ptr<SocketDependencies> deps,
-             std::unique_ptr<SocketAdapter> sock_adapter);
+             std::unique_ptr<SocketNetworkDependencies> deps,
+             std::unique_ptr<SocketAdapter> sock_adapter,
+             ConnectionKind connection_kind);
 
   /**
    * Disconnects, deletes the underlying bufferevent, and closes the TCP socket.
@@ -243,71 +242,39 @@ class Connection : public TrafficShappingSocket {
   Connection& operator=(const Connection&) = delete;
   Connection& operator=(Connection&&) = delete;
 
-  Sockaddr peerSockaddr() const {
-    return peer_sockaddr_;
+  /**
+   * If connection to node, returns whether current settings/nodes
+   * configuration point to a different address than we used to connect the
+   * first time. Otherwise, returns false.
+   */
+  bool isNodeConnectionAddressOrGenerationOutdated() const;
+
+  /**
+   * Returns the info struct for this connection. The sturct's lifetime is bound
+   * to connection.
+   */
+  const ConnectionInfo& getInfo() const {
+    return info_;
   }
 
   /**
-   * For Testing only!
+   * Replaces existing info for this connection.
    */
-  void enableChecksumTampering(bool enable) {
-    tamper_ = enable;
-  }
-
-  void setPeerNodeId(const NodeID node_id) {
-    peer_node_id_ = node_id;
-    if (peer_name_.isClientAddress() && !peer_node_id_.isNodeID()) {
-      peer_type_ = PeerType::CLIENT;
-    } else {
-      peer_type_ = PeerType::NODE;
-    }
-  }
-
-  // LogDevice-level address of peer end-point at the other end of the
-  // connection
-  const Address peer_name_;
-
-  // struct sockaddr of peer end point
-  const Sockaddr peer_sockaddr_;
+  void setInfo(ConnectionInfo&& new_info);
 
   // A numan-readable string like
   // "C22566784 ([abcd:1234:5678:90ef:1111:2222:3333:4444]:41406)"
   std::string conn_description_;
 
-  // Node location of peer end point.
-  // In format "{region}.{datacenter}.{cluster}.{row}.{rack}"
-  // Currently only used for passing client location from client to server
-  // for local SCD reading.
-  std::string peer_location_;
-
-  // Used to identify the client for permission checks. Set after successfull
-  // authentication
-  std::shared_ptr<PrincipalIdentity> principal_ =
-      std::make_shared<PrincipalIdentity>();
-
-  // CSID, Client Session ID
-  // Used to uniquely identify client sessions. Supplied by client
-  std::string csid_;
-
-  // NodeID of the peer if this is a client (incoming) connection with another
-  // node from the cluster on the other end.
-  NodeID peer_node_id_;
-
-  // Type of the peer this socket is connecte to (CLIENT or NODE)
-  PeerType peer_type_{PeerType::NODE};
-
   // Traffic shaping state shared between Sockets with the same bandwidth
   // constraints.
   FlowGroup& flow_group_;
 
-  // indicates purpose of this socket
-  const SocketType type_;
-
   /**
    * Initiate an asynchronous connect and handshake on the socket. The socket's
-   * .peer_name_ must resolve to an ip:port to which we can connect. Currently
-   * this means that .peer_name_ must be a server address. The function MUST
-   * be called on the Worker thread that runs this Socket.
+   * .info_.peer_name must resolve to an ip:port to which we can connect.
+   * Currently this means that .info_.peer_name must be a server address. The
+   * function MUST be called on the Worker thread that runs this Socket.
    *
    * @return  0 if connection was successfully initiated. -1 on failure, err
    *          is set to:
@@ -414,37 +381,14 @@ class Connection : public TrafficShappingSocket {
    * writing.
    */
   bool good() const;
+
   /**
    * @return true iff close() has been called on the socket and all clients have
    * dropped references.
    */
   bool isZombie() const {
     ld_check(isClosed());
-    if (conn_closed_.use_count() > 1) {
-      return true;
-    }
-
-    return false;
-  }
-
-  /**
-   * State machines can use ClientID to send replies to client when made a
-   * request. But ClientId space is 32bit which means long running state machine
-   * can acccidentally send a message to incorrect client if the id's wrapped
-   * around. Such long running state machines can get socket token to make sure
-   * that the socket exists before trying to use the clientId to send message.
-   * The check should be performed on the same thread on which the socket was
-   * created to avoid socket getting closed between check and actually sending
-   * the message.
-   * @return conn_closed_ which gets the socket closed status for clients to
-   * cache.
-   */
-  std::shared_ptr<const std::atomic<bool>> getSocketToken() {
-    if (isClosed()) {
-      return nullptr;
-    }
-
-    return conn_closed_;
+    return info_.is_active.use_count() > 1;
   }
 
   /**
@@ -502,10 +446,10 @@ class Connection : public TrafficShappingSocket {
    * If a working connection exists, this method returns 0 and stores the
    * ClientID that the destination has assigned to its end of the connection
    * in our_name_at_peer. Otherwise, -1 is returned with err set to DISABLED,
-   * INVALID_PARAM, ALREADY or NOTCONN (see Sender::checkConnection for the
-   * description of these error codes).
+   * INVALID_PARAM, ALREADY or NOTCONN (see Sender::checkServerConnection for
+   * the description of these error codes).
    */
-  int checkConnection(ClientID* our_name_at_peer);
+  int checkServerConnection();
 
   /**
    * Check if we reached any of the buffer size limits.
@@ -542,31 +486,15 @@ class Connection : public TrafficShappingSocket {
    */
   void getDebugInfo(InfoSocketsTable& table) const;
 
-  void setPeerConfigVersion(config_version_t version) {
-    peer_config_version_ = version;
-  }
-
-  /**
-   * @return the last known config version that the peer advertised
-   */
-  config_version_t getPeerConfigVersion() const {
-    return peer_config_version_;
-  }
-
   PeerType getPeerType() const {
-    return peer_type_;
+    return info_.getPeerType();
   }
-
-  /**
-   * @return True if the peer is a LogDevice client.
-   */
-  bool peerIsClient() const;
 
   /**
    * @return whether the socket is an SSL socket.
    */
   bool isSSL() const {
-    return conntype_ == ConnectionType::SSL;
+    return info_.isSSL();
   }
 
   bool isHandshaken() const {
@@ -574,27 +502,17 @@ class Connection : public TrafficShappingSocket {
   }
 
   /**
-   * @return protocol version used by this Socket. Returns
-   * Settings::max_protocol if !isHandshaken().
+   * Extracts the underlying connection certificate and parses the principal
+   * identity out of it.
+   * NOTES:
+   *  - The caller must guarantee that this function is only called on SSL
+   * conections (isSSL() == true).
+   *
+   * @returns The parsed principal identity out of the SSL certificate or
+   * folly::none if the an SSL principal plugin was not found.
+   *
    */
-  uint16_t getProto() const {
-    return proto_;
-  }
-
-  /**
-   * @return Get the ClientID that the other end assigned to our connection and
-   * reported in the ACK.  Only for Sockets that initiated an outgoing
-   * connection to a server.
-   */
-  ClientID getOurNameAtPeer() const {
-    return our_name_at_peer_;
-  }
-
-  /**
-   * @return should only be called if the socket is SSL enabled. Returns
-   *         the peers certificate if one was provided and nullptr otherwise.
-   */
-  folly::ssl::X509UniquePtr getPeerCert() const;
+  folly::Optional<PrincipalIdentity> extractPeerIdentity();
 
   void setPeerShuttingDown() {
     peer_shuttingdown_ = true;
@@ -605,14 +523,6 @@ class Connection : public TrafficShappingSocket {
    * existing connection to flush and close the socket.
    */
   void sendShutdown();
-
-  SocketType getSockType() const {
-    return type_;
-  }
-
-  ConnectionType getConnType() const {
-    return conntype_;
-  }
 
   const Settings& getSettings();
 
@@ -654,6 +564,13 @@ class Connection : public TrafficShappingSocket {
 
   int dispatchMessageBody(ProtocolHeader header,
                           std::unique_ptr<folly::IOBuf> msg_buffer);
+
+  /**
+   * Checks whether connection has been idle for all time since given timestamp.
+   * If connection sent/received any messages after this point or if it has
+   * active subscription then it is not treated as idle.
+   **/
+  bool isIdleAfter(SteadyTimestamp watermark);
 
  protected:
   void transitionToConnected();
@@ -710,14 +627,15 @@ class Connection : public TrafficShappingSocket {
 
   /**
    * This is strictly a delegating constructor. It sets all members
-   * other than peer_name_, peer_sockaddr_ and conntype_ to defaults.
+   * other than info_.peer_name, info_.peer_address and info_.connection_type to
+   * defaults.
    *
-   * @param deps          @see SocketDependencies.
+   * @param deps          @see SocketNetworkDependencies.
    * @param peer_name     LD-level 4-byte id of the other endpoint
    * @param peer_sockaddr sockaddr of the other endpoint
    * @param type          type of socket
    */
-  explicit Connection(std::unique_ptr<SocketDependencies>& deps,
+  explicit Connection(std::unique_ptr<SocketNetworkDependencies>& deps,
                       Address peer_name,
                       const Sockaddr& peer_sockaddr,
                       SocketType type,
@@ -764,15 +682,6 @@ class Connection : public TrafficShappingSocket {
    *         contains the actual reason.
    */
   std::unique_ptr<folly::IOBuf> serializeMessage(const Message& msg);
-
-  /**
-   * Allow the async message error simulator to optionally take ownership of
-   * this message just before it is sent.
-   *
-   * @return  True if the simulator has taken ownership of and handled the
-   *          envelope.
-   */
-  bool injectAsyncMessageError(std::unique_ptr<Envelope>&& msg);
 
   /**
    * Invoked by connect() to initiate the connection to peer.
@@ -832,6 +741,10 @@ class Connection : public TrafficShappingSocket {
    */
   void addHandshakeTimeoutEvent();
 
+  // used to increment/decrement counter stats like num_connections
+  void updateOpenConnectionStats();
+  void updateCloseConnectionStats();
+
   /**
    * A helper function to determine the reason for lower socket throughput.
    * Returns a decision for the socket slow if it can determine it otherwise
@@ -862,7 +775,7 @@ class Connection : public TrafficShappingSocket {
   friend class SocketImpl;
   std::unique_ptr<SocketImpl> impl_;
 
-  std::unique_ptr<SocketDependencies> deps_;
+  std::unique_ptr<SocketNetworkDependencies> deps_;
 
   // Envelopes that have been created via registerMessage, but have yet
   // to be released on this Socket.
@@ -908,28 +821,6 @@ class Connection : public TrafficShappingSocket {
   // ungraceful server shutdown
   bool peer_shuttingdown_{false};
 
-  // Protocol version negotiated following handshake.
-  // Only set when the socket is handshaken.
-  // This is passed to serialization and deserialization handlers.
-  // The only messages that can be serialized/deserialized before we actually
-  // set this value are ACK and HELLO messages. However, the default value
-  // of Settings::max_protocol (set in constructor) will do as
-  // getMinProtocolVersion() should return
-  // Compatibility::MIN_PROTOCOL_SUPPORTED for them.
-  uint16_t proto_;
-
-  // The highest config version known to the peer of the connection.
-  // The peer_config_version_ is commmunicated to the server using a
-  // CONFIG_ADVISORY message. Servers can update the peer_config_version_
-  // using a CONFIG_CHANGED message, which updates the client config.
-  config_version_t peer_config_version_{0};
-
-  // For Sockets that initiated an outgoing connection to a server and received
-  // a positive ACK, this is the ClientID that the other end assigned to our
-  // connection and reported in the ACK. For all other Sockets, or if an
-  // LD-level handshake has not yet completed this is an invalid ClientID.
-  ClientID our_name_at_peer_;
-
   // if the peer is a server, this object throttles the rate of connection
   // attempts
   ConnectThrottle* connect_throttle_{nullptr};
@@ -947,7 +838,7 @@ class Connection : public TrafficShappingSocket {
   // Timer event used to close the connection if the LD protocol handshake
   // (HELLO/ACK message received) is not fully established within some
   // reasonable period of time.
-  EvTimer handshake_timeout_event_;
+  std::unique_ptr<folly::HHWheelTimer::Callback> handshake_timeout_event_;
 
   // Indicates that we haven't had a fully established connection (including
   // the handshake) to the peer yet. Used by checkConnection() to differentiate
@@ -1031,48 +922,21 @@ class Connection : public TrafficShappingSocket {
   // the value here is valid only if socket-health-check-period is non-zero.
   double cached_socket_throughput_{0};
 
-  // Indicates whether this is an SSL socket
-  ConnectionType conntype_{ConnectionType::PLAIN};
-
-  // true if the message error injection code has decided to rewind
-  // a message stream. All traffic for this socket will be diverted until
-  // the end of the event loop, at which time the messages will be delivered
-  // with the error code specified by Sender::getMessageErrorInjectionErrorCode
-  // via the onSent() callback.
-  bool message_error_injection_rewinding_stream_ = false;
-
-  // event signalling the need to terminate the current simulated stream
-  // rewind event as soon as control is returned to the event loop.
-  EvTimer end_stream_rewind_event_;
-
-  // The number of messages that were asynchronously failed with NOBUFS
-  // duing the current simulated stream rewind event.
-  uint64_t message_error_injection_rewound_count_ = 0;
-
-  // The number of messages that have been processed normally since the last
-  // simulated stream rewind event.
-  uint64_t message_error_injection_pass_count_ = 0;
-
   // These two members are used to correctly maintain the number of available
   // fds for all accepted and client-only connections.
   ResourceBudget::Token conn_incoming_token_;
   ResourceBudget::Token conn_external_token_;
 
-  // called when the end_stream_rewind_event_ is signed.
-  static void endStreamRewindCallback(void* instance, short);
-
-  // called by endStreamRewindCallback to terminate the rewind on a parituclar
-  // socket instance.
-  void endStreamRewind();
-
   static void handshakeTimeoutCallback(void*, short);
 
+ private:
+  class HandshakeTimeout;
+  // General connection attributes like peer address and csid. Partially set in
+  // c-tor, partially during handshake (see HELLO_Message.cpp).
+  ConnectionInfo info_;
   // The file descriptor of the underlying OS socket. Set to -1 in situations
   // where the file descriptor is not known (e.g., before connecting).
   int fd_;
-
-  // Avoid invoking Socket::close on socket that is already closed.
-  std::shared_ptr<std::atomic<bool>> conn_closed_;
 
   // Protocol Handler layer to which owns the AsyncSocket and is responsible for
   // sending data over the socket.
@@ -1102,14 +966,35 @@ class Connection : public TrafficShappingSocket {
   // Used to note down delays in writing into the asyncsocket.
   SteadyTimestamp sched_start_time_;
 
+  // Momemnt of last activity happened on this connection such as
+  // - connection created
+  // - message sent
+  // - message receieved
+  // Used to find and proactevely close idle connections
+  SteadyTimestamp last_used_time_;
+
+  // used for num_connections counter
+  folly::Optional<ConnectionKind> connection_kind_;
+
   /**
-   * For Testing only!
+   * @return protocol version used by this connection which is either negotiated
+   * protocol if connection is handshaken or pre_handshake_proto_ otherwise.
    */
-  bool shouldTamperChecksum() {
-    return tamper_;
+  uint16_t getProto() const {
+    return info_.protocol.value_or(pre_handshake_proto_);
   }
 
-  bool tamper_{false};
+  // Checks the new info being set on connection is valid with respect to
+  // current attributes and fails ld_checks if not.
+  void checkNewInfo(const ConnectionInfo&) const;
+
+  // Version of ser/der protocol used before handshake takes place.
+  // The only messages that can be serialized/deserialized with this version
+  // are ACK and HELLO messages. However, the default value of
+  // Settings::max_protocol (set in constructor) will do as
+  // getMinProtocolVersion() should return Compatibility::MIN_PROTOCOL_SUPPORTED
+  // for them.
+  const uint16_t pre_handshake_proto_;
 
   friend class ConnectionTest;
 };

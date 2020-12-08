@@ -94,6 +94,11 @@ class NodesConfiguration {
     return storage_config_->getMembership()->hasNode(node);
   }
 
+  bool isBootstrapped() const {
+    return !this->getSequencerMembership()->isBootstrapping() &&
+        !this->getStorageMembership()->isBootstrapping();
+  }
+
   const std::shared_ptr<const SequencerConfig>& getSequencerConfig() const {
     return sequencer_config_;
   }
@@ -294,7 +299,6 @@ class NodesConfiguration {
   // of clients is very high.
   folly::Optional<std::string> serialized_config_;
 
-  friend class NodesConfigLegacyConverter;
   friend class NodesConfigurationThriftConverter;
 };
 

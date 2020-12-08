@@ -14,7 +14,6 @@
 #include "logdevice/common/ClusterState.h"
 #include "logdevice/common/configuration/Configuration.h"
 #include "logdevice/common/configuration/Node.h"
-#include "logdevice/common/configuration/nodes/NodesConfigLegacyConverter.h"
 #include "logdevice/common/configuration/nodes/NodesConfiguration.h"
 #include "logdevice/common/debug.h"
 #include "logdevice/common/event_log/EventLogRebuildingSet.h"
@@ -23,15 +22,41 @@ using namespace facebook::logdevice::configuration;
 
 namespace facebook { namespace logdevice {
 
+/**
+ * Returns a retrying policy used by folly::futures::retrying. The policy
+ * VERSION_MISMATCH errors 5 times.
+ */
+std::function<folly::Future<bool>(size_t, const folly::exception_wrapper&)>
+get_ncm_retrying_policy() {
+  return folly::futures::retryingPolicyCappedJitteredExponentialBackoff(
+      /*max_tries=*/5,
+      /*backoff_min=*/std::chrono::milliseconds(50),
+      /*backoff_max*/ std::chrono::milliseconds(50),
+      /*jitter_param=*/0.5,
+      folly::ThreadLocalPRNG(),
+      [](size_t, const folly::exception_wrapper& wrapper) {
+        {
+          // Retry as long as it's an NCM VERSION_MISMATCH error. Don't retry
+          // otherwise.
+          auto ex =
+              wrapper.get_exception<thrift::NodesConfigurationManagerError>();
+          return (ex != nullptr &&
+                  *(ex->get_error_code()) ==
+                      static_cast<uint32_t>(Status::VERSION_MISMATCH));
+        }
+      });
+}
+
 bool match_by_address(const configuration::nodes::NodeServiceDiscovery& node_sd,
                       const thrift::SocketAddress& address) {
   // UNIX
   // Match address on exact path for unix sockets
-  if (node_sd.address.isUnixAddress() &&
-      address.address_family == thrift::SocketAddressFamily::UNIX) {
+  if (node_sd.default_client_data_address.isUnixAddress() &&
+      *address.address_family_ref() == thrift::SocketAddressFamily::UNIX) {
     if (address.address_ref().has_value()) {
       // match by the address value if it's set.
-      return node_sd.address.getPath() == address.address_ref().value();
+      return node_sd.default_client_data_address.getPath() ==
+          address.address_ref().value();
     }
     return true;
   }
@@ -43,17 +68,20 @@ bool match_by_address(const configuration::nodes::NodeServiceDiscovery& node_sd,
   // Fields:
   // 1. Address
   // 2. Port
-  if (!node_sd.address.isUnixAddress() &&
-      address.address_family == thrift::SocketAddressFamily::INET) {
+  if (!node_sd.default_client_data_address.isUnixAddress() &&
+      *address.address_family_ref() == thrift::SocketAddressFamily::INET) {
     if (!address.address_ref().has_value()) {
       if (address.port_ref().has_value()) {
-        return node_sd.address.port() == address.port_ref().value();
+        return node_sd.default_client_data_address.port() ==
+            address.port_ref().value();
       }
       return false;
     } else {
       auto node_address = folly::SocketAddress(
-          node_sd.address.getAddress().str(),
-          address.port_ref().has_value() ? node_sd.address.port() : 0);
+          node_sd.default_client_data_address.getAddress().str(),
+          address.port_ref().has_value()
+              ? node_sd.default_client_data_address.port()
+              : 0);
       auto other_address = folly::SocketAddress(
           address.address_ref().value(),
           address.port_ref().has_value() ? address.port_ref().value() : 0);
@@ -207,9 +235,10 @@ void fillNodeConfig(
   out.set_roles(std::move(roles));
   out.set_location(node_sd->locationStr());
   out.set_location_per_scope(toThrift<thrift::Location>(node_sd->location));
+  out.tags_ref()->insert(node_sd->tags.begin(), node_sd->tags.end());
 
   thrift::SocketAddress data_address;
-  fillSocketAddress(data_address, node_sd->address);
+  fillSocketAddress(data_address, node_sd->default_client_data_address);
   out.set_data_address(std::move(data_address));
 
   // Other Addresses
@@ -234,6 +263,31 @@ void fillNodeConfig(
     fillSocketAddress(
         server_to_server_address, node_sd->server_to_server_address.value());
     other_addresses.set_server_to_server(std::move(server_to_server_address));
+  }
+  if (node_sd->server_thrift_api_address) {
+    thrift::SocketAddress server_thrift_api_address;
+    fillSocketAddress(
+        server_thrift_api_address, node_sd->server_thrift_api_address.value());
+    other_addresses.set_server_thrift_api(std::move(server_thrift_api_address));
+  }
+  if (node_sd->client_thrift_api_address) {
+    thrift::SocketAddress client_thrift_api_address;
+    fillSocketAddress(
+        client_thrift_api_address, node_sd->client_thrift_api_address.value());
+    other_addresses.set_client_thrift_api(std::move(client_thrift_api_address));
+  }
+  { // addresses per network priority
+    using ClientNetworkPriority =
+        configuration::nodes::NodeServiceDiscovery::ClientNetworkPriority;
+    std::map<ClientNetworkPriority, thrift::SocketAddress>
+        addresses_per_priority;
+    for (auto& [priority, address] : node_sd->addresses_per_priority) {
+      thrift::SocketAddress converted_address;
+      fillSocketAddress(converted_address, address);
+      addresses_per_priority[priority] = std::move(converted_address);
+    }
+    other_addresses.set_addresses_per_priority(
+        std::move(addresses_per_priority));
   }
   out.set_other_addresses(std::move(other_addresses));
 }
@@ -311,9 +365,6 @@ void fillNodeState(
       auto node_info = rebuilding_set
           ? rebuilding_set->getNodeInfo(node_index, shard_index)
           : nullptr;
-      // DEPRECATED
-      state.set_current_storage_state(
-          toThrift<thrift::ShardStorageState>(result->storage_state));
 
       state.set_storage_state(
           toThrift<membership::thrift::StorageState>(result->storage_state));
@@ -367,7 +418,8 @@ ShardSet resolveShardOrNode(
   ShardSet output;
 
   const auto& serv_disc = nodes_configuration.getServiceDiscovery();
-  shard_index_t shard_index = (shard.shard_index < 0) ? -1 : shard.shard_index;
+  shard_index_t shard_index =
+      (*shard.shard_index_ref() < 0) ? -1 : *shard.shard_index_ref();
   shard_size_t num_shards = 1;
   if (!isNodeIDSet(shard.get_node())) {
     throw thrift::InvalidRequest(

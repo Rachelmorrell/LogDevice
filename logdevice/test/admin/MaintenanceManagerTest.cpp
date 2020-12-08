@@ -12,6 +12,7 @@
 #include "logdevice/admin/maintenance/MaintenanceLogWriter.h"
 #include "logdevice/common/ThriftCodec.h"
 #include "logdevice/lib/ClientImpl.h"
+#include "logdevice/test/utils/AdminAPITestUtils.h"
 #include "logdevice/test/utils/IntegrationTestBase.h"
 #include "logdevice/test/utils/IntegrationTestUtils.h"
 
@@ -37,23 +38,15 @@ void MaintenanceManagerTest::init() {
   const size_t num_nodes = 5;
   const size_t num_shards = 2;
 
-  Configuration::Nodes nodes;
-
-  for (int i = 0; i < num_nodes; ++i) {
-    nodes[i].generation = 1;
-    nodes[i].addSequencerRole();
-    nodes[i].addStorageRole(num_shards);
-  }
+  auto nodes_configuration =
+      createSimpleNodesConfig(num_nodes, num_shards, true, 2);
 
   auto log_attrs = logsconfig::LogAttributes().with_replicationFactor(2);
-
-  auto meta_configs =
-      createMetaDataLogsConfig({0, 1, 2, 3, 4}, 2, NodeLocationScope::NODE);
 
   cluster_ =
       IntegrationTestUtils::ClusterFactory()
           .setNumLogs(1)
-          .setNodes(nodes)
+          .setNodes(std::move(nodes_configuration))
           .setNodesConfigurationSourceOfTruth(
               IntegrationTestUtils::NodesConfigurationSourceOfTruth::NCM)
           .enableSelfInitiatedRebuilding("10s")
@@ -68,12 +61,10 @@ void MaintenanceManagerTest::init() {
               "2s")
           .setParam("--filter-relocate-shards", GetParam() ? "true" : "false")
           .setParam("--loglevel", "debug")
-          // Starts MaintenanceManager on N2
-          .runMaintenanceManagerOn(2)
+          .useStandaloneAdminServer(true)
           .setNumDBShards(num_shards)
           .setLogGroupName("test_logrange")
           .setLogAttributes(log_attrs)
-          .setMetaDataLogsConfig(meta_configs)
           .deferStart()
           .create(num_nodes);
 }
@@ -93,44 +84,6 @@ static lsn_t write_test_records(std::shared_ptr<Client> client,
     }
   }
   return first_lsn;
-}
-
-static lsn_t writeToMaintenanceLog(Client& client,
-                                   maintenance::MaintenanceDelta& delta) {
-  logid_t maintenance_log_id =
-      configuration::InternalLogs::MAINTENANCE_LOG_DELTAS;
-
-  // Retry for at most 30s to avoid test failures due to transient failures
-  // writing to the maintenance log.
-  std::chrono::steady_clock::time_point deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds{30};
-
-  std::string serializedData =
-      ThriftCodec::serialize<apache::thrift::BinarySerializer>(delta);
-
-  lsn_t lsn = LSN_INVALID;
-  auto clientImpl = dynamic_cast<ClientImpl*>(&client);
-  clientImpl->allowWriteInternalLog();
-  auto rv = wait_until("writes to the maintenance log succeed",
-                       [&]() {
-                         lsn = clientImpl->appendSync(
-                             maintenance_log_id, serializedData);
-                         return lsn != LSN_INVALID;
-                       },
-                       deadline);
-
-  if (rv != 0) {
-    ld_check(lsn == LSN_INVALID);
-    ld_error("Could not write delta in maintenance log(%lu): %s(%s)",
-             maintenance_log_id.val_,
-             error_name(err),
-             error_description(err));
-    return false;
-  }
-
-  ld_info(
-      "Wrote maintenance log delta with lsn %s", lsn_to_string(lsn).c_str());
-  return lsn;
 }
 
 TEST_P(MaintenanceManagerTest, BasicDrain) {
@@ -174,12 +127,11 @@ TEST_P(MaintenanceManagerTest, BasicDrain) {
 
   auto maintenanceDelta = std::make_unique<MaintenanceDelta>();
   maintenanceDelta->set_apply_maintenances({def, def2});
-  writeToMaintenanceLog(*client, *maintenanceDelta);
-
+  write_to_maintenance_log(*client, *maintenanceDelta);
+  auto admin_client = cluster_->getAdminServer()->createAdminClient();
   wait_until("ShardOperationalState is DRAINED", [&]() {
-    auto state = cluster_->getNode(2).sendCommand("info shardopstate 3 0");
-    const std::string expected_text = "DRAINED\r\n";
-    return state == expected_text;
+    auto state = get_shard_operational_state(*admin_client, ShardID(3, 0));
+    return state == thrift::ShardOperationalState::DRAINED;
   });
 
   // Now remove the DRAINED maintenance, node should go back to being
@@ -195,12 +147,11 @@ TEST_P(MaintenanceManagerTest, BasicDrain) {
   req.set_reason("Integration Test");
 
   maintenanceDelta->set_remove_maintenances(std::move(req));
-  writeToMaintenanceLog(*client, *maintenanceDelta);
+  write_to_maintenance_log(*client, *maintenanceDelta);
 
   wait_until("ShardOperationalState is MAY_DISAPPEAR", [&]() {
-    auto state = cluster_->getNode(2).sendCommand("info shardopstate 3 0");
-    const std::string expected_text = "MAY_DISAPPEAR\r\n";
-    return state == expected_text;
+    auto state = get_shard_operational_state(*admin_client, ShardID(3, 0));
+    return state == thrift::ShardOperationalState::MAY_DISAPPEAR;
   });
 
   // Now remove the MAY_DISAPPEAR maintenance, node should go back to being
@@ -214,30 +165,27 @@ TEST_P(MaintenanceManagerTest, BasicDrain) {
   req.set_reason("Integration Test");
 
   maintenanceDelta->set_remove_maintenances(std::move(req));
-  writeToMaintenanceLog(*client, *maintenanceDelta);
+  write_to_maintenance_log(*client, *maintenanceDelta);
 
   wait_until("ShardOperationalState is ENABLED", [&]() {
-    auto state = cluster_->getNode(2).sendCommand("info shardopstate 3 0");
-    const std::string expected_text = "ENABLED\r\n";
-    return state == expected_text;
+    auto state = get_shard_operational_state(*admin_client, ShardID(3, 0));
+    return state == thrift::ShardOperationalState::ENABLED;
   });
 
   // Kill N3 now, internal maintenance should be added and node eventually
   // set to DRAINED
   cluster_->getNode(3).kill();
   wait_until("ShardOperationalState is DRAINED", [&]() {
-    auto state = cluster_->getNode(2).sendCommand("info shardopstate 3 0");
-    const std::string expected_text = "DRAINED\r\n";
-    return state == expected_text;
+    auto state = get_shard_operational_state(*admin_client, ShardID(3, 0));
+    return state == thrift::ShardOperationalState::DRAINED;
   });
 
   // Start N3. It shoudl ack its rebuilding and remove the maintenance
   cluster_->getNode(3).start();
   cluster_->getNode(3).waitUntilAvailable();
   wait_until("ShardOperationalState is ENABLED", [&]() {
-    auto state = cluster_->getNode(2).sendCommand("info shardopstate 3 0");
-    const std::string expected_text = "ENABLED\r\n";
-    return state == expected_text;
+    auto state = get_shard_operational_state(*admin_client, ShardID(3, 0));
+    return state == thrift::ShardOperationalState::ENABLED;
   });
 }
 
@@ -268,12 +216,13 @@ TEST_P(MaintenanceManagerTest, BasicPassiveDrain) {
 
   auto maintenanceDelta = std::make_unique<MaintenanceDelta>();
   maintenanceDelta->set_apply_maintenances({def});
-  writeToMaintenanceLog(*client, *maintenanceDelta);
+  write_to_maintenance_log(*client, *maintenanceDelta);
+
+  auto admin_client = cluster_->getAdminServer()->createAdminClient();
 
   wait_until("ShardOperationalState is PASSIVE_DRAINING", [&]() {
-    auto state = cluster_->getNode(2).sendCommand("info shardopstate 0 0");
-    const std::string expected_text = "PASSIVE_DRAINING\r\n";
-    return state == expected_text;
+    auto state = get_shard_operational_state(*admin_client, ShardID(0, 0));
+    return state == thrift::ShardOperationalState::PASSIVE_DRAINING;
   });
 
   // Now remove the DRAINED maintenance, node should go back to being
@@ -289,12 +238,11 @@ TEST_P(MaintenanceManagerTest, BasicPassiveDrain) {
   req.set_reason("Integration Test");
 
   maintenanceDelta->set_remove_maintenances(std::move(req));
-  writeToMaintenanceLog(*client, *maintenanceDelta);
+  write_to_maintenance_log(*client, *maintenanceDelta);
 
   wait_until("ShardOperationalState is ENABLED", [&]() {
-    auto state = cluster_->getNode(2).sendCommand("info shardopstate 0 0");
-    const std::string expected_text = "ENABLED\r\n";
-    return state == expected_text;
+    auto state = get_shard_operational_state(*admin_client, ShardID(0, 0));
+    return state == thrift::ShardOperationalState::ENABLED;
   });
 }
 
@@ -302,23 +250,15 @@ TEST_P(MaintenanceManagerTest, Snapshotting) {
   const size_t num_nodes = 5;
   const size_t num_shards = 2;
 
-  Configuration::Nodes nodes;
-
-  for (int i = 0; i < num_nodes; ++i) {
-    nodes[i].generation = 1;
-    nodes[i].addSequencerRole();
-    nodes[i].addStorageRole(num_shards);
-  }
+  auto nodes_configuration =
+      createSimpleNodesConfig(num_nodes, num_shards, true, 2);
 
   auto log_attrs = logsconfig::LogAttributes().with_replicationFactor(2);
-
-  auto meta_configs =
-      createMetaDataLogsConfig({0, 1, 2, 3, 4}, 2, NodeLocationScope::NODE);
 
   cluster_ =
       IntegrationTestUtils::ClusterFactory()
           .setNumLogs(1)
-          .setNodes(nodes)
+          .setNodes(std::move(nodes_configuration))
           .enableSelfInitiatedRebuilding("10s")
           .setNodesConfigurationSourceOfTruth(
               IntegrationTestUtils::NodesConfigurationSourceOfTruth::NCM)
@@ -333,15 +273,18 @@ TEST_P(MaintenanceManagerTest, Snapshotting) {
           .setParam(
               "--nodes-configuration-manager-intermediary-shard-state-timeout",
               "2s")
+          // Note that this means that all nodes will be taking snapshots. This
+          // is still safe and makes the test easier since we can ask any node
+          // on whether it has taken a snapshot or not. Ideally, this test
+          // should not exist and the snapshotting testing should be on lower
+          // level, this is leaking the whole abstraction of the RSM.
           .setParam("--maintenance-log-snapshotting", "true")
           .setParam("--maintenance-log-max-delta-records", "2")
           .setParam("--loglevel", "debug")
-          // Starts MaintenanceManager on N2
-          .runMaintenanceManagerOn(2)
+          .useStandaloneAdminServer(true)
           .setNumDBShards(num_shards)
           .setLogGroupName("test_logrange")
           .setLogAttributes(log_attrs)
-          .setMetaDataLogsConfig(meta_configs)
           .deferStart()
           .create(num_nodes);
 
@@ -370,12 +313,13 @@ TEST_P(MaintenanceManagerTest, Snapshotting) {
 
   auto maintenanceDelta = std::make_unique<MaintenanceDelta>();
   maintenanceDelta->set_apply_maintenances({def});
-  writeToMaintenanceLog(*client, *maintenanceDelta);
+  write_to_maintenance_log(*client, *maintenanceDelta);
+
+  auto admin_client = cluster_->getAdminServer()->createAdminClient();
 
   wait_until("N3's ShardOperationalState is DRAINED", [&]() {
-    auto state = cluster_->getNode(2).sendCommand("info shardopstate 3 0");
-    const std::string expected_text = "DRAINED\r\n";
-    return state == expected_text;
+    auto state = get_shard_operational_state(*admin_client, ShardID(3, 0));
+    return state == thrift::ShardOperationalState::DRAINED;
   });
 
   auto stats = cluster_->getNode(2).stats();
@@ -397,12 +341,11 @@ TEST_P(MaintenanceManagerTest, Snapshotting) {
 
   maintenanceDelta = std::make_unique<MaintenanceDelta>();
   maintenanceDelta->set_apply_maintenances({def2});
-  writeToMaintenanceLog(*client, *maintenanceDelta);
+  write_to_maintenance_log(*client, *maintenanceDelta);
 
   wait_until("N2's ShardOperationalState is MAY_DISAPPEAR", [&]() {
-    auto state = cluster_->getNode(2).sendCommand("info shardopstate 2 0");
-    const std::string expected_text = "MAY_DISAPPEAR\r\n";
-    return state == expected_text;
+    auto state = get_shard_operational_state(*admin_client, ShardID(2, 0));
+    return state == thrift::ShardOperationalState::MAY_DISAPPEAR;
   });
 
   // Since 2 records have now been written we should have snapshotted
@@ -424,12 +367,11 @@ TEST_P(MaintenanceManagerTest, Snapshotting) {
   req.set_reason("Integration Test");
 
   maintenanceDelta->set_remove_maintenances(std::move(req));
-  writeToMaintenanceLog(*client, *maintenanceDelta);
+  write_to_maintenance_log(*client, *maintenanceDelta);
 
   wait_until("N2's ShardOperationalState is ENABLED", [&]() {
-    auto state = cluster_->getNode(2).sendCommand("info shardopstate 2 0");
-    const std::string expected_text = "ENABLED\r\n";
-    return state == expected_text;
+    auto state = get_shard_operational_state(*admin_client, ShardID(2, 0));
+    return state == thrift::ShardOperationalState::ENABLED;
   });
 
   // Now remove the DRAIN maintenance on N3
@@ -443,12 +385,11 @@ TEST_P(MaintenanceManagerTest, Snapshotting) {
   req2.set_user("Test");
   req2.set_reason("Integration Test");
   maintenanceDelta->set_remove_maintenances(std::move(req2));
-  writeToMaintenanceLog(*client, *maintenanceDelta);
+  write_to_maintenance_log(*client, *maintenanceDelta);
 
   wait_until("N3's ShardOperationalState is ENABLED", [&]() {
-    auto state = cluster_->getNode(2).sendCommand("info shardopstate 3 0");
-    const std::string expected_text = "ENABLED\r\n";
-    return state == expected_text;
+    auto state = get_shard_operational_state(*admin_client, ShardID(3, 0));
+    return state == thrift::ShardOperationalState::ENABLED;
   });
 }
 
@@ -456,29 +397,20 @@ TEST_P(MaintenanceManagerTest, RestoreDowngradedToTimeRangeRebuilding) {
   const size_t num_nodes = 6;
   const size_t num_shards = 2;
 
-  Configuration::Nodes nodes;
-
-  for (int i = 0; i < num_nodes; ++i) {
-    nodes[i].generation = 1;
-    nodes[i].addSequencerRole();
-    nodes[i].addStorageRole(num_shards);
-  }
+  auto nodes_configuration =
+      createSimpleNodesConfig(num_nodes, num_shards, true, 2);
 
   auto data_log_attrs = logsconfig::LogAttributes().with_replicationFactor(5);
 
   auto log_attrs = logsconfig::LogAttributes()
                        .with_replicationFactor(2)
-                       .with_extraCopies(0)
                        .with_syncedCopies(0)
                        .with_maxWritesInFlight(2048);
-
-  auto meta_configs =
-      createMetaDataLogsConfig({0, 1, 2, 3, 4, 5}, 2, NodeLocationScope::NODE);
 
   cluster_ =
       IntegrationTestUtils::ClusterFactory()
           .setNumLogs(1)
-          .setNodes(nodes)
+          .setNodes(std::move(nodes_configuration))
           .enableSelfInitiatedRebuilding("10s")
           .setNodesConfigurationSourceOfTruth(
               IntegrationTestUtils::NodesConfigurationSourceOfTruth::NCM)
@@ -504,14 +436,12 @@ TEST_P(MaintenanceManagerTest, RestoreDowngradedToTimeRangeRebuilding) {
           .setParam("--loglevel", "debug")
           .setParam("--max-node-rebuilding-percentage", "80")
           .setLogAttributes(data_log_attrs)
-          // Starts MaintenanceManager on N3
-          .runMaintenanceManagerOn(3)
+          .useStandaloneAdminServer(true)
           .setNumDBShards(num_shards)
           .setConfigLogAttributes(log_attrs)
           .setMaintenanceLogAttributes(log_attrs)
           .setEventLogAttributes(log_attrs)
           .setLogGroupName("test_logrange")
-          .setMetaDataLogsConfig(meta_configs)
           .deferStart()
           .create(num_nodes);
 
@@ -531,10 +461,10 @@ TEST_P(MaintenanceManagerTest, RestoreDowngradedToTimeRangeRebuilding) {
   // set to DRAINED
   cluster_->getNode(1).kill();
 
+  auto admin_client = cluster_->getAdminServer()->createAdminClient();
   wait_until("ShardOperationalState is MIGRATING_DATA", [&]() {
-    auto state = cluster_->getNode(3).sendCommand("info shardopstate 1 0");
-    const std::string expected_text = "MIGRATING_DATA\r\n";
-    return state == expected_text;
+    auto state = get_shard_operational_state(*admin_client, ShardID(1, 0));
+    return state == thrift::ShardOperationalState::MIGRATING_DATA;
   });
 
   // Start the nodes back again. They should remove the internal maintenance
@@ -543,9 +473,8 @@ TEST_P(MaintenanceManagerTest, RestoreDowngradedToTimeRangeRebuilding) {
 
   cluster_->getNode(1).waitUntilAvailable();
   wait_until("ShardOperationalState is ENABLED", [&]() {
-    auto state = cluster_->getNode(3).sendCommand("info shardopstate 1 0");
-    const std::string expected_text = "ENABLED\r\n";
-    return state == expected_text;
+    auto state = get_shard_operational_state(*admin_client, ShardID(1, 0));
+    return state == thrift::ShardOperationalState::ENABLED;
   });
 
   // Verify that the shards are dirty
@@ -566,13 +495,12 @@ TEST_P(MaintenanceManagerTest, RestoreDowngradedToTimeRangeRebuilding) {
   def.set_created_on(SystemTimestamp::now().toMilliseconds().count());
   auto maintenanceDelta = std::make_unique<MaintenanceDelta>();
   maintenanceDelta->set_apply_maintenances({def});
-  writeToMaintenanceLog(*client, *maintenanceDelta);
+  write_to_maintenance_log(*client, *maintenanceDelta);
 
   // Wait until maintenance completes
   wait_until("ShardOperationalState is DRAINED", [&]() {
-    auto state = cluster_->getNode(3).sendCommand("info shardopstate 1 0");
-    const std::string expected_text = "DRAINED\r\n";
-    return state == expected_text;
+    auto state = get_shard_operational_state(*admin_client, ShardID(1, 0));
+    return state == thrift::ShardOperationalState::DRAINED;
   });
 }
 

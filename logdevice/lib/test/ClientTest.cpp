@@ -10,15 +10,20 @@
 #include <chrono>
 
 #include <folly/synchronization/Baton.h>
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
 #include "logdevice/common/Semaphore.h"
+#include "logdevice/common/stats/Stats.h"
 #include "logdevice/common/test/TestUtil.h"
 #include "logdevice/common/types_internal.h"
+#include "logdevice/include/ClientFactory.h"
 
-using namespace facebook::logdevice;
+using namespace ::testing;
 
-class ClientTest : public ::testing::Test {
+namespace facebook { namespace logdevice {
+
+class ClientTest : public Test {
  protected:
   void SetUp() override {
     // In order for writes to closed pipes to return EPIPE (instead of bringing
@@ -33,8 +38,19 @@ class ClientTest : public ::testing::Test {
     sigaction(SIGPIPE, &oldact, nullptr);
   }
 
+  ClientFactory clientFactory() {
+    ClientFactory factory{};
+    factory.setSetting(
+        "nodes-configuration-file-store-dir", ncs_->path().string());
+    factory.setSetting("admin-client-capabilities", "true");
+    return factory;
+  }
+
  private:
   struct sigaction oldact {};
+
+  std::unique_ptr<folly::test::TemporaryDirectory> ncs_{
+      provisionTempNodesConfiguration(*createSimpleNodesConfig(1))};
 };
 
 /**
@@ -45,14 +61,14 @@ TEST_F(ClientTest, ShutdownUseAfterFree) {
   // NOTE: assumes test is being run from top-level fbcode dir
   std::string config_path =
       std::string("file:") + TEST_CONFIG_FILE("sample_no_ssl.conf");
-  std::shared_ptr<Client> client = ClientFactory().create(config_path);
+  std::shared_ptr<Client> client = clientFactory().create(config_path);
   EXPECT_FALSE(client == nullptr);
 }
 
 TEST_F(ClientTest, Configuration) {
   std::string config_path =
       std::string("file:") + TEST_CONFIG_FILE("sample_no_ssl.conf");
-  std::shared_ptr<Client> client = ClientFactory().create(config_path);
+  std::shared_ptr<Client> client = clientFactory().create(config_path);
 
   auto range = client->getLogRangeByName("foo");
   EXPECT_EQ(logid_t(8), range.first);
@@ -94,7 +110,7 @@ TEST_F(ClientTest, OnDemandLogsConfigShutdown) {
   std::string config_path =
       std::string("file:") + TEST_CONFIG_FILE("sample_no_ssl.conf");
   std::shared_ptr<Client> client =
-      ClientFactory()
+      clientFactory()
           .setSetting("on-demand-logs-config", "true")
           .create(config_path);
 
@@ -180,7 +196,7 @@ TEST_F(ClientTest, clientEvents) {
   std::string config_path =
       std::string("file:") + TEST_CONFIG_FILE("sample_no_ssl.conf");
   std::shared_ptr<Client> client =
-      ClientFactory()
+      clientFactory()
           .setSetting("enable-logsconfig-manager", "false")
           .create(config_path);
   client->publishEvent(Severity::INFO,
@@ -202,13 +218,13 @@ TEST_F(ClientTest, NoAbortOnFailedCheck) {
   EXPECT_TRUE(dbg::abortOnFailedCheck.load());
   dbg::abortOnFailedCheck.store(!folly::kIsDebug);
   {
-    auto client = ClientFactory().create(config_path);
+    auto client = clientFactory().create(config_path);
     EXPECT_FALSE(client == nullptr);
     EXPECT_EQ(folly::kIsDebug, dbg::abortOnFailedCheck.load());
   }
   EXPECT_EQ(folly::kIsDebug, dbg::abortOnFailedCheck.load());
   {
-    auto client = ClientFactory()
+    auto client = clientFactory()
                       .setSetting("abort-on-failed-check",
                                   folly::kIsDebug ? "false" : "true")
                       .create(config_path);
@@ -221,7 +237,7 @@ TEST_F(ClientTest, NoAbortOnFailedCheck) {
 TEST_F(ClientTest, PayloadSizeLimitTest) {
   std::string config_path =
       std::string("file:") + TEST_CONFIG_FILE("sample_no_ssl.conf");
-  std::shared_ptr<Client> client = ClientFactory().create(config_path);
+  std::shared_ptr<Client> client = clientFactory().create(config_path);
   auto max_payload_size = client->getMaxPayloadSize();
   std::string payload_string(max_payload_size + 1, '1');
   Payload payload(payload_string.data(), payload_string.size());
@@ -239,3 +255,57 @@ TEST_F(ClientTest, PayloadSizeLimitTest) {
   EXPECT_EQ(-1, client->append(log_id, std::move(payload_string), callback));
   EXPECT_EQ(E::TOOBIG, err);
 }
+
+class MockFactory : public ClientFactory {
+ public:
+  MOCK_METHOD0(createStatsHolder, std::shared_ptr<StatsHolder>(void));
+};
+
+TEST_F(ClientTest, BumpMetricOnClientCreationFailure) {
+  std::string config_path =
+      std::string("file:") + TEST_CONFIG_FILE("sample_no_ssl.conf");
+  auto stats_holder =
+      std::make_shared<StatsHolder>(StatsParams().setIsServer(false));
+  auto clientFactory = std::make_unique<MockFactory>();
+
+  ON_CALL(*clientFactory, createStatsHolder())
+      .WillByDefault(Return(stats_holder));
+
+  // simulate a dependency failure that we should be alerted on.
+  // This will attempt to fetch NodesConfiguration from Zookeeper but we
+  // didn't setup a cluster so it would fail.
+  std::shared_ptr<Client> client =
+      clientFactory->setSetting("enable-nodes-configuration-manager", "true")
+          .setSetting("admin-client-capabilities", "true")
+          .setSetting("nodes-configuration-init-timeout", "5s")
+          .setSetting("nodes-configuration-init-retry-timeout", "100ms..500ms")
+          .create(config_path);
+  auto stats = stats_holder->aggregate();
+
+  EXPECT_EQ(nullptr, client);
+  EXPECT_EQ(1, stats.client.client_init_failed);
+}
+
+TEST_F(ClientTest, DontBumpMetricOnUnworthyFailures) {
+  std::string config_path =
+      std::string("file:") + TEST_CONFIG_FILE("sample_no_ssl.conf");
+  auto stats_holder =
+      std::make_shared<StatsHolder>(StatsParams().setIsServer(false));
+  auto clientFactory = std::make_unique<MockFactory>();
+
+  ON_CALL(*clientFactory, createStatsHolder())
+      .WillByDefault(Return(stats_holder));
+
+  // forcing a failure by attempting to set a random settings
+  // string not recognized by ClientSettings. This illustrates a customer
+  // error that we shouldn't alert on.
+  std::shared_ptr<Client> client =
+      clientFactory->setSetting("random-nonexistent-setting", "true")
+          .create(config_path);
+  auto stats = stats_holder->aggregate();
+
+  EXPECT_EQ(nullptr, client);
+  EXPECT_EQ(0, stats.client.client_init_failed);
+}
+
+}} // namespace facebook::logdevice

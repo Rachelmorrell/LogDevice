@@ -11,6 +11,7 @@ include "logdevice/common/if/common.thrift"
 include "logdevice/common/membership/Membership.thrift"
 
 namespace cpp2 facebook.logdevice.thrift
+namespace go logdevice.admin.if.nodes
 namespace py3 logdevice.admin
 namespace php LogDevice
 namespace wiki Thriftdoc.LogDevice.Nodes
@@ -77,6 +78,10 @@ struct NodeConfig {
    * A unique name for the node in the cluster.
    */
   9: string name;
+  /**
+   * Custom tags.
+   */
+   10: map<string, string> tags;
 }
 
 /**
@@ -308,10 +313,6 @@ struct ShardState {
    * See the ShardDataHealth enum for info.
    */
   1: ShardDataHealth data_health,
-  /**
-   * [DEPRECATED]. Will be removed once callers move to storage_state instead.
-   */
-  2: ShardStorageState current_storage_state (deprecated),
   /**
    * See the ShardOperationalState enum for info. See the
    * maintenance for information about the active transition

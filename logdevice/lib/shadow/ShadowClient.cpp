@@ -175,18 +175,24 @@ std::shared_ptr<ShadowClient>
 ShadowClient::create(const std::string& origin_name,
                      const Shadow::Attrs& attrs,
                      std::chrono::milliseconds timeout,
-                     StatsHolder* stats) {
+                     StatsHolder* stats,
+                     std::unique_ptr<ClientSettings> client_settings) {
+  if (client_settings == nullptr) {
+    client_settings = std::unique_ptr<ClientSettings>(ClientSettings::create());
+  }
+  client_settings->set("shadow-client", "true");
+  // In case the default is changed in the future
+  client_settings->set("on-demand-logs-config", "false");
+  // Epoch metadata cache is used for reading, not necessary here
+  client_settings->set("client-epoch-metadata-cache-size", "0");
+  // Don't want to pollute traces with shadow data - TODO not sure about
+  // this
+  client_settings->set("disable-trace-logger", "true");
+
   std::string shadow_name(origin_name + ".shadow:" + attrs->destination());
   std::shared_ptr<Client> client =
       ClientFactory()
-          .setSetting("shadow-client", "true")
-          // In case the default is changed in the future
-          .setSetting("on-demand-logs-config", "false")
-          // Epoch metadata cache is used for reading, not necessary here
-          .setSetting("client-epoch-metadata-cache-size", "0")
-          // Don't want to pollute traces with shadow data - TODO not sure about
-          // this
-          .setSetting("disable-trace-logger", "true")
+          .setClientSettings(std::move(client_settings))
           .setClusterName(shadow_name)
           .setTimeout(timeout)
           .create(attrs->destination());
@@ -207,7 +213,8 @@ ShadowClient::~ShadowClient() {}
 int ShadowClient::append(logid_t logid,
                          PayloadHolder&& payload,
                          AppendAttributes attrs,
-                         bool buffered_writer_blob) noexcept {
+                         bool buffered_writer_blob,
+                         bool payload_group) noexcept {
   auto callback = [&](auto a, const auto& b) { this->appendCallback(a, b); };
 
   ld_spew(LD_SHADOW_PREFIX "Shadowing payload of size %zu to shadow '%s'",
@@ -216,8 +223,9 @@ int ShadowClient::append(logid_t logid,
 
   // Downcast client in order to use lower level API. The reason is we need
   // to be able to alter append request flags to match those of the original
-  // request. In particular, we need to propage the BUFFERED_WRITER_BLOB
-  // flag so readers can detect buffered writer batches and unpack them.
+  // request. In particular, we need to propage the BUFFERED_WRITER_BLOB and
+  // PAYLOAD_GROUP flags so readers can detect buffered writer batches or
+  // PayloadGroups and unpack them.
   ClientImpl* client_impl = checked_downcast<ClientImpl*>(client_.get());
   int rv = -1;
   auto req = client_impl->prepareRequest(
@@ -225,6 +233,9 @@ int ShadowClient::append(logid_t logid,
   if (req) {
     if (buffered_writer_blob) {
       req->setBufferedWriterBlobFlag();
+    }
+    if (payload_group) {
+      req->setPayloadGroupFlag();
     }
     rv = client_impl->postAppend(std::move(req));
   }

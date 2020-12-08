@@ -12,7 +12,6 @@
 #include "logdevice/common/EventLoop.h"
 #include "logdevice/common/Processor.h"
 #include "logdevice/common/RandomNodeSelector.h"
-#include "logdevice/common/Sender.h"
 #include "logdevice/common/Worker.h"
 #include "logdevice/common/configuration/Configuration.h"
 #include "logdevice/common/configuration/UpdateableConfig.h"
@@ -62,6 +61,9 @@ void GetLogInfoRequest::changeTargetNode(std::unique_lock<std::mutex>& lock) {
   ClusterState* cluster_state = nullptr;
   if (worker != nullptr) {
     cluster_state = worker->getClusterState();
+  }
+  if (cluster_state != nullptr && !cluster_state->isAnyNodeAlive()) {
+    cluster_state = nullptr;
   }
   const auto new_node = RandomNodeSelector::getAliveNode(
       *nodes_configuration, cluster_state, exclude);

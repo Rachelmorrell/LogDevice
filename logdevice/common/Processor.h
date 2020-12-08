@@ -18,6 +18,7 @@
 #include <folly/Memory.h>
 #include <folly/memory/EnableSharedFromThis.h>
 
+#include "logdevice/common/RequestExecutor.h"
 #include "logdevice/common/ResourceBudget.h"
 #include "logdevice/common/Semaphore.h"
 #include "logdevice/common/WorkerType.h"
@@ -26,6 +27,7 @@
 #include "logdevice/common/types_internal.h"
 #include "logdevice/common/work_model/WorkContext.h"
 #include "logdevice/include/types.h"
+
 // Think twice before adding new includes here!  This file is included in many
 // translation units and increasing its transitive dependency footprint will
 // slow down the build.  We use forward declaration and the pimpl idiom to
@@ -58,9 +60,12 @@ class Request;
 class SequencerBatching;
 class ReadStreamDebugInfoSamplingConfig;
 class SequencerLocator;
-class SSLFetcher;
+class SSLSessionCache;
 class StatsHolder;
 class TraceLogger;
+class ThriftClientFactory;
+class ThriftRouter;
+class TLSCredMonitor;
 class UpdateableConfig;
 class UpdateableSecurityInfo;
 class Worker;
@@ -69,7 +74,12 @@ class Configuration;
 enum class SequencerOptions : uint8_t;
 using workers_t = std::vector<std::unique_ptr<Worker>>;
 
-class Processor : public folly::enable_shared_from_this<Processor> {
+class Processor : public folly::enable_shared_from_this<Processor>,
+                  public RequestPoster,
+                  // TODO: Remove this inheritence after migrating all the
+                  // callsites to use RequestExecutorInterface instead of the
+                  // Processor directly.
+                  public RequestExecutor {
  public:
   enum class Order { FORWARD, REVERSE, RANDOM };
 
@@ -77,21 +87,6 @@ class Processor : public folly::enable_shared_from_this<Processor> {
    * Creates a new Processor.  You cannot use this directly, need to call the
    * create() factory method which performs two-step initialisation with init().
    *
-   * @param cluster_config config to pass to Worker threads
-   * @param Settings       common setting shared by all EventLoops in this
-   *                       Processor and all the objects running on them.
-   *                       Must be non-null. Is NOT owned by Processor.
-   * @param rebuilding_mode             whether this Processor is part of
-   *                                    rebuilding process
-   * @param permission_checker          pointer to a PermissionChecker.
-   *                                    Ownership is transferred to the
-   *                                    processor
-   * @param principal_parser            pointer to a PrinciplaParser. Ownership
-   *                                    is transferred to the processor
-   * @param stats                       object used to update various stat
-   *                                    counters
-   * @param sequencer_locator           used on clients and storage nodes to
-   *                                    map from log ids to sequencer nodes
    * @param credentials                 an optional field used in the initial
    *                                    handshake of a Connection. Used
    *                                    only when the configuration file has set
@@ -141,15 +136,12 @@ class Processor : public folly::enable_shared_from_this<Processor> {
                    bool force);
 
   /**
-   * Common implementation of postRequest(), postImportant() etc. Different
-   * processors can decide to override this accordingly.
+   * Implementation for the RequestExecutor interface.
    */
   int postImpl(std::unique_ptr<Request>& rq,
                WorkerType worker_type,
                int target_thread,
-               bool force);
-
-  int blockingRequestImpl(std::unique_ptr<Request>& rq, bool force);
+               bool force) override;
 
   /**
    * Decides which thread to send a request to.
@@ -279,67 +271,6 @@ class Processor : public folly::enable_shared_from_this<Processor> {
   WheelTimer& getWheelTimer();
 
   /**
-   * Schedules rq to run on one of the Workers managed by this Processor.
-   *
-   * @param rq  request to execute. Must not be nullptr. On success the
-   *            function takes ownership of the object (and passes it on
-   *            to a Worker). On failure ownership remains with the
-   *            caller.
-   *
-   * @return 0 if request was successfully passed to a Worker thread for
-   *           execution, -1 on failure. err is set to
-   *     INVALID_PARAM  if rq is invalid
-   *     NOBUFS         if too many requests are pending to be delivered to
-   *                    Workers
-   *     SHUTDOWN       Processor is shutting down
-   */
-  int postRequest(std::unique_ptr<Request>& rq);
-
-  /**
-   * The same as standard postRequest() but worker id is being
-   * selected manually
-   */
-  int postRequest(std::unique_ptr<Request>& rq,
-                  WorkerType worker_type,
-                  int target_thread);
-
-  /**
-   * Runs a Request on one of the Workers, waiting for it to finish.
-   *
-   * For parameters and return values, see postRequest()/postImportant().
-   */
-  int blockingRequest(std::unique_ptr<Request>& rq);
-  int blockingRequestImportant(std::unique_ptr<Request>& rq);
-
-  /**
-   * Similar to postRequest() but proceeds regardless of how many requests are
-   * already pending on the worker (no NOBUFS error).
-   *
-   * This should be used when there is no avenue for pushback in case the
-   * worker is overloaded.  A guideline: if the only way to handle NOBUFS from
-   * the regular postRequest() would be to retry posting the request
-   * individually, then using this instead is appropriate and more efficient.
-   *
-   * @param rq  request to execute. Must not be nullptr. On success the
-   *            function takes ownership of the object (and passes it on
-   *            to the Processor). On failure ownership remains with the
-   *            caller.
-   *
-   * @return 0 if request was successfully passed to a Worker thread for
-   *           execution, -1 on failure. err is set to
-   *     INVALID_PARAM  if rq is invalid
-   *     SHUTDOWN       this queue or processor_ is shutting down
-   */
-  int postImportant(std::unique_ptr<Request>& rq);
-  int postImportant(std::unique_ptr<Request>& rq,
-                    WorkerType worker_type,
-                    int target_thread);
-  // Older alias for postImportant()
-  int postWithRetrying(std::unique_ptr<Request>& rq) {
-    return postImportant(rq);
-  }
-
-  /**
    * Are we a storage node, able to store and deliver records?
    */
   virtual bool runningOnStorageNode() const {
@@ -444,19 +375,9 @@ class Processor : public folly::enable_shared_from_this<Processor> {
    */
   void setNodesConfigurationManager(
       std::shared_ptr<configuration::nodes::NodesConfigurationManager> ncm);
-  /**
-   * Get the NodesConfiguration updated by NodesConfigurationManager.
-   * Note: only used during NCM migration period, will be removed later
-   */
-  std::shared_ptr<const configuration::nodes::NodesConfiguration>
-  getNodesConfigurationFromNCMSource() const;
-
-  std::shared_ptr<const configuration::nodes::NodesConfiguration>
-  getNodesConfigurationFromServerConfigSource() const;
 
   /**
-   * @return  NodesConfiguraton object of the cluster, depending on
-   *          processor settings, the source can be server config or NCM.
+   * @return  NodesConfiguraton object of the cluster.
    */
   std::shared_ptr<const configuration::nodes::NodesConfiguration>
   getNodesConfiguration() const;
@@ -484,7 +405,9 @@ class Processor : public folly::enable_shared_from_this<Processor> {
    */
   ResourceBudget::Token getIncomingMessageToken(size_t payload_size);
 
-  ReadStreamDebugInfoSamplingConfig& getDebugClientConfig();
+  RequestExecutor getRequestExecutor() {
+    return RequestExecutor(this);
+  }
 
  private:
   // Make runningOnStorageNode() return true. Used for tests.
@@ -499,8 +422,13 @@ class Processor : public folly::enable_shared_from_this<Processor> {
 
   std::shared_ptr<PluginRegistry> plugin_registry_;
 
+  std::unique_ptr<ThriftClientFactory> thrift_client_factory_;
+  std::unique_ptr<ThriftRouter> thrift_router_;
+
  public:
   StatsHolder* stats_;
+
+  ThriftRouter* getThriftRouter() const;
 
   friend class ProcessorImpl;
   std::unique_ptr<ProcessorImpl> impl_;
@@ -697,8 +625,7 @@ class Processor : public folly::enable_shared_from_this<Processor> {
   void
   setSequencerBatching(std::unique_ptr<SequencerBatching> sequencer_batching);
 
-  // SSL context fetcher, used to refresh certificate data
-  SSLFetcher& sslFetcher() const;
+  SSLSessionCache& sslSessionCache() const;
 
  private:
   const std::shared_ptr<TraceLogger> trace_logger_;
@@ -759,6 +686,13 @@ class Processor : public folly::enable_shared_from_this<Processor> {
 
   // Callback called when settings are update
   void onSettingsUpdated();
+
+ protected:
+  // A component that monitors TLS certificates and TLS ticket seeds and invokes
+  // the callbacks on SSLFetchers on workers.
+  std::unique_ptr<TLSCredMonitor> tls_cred_monitor_;
+
+  virtual void initTLSCredMonitor();
 };
 
 }} // namespace facebook::logdevice

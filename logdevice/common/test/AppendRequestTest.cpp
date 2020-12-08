@@ -12,12 +12,13 @@
 #include <folly/Memory.h>
 #include <gtest/gtest.h>
 
-#include "logdevice/common/Sender.h"
 #include "logdevice/common/SequencerRouter.h"
 #include "logdevice/common/StaticSequencerLocator.h"
 #include "logdevice/common/debug.h"
 #include "logdevice/common/protocol/APPENDED_Message.h"
 #include "logdevice/common/test/MockSequencerRouter.h"
+#include "logdevice/common/test/NodeSetTestUtil.h"
+#include "logdevice/common/test/SenderTestProxy.h"
 #include "logdevice/common/test/TestUtil.h"
 
 namespace facebook { namespace logdevice {
@@ -26,21 +27,20 @@ class MockAppendRequest : public AppendRequest {
  public:
   using MockSender = SenderTestProxy<MockAppendRequest>;
   MockAppendRequest(logid_t log_id,
-                    std::shared_ptr<Configuration> configuration,
+                    std::shared_ptr<const NodesConfiguration> nodes_config,
                     std::shared_ptr<SequencerLocator> locator,
                     ClusterState* cluster_state)
-      : AppendRequest(
-            nullptr,
-            log_id,
-            AppendAttributes(),
-            PayloadHolder(),
-            std::chrono::milliseconds(0),
-            append_callback_t(),
-            std::make_unique<MockSequencerRouter>(log_id,
-                                                  this,
-                                                  configuration->serverConfig(),
-                                                  locator,
-                                                  cluster_state)),
+      : AppendRequest(nullptr,
+                      log_id,
+                      AppendAttributes(),
+                      PayloadHolder(),
+                      std::chrono::milliseconds(0),
+                      append_callback_t(),
+                      std::make_unique<MockSequencerRouter>(log_id,
+                                                            this,
+                                                            nodes_config,
+                                                            locator,
+                                                            cluster_state)),
         settings_(create_default_settings<Settings>()) {
     dbg::assertOnData = true;
 
@@ -67,7 +67,7 @@ class MockAppendRequest : public AppendRequest {
     return true;
   }
 
-  int sendMessageImpl(std::unique_ptr<Message>&& /*msg*/,
+  int sendMessageImpl(std::unique_ptr<Message>&& message,
                       const Address& addr,
                       BWAvailableCallback*,
                       SocketCallback*) {
@@ -77,6 +77,7 @@ class MockAppendRequest : public AppendRequest {
       return -1;
     }
     dest_ = addr.id_.node_;
+    sent_message_ = std::move(message);
     return 0;
   }
 
@@ -86,8 +87,13 @@ class MockAppendRequest : public AppendRequest {
     return status_;
   }
 
+  Message* getSentMessage() const {
+    return sent_message_.get();
+  }
+
   NodeID dest_;
   Settings settings_;
+  std::unique_ptr<Message> sent_message_;
 };
 
 class AppendRequestTest : public ::testing::Test {
@@ -101,16 +107,12 @@ class AppendRequestTest : public ::testing::Test {
             size_t nlogs,
             LocatorType type = LocatorType::HASH_BASED) {
     auto simple_config = createSimpleConfig(nnodes, nlogs);
-    config_ = UpdateableConfig::createEmpty();
-    config_->updateableServerConfig()->update(simple_config->serverConfig());
-    config_->updateableLogsConfig()->update(simple_config->logsConfig());
+    config_ = std::make_shared<UpdateableConfig>(simple_config);
     cluster_state_ = std::make_unique<MockClusterState>(nnodes);
     switch (type) {
       case LocatorType::HASH_BASED:
         locator_ = std::make_unique<MockHashBasedSequencerLocator>(
-            config_->updateableServerConfig(),
-            cluster_state_.get(),
-            simple_config);
+            cluster_state_.get(), simple_config);
         break;
       case LocatorType::STATIC:
         locator_ = std::make_unique<StaticSequencerLocator>(config_);
@@ -119,8 +121,10 @@ class AppendRequestTest : public ::testing::Test {
   }
 
   std::unique_ptr<MockAppendRequest> create(logid_t log_id) {
-    return std::make_unique<MockAppendRequest>(
-        log_id, config_->get(), locator_, cluster_state_.get());
+    return std::make_unique<MockAppendRequest>(log_id,
+                                               config_->getNodesConfiguration(),
+                                               locator_,
+                                               cluster_state_.get());
   }
 
   bool isNodeAlive(NodeID node_id) {
@@ -266,18 +270,21 @@ TEST_F(AppendRequestTest, SequencerAffinityTest) {
   auto settings = create_default_settings<Settings>();
 
   // Config with 2 regions each with 1 node
-  config_ = std::make_shared<UpdateableConfig>(Configuration::fromJsonFile(
-      TEST_CONFIG_FILE("sequencer_affinity_2nodes.conf")));
+  auto nodes_config = std::make_shared<const NodesConfiguration>();
+  NodeSetTestUtil::addNodes(nodes_config, 1, 2, "rgn1.dc1.cl1.row1.rck1");
+  NodeSetTestUtil::addNodes(nodes_config, 1, 2, "rgn2.dc2.cl2.row2.rck2");
+
+  config_ = std::make_shared<UpdateableConfig>(
+      Configuration::fromJsonFile(
+          TEST_CONFIG_FILE("sequencer_affinity_2nodes.conf"))
+          ->withNodesConfiguration(std::move(nodes_config)));
 
   cluster_state_ = std::make_unique<MockClusterState>(
-      config_->getNodesConfigurationFromServerConfigSource()->clusterSize());
+      config_->getNodesConfiguration()->clusterSize());
 
   settings.use_sequencer_affinity = true;
   locator_ = std::make_unique<MockHashBasedSequencerLocator>(
-      config_->updateableServerConfig(),
-      cluster_state_.get(),
-      config_->get(),
-      settings);
+      cluster_state_.get(), config_->get(), settings);
 
   // Log with id 1 prefers rgn1. N0 is the only node in that region.
   auto rq = create(logid_t(1));
@@ -299,10 +306,7 @@ TEST_F(AppendRequestTest, SequencerAffinityTest) {
   // use-sequencer-affinity is false.
   settings.use_sequencer_affinity = false;
   locator_ = std::make_unique<MockHashBasedSequencerLocator>(
-      config_->updateableServerConfig(),
-      cluster_state_.get(),
-      config_->get(),
-      settings);
+      cluster_state_.get(), config_->get(), settings);
 
   rq = create(logid_t(2));
   ASSERT_EQ(Request::Execution::CONTINUE, rq->execute());
@@ -348,6 +352,50 @@ TEST_F(AppendRequestTest, ShouldAddStatAppendFail) {
             << "Enum val: " << enum_val;
     }
   }
+}
+
+// Checks that AppendRequest sets PAYLOAD_GROUP and BUFFERED_WRITER_BLOB
+// correctly on APPEND_Message
+TEST_F(AppendRequestTest, MessageFlags) {
+  init(4, 1);
+
+  std::unique_ptr<MockAppendRequest> request;
+  APPEND_Message* message;
+
+  // regular request
+  request = create(logid_t(1));
+  EXPECT_FALSE(request->getBufferedWriterBlobFlag());
+  EXPECT_FALSE(request->getPayloadGroupFlag());
+  ASSERT_EQ(Request::Execution::CONTINUE, request->execute());
+
+  message = dynamic_cast<APPEND_Message*>(request->getSentMessage());
+  ASSERT_NE(message, nullptr);
+  EXPECT_EQ(message->header_.flags & APPEND_Header::PAYLOAD_GROUP, 0);
+  EXPECT_EQ(message->header_.flags & APPEND_Header::BUFFERED_WRITER_BLOB, 0);
+
+  // buffered writer append request
+  request = create(logid_t(1));
+  request->setBufferedWriterBlobFlag();
+  EXPECT_TRUE(request->getBufferedWriterBlobFlag());
+  EXPECT_FALSE(request->getPayloadGroupFlag());
+  ASSERT_EQ(Request::Execution::CONTINUE, request->execute());
+
+  message = dynamic_cast<APPEND_Message*>(request->getSentMessage());
+  ASSERT_NE(message, nullptr);
+  EXPECT_EQ(message->header_.flags & APPEND_Header::PAYLOAD_GROUP, 0);
+  EXPECT_NE(message->header_.flags & APPEND_Header::BUFFERED_WRITER_BLOB, 0);
+
+  // payload group append request
+  request = create(logid_t(1));
+  request->setPayloadGroupFlag();
+  EXPECT_FALSE(request->getBufferedWriterBlobFlag());
+  EXPECT_TRUE(request->getPayloadGroupFlag());
+  ASSERT_EQ(Request::Execution::CONTINUE, request->execute());
+
+  message = dynamic_cast<APPEND_Message*>(request->getSentMessage());
+  ASSERT_NE(message, nullptr);
+  EXPECT_NE(message->header_.flags & APPEND_Header::PAYLOAD_GROUP, 0);
+  EXPECT_EQ(message->header_.flags & APPEND_Header::BUFFERED_WRITER_BLOB, 0);
 }
 
 }} // namespace facebook::logdevice

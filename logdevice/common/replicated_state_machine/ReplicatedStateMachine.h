@@ -465,9 +465,7 @@ class ReplicatedStateMachine {
 
   // Create a payload for a snapshot. The payload includes `data` serialized as
   // well as the version of that snapshot.
-  std::string createSnapshotPayload(const T& data,
-                                    lsn_t version,
-                                    bool rsm_include_read_pointer_in_snapshot);
+  std::string createSnapshotPayload(const T& data, lsn_t version);
 
   // Some metadata included inside delta records.
   struct DeltaHeader {
@@ -656,6 +654,8 @@ class ReplicatedStateMachine {
   const logid_t delta_log_id_;
   const logid_t snapshot_log_id_;
   lsn_t last_written_version_{LSN_INVALID};
+
+  folly::Optional<std::string> node_info;
 
   // Used by tests.
   boost::uuids::uuid last_uuid_;

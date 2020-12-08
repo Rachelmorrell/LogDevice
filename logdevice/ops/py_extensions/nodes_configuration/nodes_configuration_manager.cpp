@@ -12,7 +12,6 @@
 #include "logdevice/common/ThriftCodec.h"
 #include "logdevice/common/configuration/Configuration.h"
 #include "logdevice/common/configuration/ServerConfig.h"
-#include "logdevice/common/configuration/nodes/NodesConfigLegacyConverter.h"
 #include "logdevice/common/configuration/nodes/NodesConfigurationAPI.h"
 #include "logdevice/common/configuration/nodes/NodesConfigurationCodec.h"
 #include "logdevice/common/configuration/nodes/NodesConfigurationManagerFactory.h"
@@ -187,27 +186,6 @@ static void provision_empty_nodes_configuration(std::string config_json) {
   do_provision_write(*config, NodesConfiguration());
 }
 
-static void provision_initial_nodes_configuration(std::string config_json) {
-  // 1. Parse the passed config json
-  auto config = Configuration::fromJson(config_json, nullptr);
-  if (config == nullptr) {
-    auto exception = folly::sformat(
-        "Failed to parse config json: {}", errorStrings()[err].name);
-    throw_python_exception(parseException, object(exception.c_str()));
-  }
-  err = Status::OK;
-
-  // 2. Convert the ServerConfig into a NodesConfiguration
-  const auto& server_config = config->serverConfig();
-  auto nc = NodesConfigLegacyConverter::fromLegacyNodesConfig(
-      server_config->getNodesConfig(),
-      server_config->getMetaDataLogsConfig(),
-      server_config->getVersion());
-
-  // 3. Do the actual write
-  do_provision_write(*config, *nc);
-}
-
 static bool nodes_configuration_exists(std::string config_json) {
   // 1. Parse the passed config json
   auto config = Configuration::fromJson(config_json, nullptr);
@@ -228,65 +206,6 @@ static bool nodes_configuration_exists(std::string config_json) {
     throw_python_exception(apiException, object(exception.c_str()));
   }
   return status == Status::OK;
-}
-
-static std::string update_server_config_with_nodes_configuration(
-    std::string server_config_str,
-    std::string binary_nodes_configuration) {
-  auto config = Configuration::fromJson(server_config_str, nullptr);
-  if (config == nullptr) {
-    auto exception = folly::sformat(
-        "Failed to parse config json: {}", errorStrings()[err].name);
-    throw_python_exception(parseException, object(exception.c_str()));
-  }
-  err = Status::OK;
-
-  auto nc = nodes_configuration_from_string(binary_nodes_configuration);
-
-  NodesConfig nodes_config;
-  NodesConfigLegacyConverter::toLegacyNodesConfig(*nc, &nodes_config);
-
-  auto metadata_cfg = config->serverConfig()->getMetaDataLogsConfig();
-  NodesConfigLegacyConverter::toLegacyMetadataLogsConfig(*nc, metadata_cfg);
-
-  auto new_server_config = config->serverConfig()
-                               ->withNodes(std::move(nodes_config))
-                               ->withMetaDataLogsConfig(metadata_cfg);
-  return new_server_config->toString(
-      config->logsConfig().get(), config->zookeeperConfig().get());
-}
-
-static std::string normalize_server_config(std::string server_config_str) {
-  auto config = Configuration::fromJson(server_config_str, nullptr);
-  if (config == nullptr) {
-    auto exception = folly::sformat(
-        "Failed to parse config json: {}", errorStrings()[err].name);
-    throw_python_exception(parseException, object(exception.c_str()));
-  }
-  return config->toString();
-}
-
-static object
-nodes_configuration_from_server_config(std::string server_config_str) {
-  auto server_config = ServerConfig::fromJson(server_config_str);
-  if (server_config == nullptr) {
-    auto exception = folly::sformat(
-        "Failed to parse config binary: {}", errorStrings()[err].name);
-    throw_python_exception(
-        parseException, object("failed to parse server config json"));
-  }
-  err = Status::OK;
-
-  auto nc = NodesConfigLegacyConverter::fromLegacyNodesConfig(
-      server_config->getNodesConfig(),
-      server_config->getMetaDataLogsConfig(),
-      server_config->getVersion());
-
-  auto nc_thrift = NodesConfigurationThriftConverter::toThrift(*nc);
-  auto nc_str = ThriftCodec::serialize<BinarySerializer>(nc_thrift);
-
-  return object(
-      handle<>(PyBytes_FromStringAndSize(nc_str.c_str(), nc_str.size())));
 }
 
 }}}} // namespace facebook::logdevice::configuration::nodes
@@ -341,45 +260,6 @@ BOOST_PYTHON_MODULE(nodes_configuration_manager) {
 
   )");
 
-  def("update_server_config_with_nodes_configuration",
-      update_server_config_with_nodes_configuration,
-      R"(
-    Returns a JSON ServerConfig that's the result of merging the passed
-    JSON ServerConfig with the the passed binary NodesConfiguration.
-
-    @param server_config_str: The JSON serialized ServerConfig
-
-    @param binary_nodes_configuration: The binary serialized NodesConfiguration
-
-    @raises NodesConfigurationManagerParseException if either the ServerConfig
-      or the NodesConfiguration are not parsable.
-  )");
-
-  def("normalize_server_config",
-      normalize_server_config,
-      R"(
-    Reserializes the passed server config with the cpp ServerConfig serializer
-    to allow cleaner comparison with other cpp serialized server configs (e.g.
-    the one returned by update_server_config_with_nodes_configuration).
-
-    @param server_config_str: The JSON serialized ServerConfig
-
-    @raises NodesConfigurationManagerParseException if the ServerConfig is not
-      parsable.
-  )");
-
-  def("nodes_configuration_from_server_config",
-      nodes_configuration_from_server_config,
-      R"(
-    Returns a binary serialized NodesConfiguration that's extracted from the
-    passed JSON ServerConfig.
-
-    @param server_config_str: The JSON serialized ServerConfig
-
-    @raises NodesConfigurationManagerParseException if either the ServerConfig
-      is not parsable.
-  )");
-
   def("provision_empty_nodes_configuration",
       provision_empty_nodes_configuration,
       R"(
@@ -396,34 +276,12 @@ BOOST_PYTHON_MODULE(nodes_configuration_manager) {
       fails or if it fails to create the NodesConfigurationStore.
   )");
 
-  def("provision_initial_nodes_configuration",
-      provision_initial_nodes_configuration,
-      R"(
-
-    Bootstraps the initial NodesConfigurationStore (e.g. creates znode / file)
-    and then writes the initial NodesConfiguration from a ServerConfig. It's
-    intended to be used during the migration period to move clusters to the NC
-    for the first time. When all the clusters are on NC and new clusters are
-    turned up with NC enabled, this binding will be removed.
-
-    @param server_config_str: The JSON serialized ServerConfig
-
-
-    @raises NodesConfigurationManagerParseException if either the ServerConfig
-      or the NodesConfiguration are not parsable.
-
-    @raises NodesConfigurationManagerApiException when the provision operation
-      fails or if it fails to create the NodesConfigurationStore.
-
-  )");
-
   def("nodes_configuration_exists",
       nodes_configuration_exists,
       R"(
     Check if the NodesConfiguration exists in zookeeper or not.
 
     @param server_config_str: The JSON serialized ServerConfig
-
 
     @raises NodesConfigurationManagerParseException if either the ServerConfig
       is not parsable.

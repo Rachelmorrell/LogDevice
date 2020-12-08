@@ -60,6 +60,7 @@ class HistogramInterface;
 struct ClientHistograms;
 struct PerShardHistograms;
 struct ServerHistograms;
+struct PerMonitoringTagHistograms;
 
 /**
  * How to combine two Stats objects.
@@ -169,11 +170,14 @@ struct PerTrafficClassStats {
 #include "logdevice/common/stats/per_traffic_class_stats.inc" // nolint
 };
 
-struct PerMonitoringTierStats {
+struct PerMonitoringTagStats {
+  PerMonitoringTagStats();
+  PerMonitoringTagStats(const PerMonitoringTagStats&);
+
   /**
    * Add values from @param other.
    */
-  void aggregate(PerMonitoringTierStats const& other,
+  void aggregate(PerMonitoringTagStats const& other,
                  StatsAggOptional agg_override);
 
   /**
@@ -182,7 +186,9 @@ struct PerMonitoringTierStats {
   void reset();
 
 #define STAT_DEFINE(name, _) StatsCounter name{};
-#include "logdevice/common/stats/per_monitoring_tier_stats.inc" // nolint
+#include "logdevice/common/stats/per_monitoring_tag_stats.inc" // nolint
+
+  std::unique_ptr<PerMonitoringTagHistograms> histograms;
 };
 
 struct PerShapingPriorityStats {
@@ -661,9 +667,9 @@ struct Stats final {
   std::array<PerTrafficClassStats, static_cast<int>(TrafficClass::MAX)>
       per_traffic_class_stats = {};
 
-  // per-monitoring tier stats
-  std::array<PerMonitoringTierStats, static_cast<int>(MonitoringTier::MAX)>
-      per_monitoring_tier_stats;
+  // per-monitoring tag stats
+  folly::Synchronized<folly::F14FastMap<std::string, PerMonitoringTagStats>>
+      per_monitoring_tag_stats;
 
   // per-flow group stats
   // For Network Traffic Shaping
@@ -817,9 +823,9 @@ class Stats::EnumerationCallbacks {
                     NodeLocationScope flow_group,
                     Priority,
                     int64_t val) = 0;
-  virtual void stat(const std::string& name,
-                    MonitoringTier monitoring_tier,
-                    int64_t val) = 0;
+  virtual void statWithTag(const std::string& name,
+                           const std::string& tag,
+                           int64_t val) = 0;
   // Per-msg-priority stats (totals of the previous one).
   virtual void stat(const std::string& name, Priority, int64_t val) = 0;
   // Per-request-type stats.
@@ -843,6 +849,9 @@ class Stats::EnumerationCallbacks {
   virtual void histogram(const std::string& name,
                          shard_index_t shard,
                          const HistogramInterface& hist) = 0;
+  virtual void histogramWithTag(const std::string& name,
+                                const std::string& tag,
+                                const HistogramInterface& hist) = 0;
 };
 
 /**
@@ -1233,6 +1242,18 @@ class PerShardStatToken {
     }                                                                         \
   } while (0)
 
+#define TAGGED_HISTOGRAM_ADD(stats_struct, name, tags, usecs)   \
+  do {                                                          \
+    if (stats_struct) {                                         \
+      for (const auto& tag : tags) {                            \
+        stats_struct->get().per_monitoring_tag_stats.withWLock( \
+            [&tag, val = (usecs)](auto& stats) {                \
+              stats[tag].histograms->name.add(val);             \
+            });                                                 \
+      }                                                         \
+    }                                                           \
+  } while (0);
+
 #define HISTOGRAM_ADD(stats_struct, name, usecs)                   \
   do {                                                             \
     if (stats_struct && (stats_struct)->get().server_histograms) { \
@@ -1378,22 +1399,27 @@ class PerShardStatToken {
     }                                                             \
   } while (0)
 
-#define MONITORING_TIER_STAT_ADD(stats_struct, monitoring_tier, name, value)  \
-  do {                                                                        \
-    if (stats_struct) {                                                       \
-      auto& stats =                                                           \
-          stats_struct->get().per_monitoring_tier_stats[static_cast<uint8_t>( \
-              monitoring_tier)];                                              \
-      stats.name += value;                                                    \
-    }                                                                         \
-    STAT_ADD(stats_struct, name, value);                                      \
+#define TAGGED_STAT_ADD(stats_struct_expr, tags, name, value) \
+  do {                                                        \
+    auto val = (value);                                       \
+    const auto& tags_ref = (tags);                            \
+    auto* stats_struct = (stats_struct_expr);                 \
+    if (stats_struct) {                                       \
+      stats_struct->get().per_monitoring_tag_stats.withWLock( \
+          [&tags_ref, &val](auto& stats) {                    \
+            for (auto& tag : tags_ref) {                      \
+              stats[tag].name += val;                         \
+            }                                                 \
+          });                                                 \
+    }                                                         \
+    STAT_ADD(stats_struct, name, val);                        \
   } while (0)
 
-#define MONITORING_TIER_STAT_INCR(stats_struct, monitoring_tier, name) \
-  MONITORING_TIER_STAT_ADD(stats_struct, monitoring_tier, name, +1);
+#define TAGGED_STAT_INCR(stats_struct, tags, name) \
+  TAGGED_STAT_ADD(stats_struct, tags, name, +1);
 
-#define MONITORING_TIER_STAT_DECR(stats_struct, monitoring_tier, name) \
-  MONITORING_TIER_STAT_ADD(stats_struct, monitoring_tier, name, -1);
+#define TAGGED_STAT_DECR(stats_struct, tags, name) \
+  TAGGED_STAT_ADD(stats_struct, tags, name, -1);
 
 // expects name to be {AppendSuccess, AppendFail}
 #define PER_NODE_STAT_ADD(stats_struct, node_id, name)                  \

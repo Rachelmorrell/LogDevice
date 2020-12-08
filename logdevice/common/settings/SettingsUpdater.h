@@ -50,9 +50,9 @@ class SettingsUpdater {
   // from the other sources according to precedence rules.
   enum class Source {
     INTERNAL = 0,
-    CLI,
     CLIENT,
     CONFIG,
+    CLI,
     ADMIN_OVERRIDE,
     CURRENT
   };
@@ -102,6 +102,12 @@ class SettingsUpdater {
    * @return Settings documentation in Markdown
    */
   std::string markdownDoc(bool include_deprecated = false) const;
+
+  /**
+   * @return a JSON structure describing all settings.
+   * @return JSON structure.
+   */
+  std::string jsonConfigSchema() const;
 
   /**
    * Register a new bundle to contain settings to be updated by this object.

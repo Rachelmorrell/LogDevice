@@ -90,8 +90,8 @@ void SyncCheckpointedReaderImpl::waitOnlyWhenNoData() {
   reader_->waitOnlyWhenNoData();
 }
 
-void SyncCheckpointedReaderImpl::setMonitoringTier(MonitoringTier tier) {
-  reader_->setMonitoringTier(tier);
+void SyncCheckpointedReaderImpl::addMonitoringTag(std::string tag) {
+  reader_->addMonitoringTag(std::move(tag));
 }
 
 void SyncCheckpointedReaderImpl::withoutPayload() {
@@ -116,6 +116,10 @@ int SyncCheckpointedReaderImpl::isConnectionHealthy(logid_t log_id) const {
 
 void SyncCheckpointedReaderImpl::doNotDecodeBufferedWrites() {
   reader_->doNotDecodeBufferedWrites();
+}
+
+void SyncCheckpointedReaderImpl::setReaderName(const std::string& reader_name) {
+  reader_->setReaderName(reader_name);
 }
 
 }} // namespace facebook::logdevice

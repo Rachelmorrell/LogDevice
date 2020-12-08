@@ -8,7 +8,7 @@ include(ExternalProject)
 
 ExternalProject_Add(fmt
     GIT_REPOSITORY https://github.com/fmtlib/fmt.git
-    GIT_TAG 5.3.0
+    GIT_TAG 6.2.1
     PREFIX "${CMAKE_CURRENT_BINARY_DIR}"
     SOURCE_DIR "${CMAKE_CURRENT_BINARY_DIR}/external/fmt"
     CMAKE_ARGS -DCMAKE_POSITION_INDEPENDENT_CODE=True
@@ -16,7 +16,7 @@ ExternalProject_Add(fmt
         -DCMAKE_CXX_STANDARD=17
         -DCMAKE_PREFIX_PATH=${LOGDEVICE_STAGING_DIR}/usr/local
         -DFMT_TEST=OFF
-    INSTALL_COMMAND make install DESTDIR=${LOGDEVICE_STAGING_DIR}
+    INSTALL_COMMAND $(MAKE) install DESTDIR=${LOGDEVICE_STAGING_DIR}
     )
 
 # Specify include dir

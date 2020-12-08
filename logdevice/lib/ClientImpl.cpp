@@ -26,7 +26,7 @@
 #include "logdevice/common/GetHeadAttributesRequest.h"
 #include "logdevice/common/LogsConfigApiRequest.h"
 #include "logdevice/common/NoopTraceLogger.h"
-#include "logdevice/common/PrincipalParser.h"
+#include "logdevice/common/PayloadGroupCodec.h"
 #include "logdevice/common/Processor.h"
 #include "logdevice/common/ReaderImpl.h"
 #include "logdevice/common/Semaphore.h"
@@ -176,7 +176,7 @@ ClientImpl::ClientImpl(std::string cluster_name,
       throw ConstructorFailed();
     }
 
-    auto initial_nc = processor_->config_->getNodesConfigurationFromNCMSource();
+    auto initial_nc = processor_->config_->getNodesConfiguration();
     if (!initial_nc) {
       // Currently this should only happen in tests as our boostrapping
       // workflow should always ensure the Processor has a valid
@@ -369,6 +369,24 @@ int ClientImpl::append(logid_t logid,
   return postAppend(std::move(req));
 }
 
+int ClientImpl::append(logid_t logid,
+                       PayloadGroup&& payload_group,
+                       append_callback_t cb,
+                       AppendAttributes attrs,
+                       worker_id_t target_worker,
+                       std::unique_ptr<std::string> per_request_token) {
+  auto req = prepareRequest(logid,
+                            std::move(payload_group),
+                            std::move(cb),
+                            std::move(attrs),
+                            target_worker,
+                            std::move(per_request_token));
+  if (!req) {
+    return -1;
+  }
+  return postAppend(std::move(req));
+}
+
 std::pair<Status, NodeID> ClientImpl::appendBuffered(
     logid_t logid,
     const BufferedWriter::AppendCallback::ContextSet&,
@@ -552,6 +570,18 @@ int ClientImpl::append(logid_t logid,
   return append(logid, payload, cb, std::move(attrs), worker_id_t{-1}, nullptr);
 }
 
+int ClientImpl::append(logid_t logid,
+                       PayloadGroup&& payload_group,
+                       append_callback_t cb,
+                       AppendAttributes attrs) noexcept {
+  return append(logid,
+                std::move(payload_group),
+                cb,
+                std::move(attrs),
+                worker_id_t{-1},
+                nullptr);
+}
+
 lsn_t ClientImpl::appendSync(logid_t logid,
                              const Payload& payload,
                              AppendAttributes attrs,
@@ -565,6 +595,16 @@ lsn_t ClientImpl::appendSync(logid_t logid,
                              std::chrono::milliseconds* ts) noexcept {
   return append_sync_helper(
       this, logid, std::move(payload), std::move(attrs), ts);
+}
+
+lsn_t ClientImpl::appendSync(logid_t logid,
+                             PayloadGroup&& payload_group,
+                             AppendAttributes attrs,
+                             std::chrono::milliseconds* ts) noexcept {
+  // TODO this consumes payload_group in case of failure. should return it to
+  // the caller?
+  return append_sync_helper(
+      this, logid, std::move(payload_group), std::move(attrs), ts);
 }
 
 std::unique_ptr<Reader> ClientImpl::createReader(size_t max_logs,
@@ -582,19 +622,6 @@ ClientImpl::createAsyncReader(ssize_t buffer_size) noexcept {
   return std::make_unique<AsyncReaderImpl>(shared_from_this(), buffer_size);
 }
 
-static std::string get_full_name(const std::string& name,
-                                 const Configuration& config,
-                                 const ClientSettingsImpl& settings) {
-  // If the name starts with a delimiter, we don't use the default namespace
-  std::string delim = config.logsConfig()->getNamespaceDelimiter();
-  if (name.size() > 0 && name.compare(0, delim.size(), delim) == 0) {
-    return name;
-  } else {
-    return config.logsConfig()->getNamespacePrefixedLogRangeName(
-        settings.getSettings()->default_log_namespace, name);
-  }
-}
-
 logid_range_t ClientImpl::getLogRangeByName(const std::string& name) noexcept {
   if (ThreadID::isWorker()) {
     ld_error("Synchronous methods for fetching log configuration should not "
@@ -604,15 +631,13 @@ logid_range_t ClientImpl::getLogRangeByName(const std::string& name) noexcept {
     return logid_range_t(logid_t(0), logid_t(0));
   }
 
-  std::string full_name = get_full_name(name, *config_->get(), *settings_);
-  return config_->get()->logsConfig()->getLogRangeByName(full_name);
+  return config_->get()->logsConfig()->getLogRangeByName(name);
 }
 
 void ClientImpl::getLogRangeByName(
     const std::string& name,
     get_log_range_by_name_callback_t cb) noexcept {
-  std::string full_name = get_full_name(name, *config_->get(), *settings_);
-  config_->get()->logsConfig()->getLogRangeByNameAsync(full_name, cb);
+  config_->get()->logsConfig()->getLogRangeByNameAsync(name, cb);
 }
 
 std::string ClientImpl::getLogNamespaceDelimiter() noexcept {
@@ -629,20 +654,17 @@ ClientImpl::getLogRangesByNamespace(const std::string& ns) noexcept {
     return {};
   }
 
-  auto full_ns = get_full_name(ns, *config_->get(), *settings_);
-  return config_->get()->logsConfig()->getLogRangesByNamespace(full_ns);
+  return config_->get()->logsConfig()->getLogRangesByNamespace(ns);
 }
 
 void ClientImpl::getLogRangesByNamespace(
     const std::string& ns,
     get_log_ranges_by_namespace_callback_t cb) noexcept {
-  auto full_ns = get_full_name(ns, *config_->get(), *settings_);
-  config_->get()->logsConfig()->getLogRangesByNamespaceAsync(full_ns, cb);
+  config_->get()->logsConfig()->getLogRangesByNamespaceAsync(ns, cb);
 }
 
 std::unique_ptr<client::LogGroup>
 ClientImpl::getLogGroupSync(const std::string& name) noexcept {
-  auto full_ns = get_full_name(name, *config_->get(), *settings_);
   if (ThreadID::isWorker()) {
     ld_error("Synchronous methods for fetching log configuration should not "
              "be called from worker threads on the client.");
@@ -659,7 +681,7 @@ ClientImpl::getLogGroupSync(const std::string& name) noexcept {
     sem.post();
   };
 
-  getLogGroup(full_ns, cb);
+  getLogGroup(name, cb);
 
   sem.wait();
   if (status != E::OK) {
@@ -693,14 +715,13 @@ void ClientImpl::getLocalLogGroup(const std::string& path,
 
 void ClientImpl::getLogGroup(const std::string& path,
                              get_log_group_callback_t cb) noexcept {
-  auto full_ns = get_full_name(path, *config_->get(), *settings_);
   if (hasFullyLoadedLocalLogsConfig()) {
-    getLocalLogGroup(full_ns, std::move(cb));
+    getLocalLogGroup(path, std::move(cb));
     return;
   }
   std::string delimiter =
       config_->get()->serverConfig()->getNamespaceDelimiter();
-  auto callback = [cb, full_ns, delimiter](
+  auto callback = [cb, path, delimiter](
                       Status st, uint64_t config_version, std::string payload) {
     if (st == E::OK) {
       ld_check(payload.size() > 0);
@@ -716,7 +737,7 @@ void ClientImpl::getLogGroup(const std::string& path,
       }
       std::unique_ptr<client::LogGroupImpl> lg =
           std::make_unique<client::LogGroupImpl>(
-              std::move(recovered_lg), full_ns, config_version);
+              std::move(recovered_lg), path, config_version);
       cb(st, std::move(lg));
     } else {
       cb(st, nullptr);
@@ -725,7 +746,7 @@ void ClientImpl::getLogGroup(const std::string& path,
 
   std::unique_ptr<Request> req = std::make_unique<LogsConfigApiRequest>(
       LOGS_CONFIG_API_Header::Type::GET_LOG_GROUP_BY_NAME,
-      full_ns,
+      path,
       settings_->getSettings()->logsconfig_timeout.value_or(timeout_),
       LogsConfigApiRequest::MAX_ERRORS,
       logsconfig_api_random_seed_,
@@ -833,14 +854,13 @@ int ClientImpl::makeDirectory(const std::string& path,
                               bool mk_intermediate_dirs,
                               const client::LogAttributes& attrs,
                               make_directory_callback_t cb) noexcept {
-  auto full_ns = get_full_name(path, *config_->get(), *settings_);
   std::string delimiter =
       config_->get()->serverConfig()->getNamespaceDelimiter();
   // create the payload
   logsconfig::DeltaHeader header; // Resolution is Auto by default
   logsconfig::MkDirectoryDelta delta{header, path, mk_intermediate_dirs, attrs};
 
-  auto callback = [cb, full_ns, delimiter](
+  auto callback = [cb, path, delimiter](
                       Status st, uint64_t config_version, std::string payload) {
     if (st == E::OK) {
       // deserialize the payload
@@ -854,7 +874,7 @@ int ClientImpl::makeDirectory(const std::string& path,
       }
       std::unique_ptr<client::DirectoryImpl> dir =
           std::make_unique<client::DirectoryImpl>(
-              *recovered_dir, nullptr, full_ns, delimiter, config_version);
+              *recovered_dir, nullptr, path, delimiter, config_version);
       cb(st, std::move(dir), "");
     } else {
       // payload has the failure reason
@@ -918,7 +938,6 @@ ClientImpl::makeDirectorySync(const std::string& path,
 int ClientImpl::removeDirectory(const std::string& path,
                                 bool recursive,
                                 logsconfig_status_callback_t cb) noexcept {
-  auto full_ns = get_full_name(path, *config_->get(), *settings_);
   std::string delimiter = config_->get()->logsConfig()->getNamespaceDelimiter();
   // create the payload
   logsconfig::DeltaHeader header; // Resolution is Auto by default
@@ -1002,7 +1021,6 @@ bool ClientImpl::removeLogGroupSync(const std::string& path,
 
 int ClientImpl::removeLogGroup(const std::string& path,
                                logsconfig_status_callback_t cb) noexcept {
-  auto full_ns = get_full_name(path, *config_->get(), *settings_);
   std::string delimiter = config_->get()->logsConfig()->getNamespaceDelimiter();
   // create the payload
   logsconfig::DeltaHeader header; // Resolution is Auto by default
@@ -1034,12 +1052,9 @@ int ClientImpl::removeLogGroup(const std::string& path,
 int ClientImpl::rename(const std::string& from_path,
                        const std::string& to_path,
                        logsconfig_status_callback_t cb) noexcept {
-  auto source_full_ns = get_full_name(from_path, *config_->get(), *settings_);
-  auto dest_full_ns = get_full_name(to_path, *config_->get(), *settings_);
-  std::string delimiter = config_->get()->logsConfig()->getNamespaceDelimiter();
   // create the payload
   logsconfig::DeltaHeader header; // Resolution is Auto by default
-  logsconfig::RenameDelta delta{header, source_full_ns, dest_full_ns};
+  logsconfig::RenameDelta delta{header, from_path, to_path};
 
   auto callback = [cb](
                       Status st, uint64_t version, std::string failure_reason) {
@@ -1102,7 +1117,6 @@ int ClientImpl::makeLogGroup(const std::string& path,
                              const client::LogAttributes& attrs,
                              bool mk_intermediate_dirs,
                              make_log_group_callback_t cb) noexcept {
-  auto full_ns = get_full_name(path, *config_->get(), *settings_);
   std::string delimiter =
       config_->get()->serverConfig()->getNamespaceDelimiter();
   // create the payload
@@ -1110,7 +1124,7 @@ int ClientImpl::makeLogGroup(const std::string& path,
   logsconfig::MkLogGroupDelta delta{
       header, path, range, mk_intermediate_dirs, attrs};
 
-  auto callback = [cb, full_ns, delimiter](
+  auto callback = [cb, path, delimiter](
                       Status st, uint64_t config_version, std::string payload) {
     if (st == E::OK) {
       // deserialize the payload
@@ -1126,7 +1140,7 @@ int ClientImpl::makeLogGroup(const std::string& path,
       }
       std::unique_ptr<client::LogGroupImpl> lg =
           std::make_unique<client::LogGroupImpl>(
-              std::move(recovered_log_group), full_ns, config_version);
+              std::move(recovered_log_group), path, config_version);
       cb(st, std::move(lg), "");
     } else {
       // payload contains the failure reason.
@@ -1191,13 +1205,12 @@ ClientImpl::makeLogGroupSync(const std::string& path,
 int ClientImpl::setAttributes(const std::string& path,
                               const client::LogAttributes& attrs,
                               logsconfig_status_callback_t cb) noexcept {
-  auto full_ns = get_full_name(path, *config_->get(), *settings_);
   std::string delimiter = config_->get()->logsConfig()->getNamespaceDelimiter();
   // create the payload
   logsconfig::DeltaHeader header; // Resolution is Auto by default
   logsconfig::SetAttributesDelta delta{header, path, attrs};
 
-  auto callback = [cb, full_ns, delimiter](
+  auto callback = [cb, path, delimiter](
                       Status st, uint64_t version, std::string failure_reason) {
     cb(st, version, failure_reason);
   };
@@ -1256,13 +1269,12 @@ bool ClientImpl::setAttributesSync(const std::string& path,
 int ClientImpl::setLogGroupRange(const std::string& path,
                                  const logid_range_t& range,
                                  logsconfig_status_callback_t cb) noexcept {
-  auto full_ns = get_full_name(path, *config_->get(), *settings_);
   std::string delimiter = config_->get()->logsConfig()->getNamespaceDelimiter();
   // create the payload
   logsconfig::DeltaHeader header; // Resolution is Auto by default
   logsconfig::SetLogRangeDelta delta{header, path, range};
 
-  auto callback = [cb, full_ns, delimiter](
+  auto callback = [cb, path, delimiter](
                       Status st, uint64_t version, std::string failure_reason) {
     cb(st, version, std::move(failure_reason));
   };
@@ -1340,13 +1352,12 @@ int ClientImpl::getLocalDirectory(const std::string& path,
 
 int ClientImpl::getDirectory(const std::string& path,
                              get_directory_callback_t cb) noexcept {
-  auto full_ns = get_full_name(path, *config_->get(), *settings_);
   if (hasFullyLoadedLocalLogsConfig()) {
-    return getLocalDirectory(full_ns, std::move(cb));
+    return getLocalDirectory(path, std::move(cb));
   }
   std::string delimiter =
       config_->get()->serverConfig()->getNamespaceDelimiter();
-  auto callback = [cb, full_ns, delimiter](
+  auto callback = [cb, path, delimiter](
                       Status st, uint64_t config_version, std::string payload) {
     if (st == E::OK) {
       // deserialize the payload
@@ -1359,7 +1370,7 @@ int ClientImpl::getDirectory(const std::string& path,
       }
       std::unique_ptr<client::DirectoryImpl> dir =
           std::make_unique<client::DirectoryImpl>(
-              *recovered_dir, nullptr, full_ns, delimiter, config_version);
+              *recovered_dir, nullptr, path, delimiter, config_version);
       cb(st, std::move(dir));
     } else {
       cb(st, nullptr);
@@ -1368,7 +1379,7 @@ int ClientImpl::getDirectory(const std::string& path,
 
   std::unique_ptr<Request> req = std::make_unique<LogsConfigApiRequest>(
       LOGS_CONFIG_API_Header::Type::GET_DIRECTORY,
-      full_ns,
+      path,
       settings_->getSettings()->logsconfig_timeout.value_or(timeout_),
       LogsConfigApiRequest::MAX_ERRORS,
       logsconfig_api_random_seed_,
@@ -2246,6 +2257,58 @@ ClientImpl::prepareRequest(logid_t logid,
     return nullptr;
   }
 
+  return createRequest(logid,
+                       std::move(payload),
+                       std::move(cb),
+                       std::move(attrs),
+                       target_worker,
+                       std::move(per_request_token));
+}
+
+std::unique_ptr<AppendRequest>
+ClientImpl::prepareRequest(logid_t logid,
+                           PayloadGroup&& payload_group,
+                           append_callback_t cb,
+                           AppendAttributes attrs,
+                           worker_id_t target_worker,
+                           std::unique_ptr<std::string> per_request_token) {
+  folly::IOBufQueue queue;
+  PayloadGroupCodec::encode(payload_group, queue);
+  auto iobuf = queue.moveAsValue();
+  if (!checkAppend(logid, iobuf.computeChainDataLength())) {
+    return nullptr;
+  }
+
+  // TODO remove coalesce once PayloadHolder supports chained IOBufs
+  iobuf.coalesceWithHeadroomTailroom(0, 0);
+  auto req = createRequest(
+      logid,
+      PayloadHolder{std::move(iobuf)},
+      [cb = std::move(cb), payload_group = std::move(payload_group)](
+          Status st, const DataRecord& r) mutable {
+        // pass PayloadGroup ownership back to the caller
+        DataRecord record{r.logid,
+                          std::move(payload_group),
+                          r.attrs.lsn,
+                          r.attrs.timestamp,
+                          r.attrs.batch_offset,
+                          r.attrs.offsets};
+        cb(st, record);
+      },
+      std::move(attrs),
+      target_worker,
+      std::move(per_request_token));
+  req->setPayloadGroupFlag();
+  return req;
+}
+
+std::unique_ptr<AppendRequest>
+ClientImpl::createRequest(logid_t logid,
+                          PayloadHolder&& payload,
+                          append_callback_t cb,
+                          AppendAttributes attrs,
+                          worker_id_t target_worker,
+                          std::unique_ptr<std::string> per_request_token) {
   auto req = std::make_unique<AppendRequest>(
       bridge_.get(),
       logid,

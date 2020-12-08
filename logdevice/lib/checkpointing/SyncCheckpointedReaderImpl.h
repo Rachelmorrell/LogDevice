@@ -46,7 +46,7 @@ class SyncCheckpointedReaderImpl : public SyncCheckpointedReader {
 
   void waitOnlyWhenNoData() override;
 
-  void setMonitoringTier(MonitoringTier tier) override;
+  void addMonitoringTag(std::string) override;
 
   void withoutPayload() override;
 
@@ -59,6 +59,8 @@ class SyncCheckpointedReaderImpl : public SyncCheckpointedReader {
   int isConnectionHealthy(logid_t) const override;
 
   void doNotDecodeBufferedWrites() override;
+
+  void setReaderName(const std::string& reader_name) override;
 
  private:
   std::unique_ptr<Reader> reader_;

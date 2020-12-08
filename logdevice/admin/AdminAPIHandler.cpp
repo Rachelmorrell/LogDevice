@@ -15,6 +15,7 @@
 #include <thrift/lib/cpp/util/EnumUtils.h>
 
 #include "logdevice/admin/Conv.h"
+#include "logdevice/admin/SettingOverrideTTLRequest.h"
 #include "logdevice/admin/maintenance/ClusterMaintenanceStateMachine.h"
 #include "logdevice/admin/safety/SafetyChecker.h"
 #include "logdevice/common/BuildInfo.h"
@@ -29,7 +30,10 @@
 
 namespace facebook { namespace logdevice {
 
+using fb_status = facebook::fb303::cpp2::fb_status;
+
 AdminAPIHandler::AdminAPIHandler(
+    const std::string& service_name,
     Processor* processor,
     std::shared_ptr<SettingsUpdater> settings_updater,
     UpdateableSettings<ServerSettings> updateable_server_settings,
@@ -40,36 +44,9 @@ AdminAPIHandler::AdminAPIHandler(
                           std::move(updateable_server_settings),
                           std::move(updateable_admin_server_settings),
                           stats_holder),
-      facebook::fb303::FacebookBase2("LogDevice Admin API Service") {
-  start_time_ = std::chrono::steady_clock::now();
+      LogDeviceThriftHandler(service_name, processor) {
   safety_checker_ = std::make_shared<SafetyChecker>(processor_);
   safety_checker_->useAdminSettings(updateable_admin_server_settings_);
-}
-
-facebook::fb303::cpp2::fb_status AdminAPIHandler::getStatus() {
-  // Given that this thrift / Admin API service is started as soon as we
-  // start accepting connections, the service can only be:
-  // - ALIVE
-  // - STOPPING
-  if (processor_->isShuttingDown()) {
-    return facebook::fb303::cpp2::fb_status::STOPPING;
-  } else if (!processor_->isLogsConfigLoaded()) {
-    return facebook::fb303::cpp2::fb_status::STARTING;
-  } else {
-    return facebook::fb303::cpp2::fb_status::ALIVE;
-  }
-}
-
-void AdminAPIHandler::getVersion(std::string& _return) {
-  auto build_info = processor_->getPluginRegistry()->getSinglePlugin<BuildInfo>(
-      PluginType::BUILD_INFO);
-  _return = build_info->version();
-}
-
-int64_t AdminAPIHandler::aliveSince() {
-  auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
-      std::chrono::steady_clock::now() - start_time_);
-  return uptime.count();
 }
 
 void AdminAPIHandler::getLogTreeInfo(thrift::LogTreeInfo& response) {
@@ -79,6 +56,20 @@ void AdminAPIHandler::getLogTreeInfo(thrift::LogTreeInfo& response) {
   response.set_num_logs(logsconfig->size());
   response.set_max_backlog_seconds(logsconfig->getMaxBacklogDuration().count());
   response.set_is_fully_loaded(logsconfig->isFullyLoaded());
+}
+
+fb_status AdminAPIHandler::getStatus() {
+  ShardedRocksDBLocalLogStore* sharded_store =
+      AdminAPIHandlerBase::sharded_store_;
+  if (sharded_store != nullptr) {
+    for (int i = 0; i < sharded_store->numShards(); ++i) {
+      LocalLogStore* local_log_store = sharded_store->getByIndex(i);
+      if (local_log_store != nullptr && local_log_store->inFailSafeMode()) {
+        return fb_status::WARNING;
+      }
+    }
+  }
+  return LogDeviceThriftHandler::getStatus();
 }
 
 void AdminAPIHandler::getReplicationInfo(thrift::ReplicationInfo& response) {
@@ -128,25 +119,91 @@ void AdminAPIHandler::getSettings(
           .value_or("");
     };
     thrift::Setting s;
-    s.currentValue = get(SettingsUpdater::Source::CURRENT);
-    s.defaultValue = folly::join(" ", setting.second.descriptor.default_value);
+    *s.currentValue_ref() = get(SettingsUpdater::Source::CURRENT);
+    *s.defaultValue_ref() =
+        folly::join(" ", setting.second.descriptor.default_value);
 
     std::string cli = get(SettingsUpdater::Source::CLI);
     std::string config = get(SettingsUpdater::Source::CONFIG);
     std::string admin_cmd = get(SettingsUpdater::Source::ADMIN_OVERRIDE);
 
     if (!cli.empty()) {
-      s.sources[thrift::SettingSource::CLI] = std::move(cli);
+      s.sources_ref()[thrift::SettingSource::CLI] = std::move(cli);
     }
     if (!config.empty()) {
-      s.sources[thrift::SettingSource::CONFIG] = std::move(config);
+      s.sources_ref()[thrift::SettingSource::CONFIG] = std::move(config);
     }
     if (!admin_cmd.empty()) {
-      s.sources[thrift::SettingSource::ADMIN_OVERRIDE] = std::move(admin_cmd);
+      s.sources_ref()[thrift::SettingSource::ADMIN_OVERRIDE] =
+          std::move(admin_cmd);
     }
 
-    response.settings[setting.first] = std::move(s);
+    response.settings_ref()[setting.first] = std::move(s);
   }
+}
+
+folly::SemiFuture<folly::Unit>
+logdevice::AdminAPIHandler::semifuture_applySettingOverride(
+    std::unique_ptr<thrift::ApplySettingOverrideRequest> request) {
+  folly::Promise<folly::Unit> p;
+  auto future = p.getSemiFuture();
+
+  // Validate request
+  if (*request->ttl_seconds_ref() <= 0) {
+    p.setException(thrift::InvalidRequest("TTL must be > 0 seconds"));
+    return future;
+  }
+
+  try {
+    // Apply the temporary setting
+    settings_updater_->setFromAdminCmd(
+        *request->name_ref(), *request->value_ref());
+
+    // Post a request to unset the setting after ttl expires.
+    // If the request fails, do nothing
+    auto ttl = std::chrono::seconds(*request->ttl_seconds_ref());
+    std::unique_ptr<Request> req = std::make_unique<SettingOverrideTTLRequest>(
+        ttl, *request->name_ref(), settings_updater_);
+
+    if (processor_->postImportant(req) != 0) {
+      ld_error("Failed to post SettingOverrideTTLRequest, error: %s.",
+               error_name(err));
+
+      // We have a problem. Roll back the temporary setting since it will
+      // otherwise never get removed.
+      settings_updater_->unsetFromAdminCmd(*request->name_ref());
+
+      p.setException(thrift::OperationError(
+          folly::format("Failed to post SettingOverrideTTLRequest, error: {}",
+                        error_name(err))
+              .str()));
+      return future;
+    }
+
+  } catch (const boost::program_options::error& ex) {
+    p.setException(
+        thrift::InvalidRequest(folly::format("Error: {}", ex.what()).str()));
+    return future;
+  }
+
+  return folly::makeSemiFuture();
+}
+
+folly::SemiFuture<folly::Unit>
+AdminAPIHandler::semifuture_removeSettingOverride(
+    std::unique_ptr<thrift::RemoveSettingOverrideRequest> request) {
+  folly::Promise<folly::Unit> p;
+  auto future = p.getSemiFuture();
+
+  try {
+    settings_updater_->unsetFromAdminCmd(*request->name_ref());
+  } catch (const boost::program_options::error& ex) {
+    p.setException(
+        thrift::InvalidRequest(folly::format("Error: {}", ex.what()).str()));
+    return future;
+  }
+
+  return folly::makeSemiFuture();
 }
 
 folly::SemiFuture<folly::Unit> AdminAPIHandler::semifuture_takeLogTreeSnapshot(
@@ -333,12 +390,12 @@ void setLogGroupCustomCountersResponse(
       }
     }
     thrift::LogGroupCustomCounter counter;
-    counter.key = static_cast<int16_t>(result.first);
-    counter.val = static_cast<int64_t>(result.second);
+    *counter.key_ref() = static_cast<int16_t>(result.first);
+    *counter.val_ref() = static_cast<int64_t>(result.second);
     results.push_back(counter);
   }
 
-  response.counters[log_group_name] = std::move(results);
+  response.counters_ref()[log_group_name] = std::move(results);
 }
 
 void AdminAPIHandler::getLogGroupCustomCounters(
@@ -353,17 +410,17 @@ void AdminAPIHandler::getLogGroupCustomCounters(
   }
 
   Duration query_interval = std::chrono::seconds(60);
-  if (request->time_period != 0) {
-    query_interval = std::chrono::seconds(request->time_period);
+  if (*request->time_period_ref() != 0) {
+    query_interval = std::chrono::seconds(*request->time_period_ref());
   }
 
   CustomCountersAggregateMap agg =
       doAggregateCustomCounters(stats_holder_, query_interval);
 
-  std::string req_log_group = request->log_group_path;
+  std::string req_log_group = *request->log_group_path_ref();
 
   std::vector<u_int16_t> keys_filter;
-  for (const uint8_t& key : request->keys) {
+  for (const uint8_t& key : *request->keys_ref()) {
     if (key > std::numeric_limits<uint8_t>::max() || key < 0) {
       thrift::InvalidRequest err;
       std::ostringstream error_message;
@@ -458,15 +515,15 @@ void AdminAPIHandler::getLogGroupThroughput(
     }
 
     thrift::LogGroupThroughput lg_throughput;
-    lg_throughput.operation = operation;
+    *lg_throughput.operation_ref() = operation;
 
     const OneGroupResults& results = entry.second;
     std::vector<int64_t> log_results;
     for (auto result : results) {
       log_results.push_back(int64_t(result));
     }
-    lg_throughput.results = std::move(log_results);
-    response.throughput[log_group_name] = std::move(lg_throughput);
+    *lg_throughput.results_ref() = std::move(log_results);
+    response.throughput_ref()[log_group_name] = std::move(lg_throughput);
   }
 }
 }} // namespace facebook::logdevice

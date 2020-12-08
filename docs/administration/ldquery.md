@@ -394,6 +394,7 @@ List of LogsDB partitions that store records.  Each shard on each node has a seq
 | current\_version | long | The current live version |
 | append\_dirtied\_by | string | Nodes that have uncommitted append data in this partition. |
 | rebuild\_dirtied\_by | string | Nodes that have uncommitted rebuild data in this partition. |
+| copyset\_index\_enabled | bool | Whether or not copyset\_index is enabled for this partition. This is controlled by --rocksdb-write-copyset-index setting. |
 
 ## purges
 List the PurgeUncleanEpochs state machines currently active in the cluster. The responsability of this state machine is to delete any records that were deleted during log recovery on nodes that did not participate in that recovery. See "logdevice/server/storage/PungeUncleanEpochs.h" for more information.
@@ -436,7 +437,7 @@ Tracks all ServerReadStreams. A ServerReadStream is a stream of records sent by 
 | storage\_task\_in\_flight | int | True if there is currently a storage task running on a slow storage thread for reading a batch of records. |
 | csid | string | Client Session ID |
 | rsid | string | Read stream ID |
-| sndbuf\_occupancy | int | Number of bytes in TCP sndbuf waiting to be sent |
+| tcp\_sndbuf | int | Number of bytes in TCP sndbuf waiting to be sent |
 
 ## record
 This table allows fetching information about individual record copies in the cluster.  The user must provide query constraints on the "log\_id" and "lsn" columns.  This table can be useful to introspect where copies of a record are stored and see their metadata.  Do not use it to serve production use cases as this query runs very inneficiently (it bypasses the normal read protocol and instead performs a point query on all storage nodes in the cluster).
@@ -575,11 +576,11 @@ Show the current state in the event log. This contains each shard's authoritativ
 | authoritative\_status | string | Authoritative status of the shard. |
 | donors\_remaining | string | If authoritative status is UNDERREPLICATION, list of donors that have not finished rebuilding the under-replicated data. |
 | drain | int | Whether the shard is being drained or has been drained. |
+| mode | string | Whether rebuilding is in RESTORE or RELOCATE mode |
 | dirty\_ranges | string | Time ranges where this shard may be missing data.  This happens if the LogDevice process on this storage node crashed before committing data to disk. |
 | rebuilding\_is\_authoritative | int | Whether rebuilding is authoritative.  A non authoritative rebuilding means that too many shards lost data such that all copies of some records may be unavailable.  Some readers may stall when this happens and there are some shards that are still marked as recoverable. |
 | data\_is\_recoverable | int | Indicates whether the shard's data has been marked as unrecoverable using `ldshell mark-unrecoverable`. If all shards in the rebuilding set are marked unrecoverable, shards for which rebuilding completed will transition to AUTHORITATIVE\_EMPTY status even if that rebuilding is non authoritative. Note that if logdeviced is started on a shard whose corresponding disk has been wiped by a remediation, the shard's data will automatically be considered unrecoverable. |
 | source | string | Entity that triggered rebuilding for this shard. |
-| details | string | Reason for rebuilding this shard. |
 | rebuilding\_started\_ts | string | When rebuilding was started. |
 | rebuilding\_completed\_ts | string | When the shard transitioned to AUTHORITATIVE\_EMPTY. |
 
@@ -594,14 +595,13 @@ Like shard\_authoritative\_status\_verbose but has even more columns.
 | authoritative\_status | string | Authoritative status of the shard. |
 | donors\_remaining | string | If authoritative status is UNDERREPLICATION, list of donors that have not finished rebuilding the under-replicated data. |
 | drain | int | Whether the shard is being drained or has been drained. |
+| mode | string | Whether rebuilding is in RESTORE or RELOCATE mode |
 | dirty\_ranges | string | Time ranges where this shard may be missing data.  This happens if the LogDevice process on this storage node crashed before committing data to disk. |
 | rebuilding\_is\_authoritative | int | Whether rebuilding is authoritative.  A non authoritative rebuilding means that too many shards lost data such that all copies of some records may be unavailable.  Some readers may stall when this happens and there are some shards that are still marked as recoverable. |
 | data\_is\_recoverable | int | Indicates whether the shard's data has been marked as unrecoverable using `ldshell mark-unrecoverable`. If all shards in the rebuilding set are marked unrecoverable, shards for which rebuilding completed will transition to AUTHORITATIVE\_EMPTY status even if that rebuilding is non authoritative. Note that if logdeviced is started on a shard whose corresponding disk has been wiped by a remediation, the shard's data will automatically be considered unrecoverable. |
 | source | string | Entity that triggered rebuilding for this shard. |
-| details | string | Reason for rebuilding this shard. |
 | rebuilding\_started\_ts | string | When rebuilding was started. |
 | rebuilding\_completed\_ts | string | When the shard transitioned to AUTHORITATIVE\_EMPTY. |
-| mode | string | Whether the shard participates in its own rebuilding |
 | acked | int | Whether the node acked the rebuilding. (Why would such nodes remain in the rebuilding set at all? No one remembers now.) |
 | ack\_lsn | string | LSN of the SHARD\_ACK\_REBUILT written by this shard. |
 | ack\_version | string | Version of the rebuilding that was acked. |
@@ -619,14 +619,13 @@ Like shard\_authoritative\_status but has more columns and prints all the shards
 | authoritative\_status | string | Authoritative status of the shard. |
 | donors\_remaining | string | If authoritative status is UNDERREPLICATION, list of donors that have not finished rebuilding the under-replicated data. |
 | drain | int | Whether the shard is being drained or has been drained. |
+| mode | string | Whether rebuilding is in RESTORE or RELOCATE mode |
 | dirty\_ranges | string | Time ranges where this shard may be missing data.  This happens if the LogDevice process on this storage node crashed before committing data to disk. |
 | rebuilding\_is\_authoritative | int | Whether rebuilding is authoritative.  A non authoritative rebuilding means that too many shards lost data such that all copies of some records may be unavailable.  Some readers may stall when this happens and there are some shards that are still marked as recoverable. |
 | data\_is\_recoverable | int | Indicates whether the shard's data has been marked as unrecoverable using `ldshell mark-unrecoverable`. If all shards in the rebuilding set are marked unrecoverable, shards for which rebuilding completed will transition to AUTHORITATIVE\_EMPTY status even if that rebuilding is non authoritative. Note that if logdeviced is started on a shard whose corresponding disk has been wiped by a remediation, the shard's data will automatically be considered unrecoverable. |
 | source | string | Entity that triggered rebuilding for this shard. |
-| details | string | Reason for rebuilding this shard. |
 | rebuilding\_started\_ts | string | When rebuilding was started. |
 | rebuilding\_completed\_ts | string | When the shard transitioned to AUTHORITATIVE\_EMPTY. |
-| mode | string | Whether the shard participates in its own rebuilding |
 | acked | int | Whether the node acked the rebuilding. (Why would such nodes remain in the rebuilding set at all? No one remembers now.) |
 | ack\_lsn | string | LSN of the SHARD\_ACK\_REBUILT written by this shard. |
 | ack\_version | string | Version of the rebuilding that was acked. |
@@ -686,7 +685,6 @@ Tracks all Connections on all nodes in the cluster.
 | sndbuf\_limited\_pct | real | Portion of last health check peiod, when Connection throughput was limited by send buffer. |
 | proto | int | Protocol that was handshaken. Do not trust this value if the Connection's state is not active. |
 | sendbuf | int | Size of the send buffer of the underlying TCP socket. |
-| peer\_config\_version | int | Last config version that the peer advertised |
 | is\_ssl | int | Set to true if this Connection uses SSL. |
 | fd | int | The file descriptor of the underlying os socket. |
 

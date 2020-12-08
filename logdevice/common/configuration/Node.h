@@ -77,46 +77,25 @@ bool storageStateFromString(const std::string&, StorageState* out);
 class SequencerNodeAttributes {
  public:
   SequencerNodeAttributes(bool enabled, double weight)
-      : weight_(weight), enabled_(enabled) {}
+      : weight(weight), enabled(enabled) {}
 
   SequencerNodeAttributes() {}
 
-  double getConfiguredWeight() const {
-    return weight_;
-  }
-
-  double getEffectiveWeight() const {
-    return enabled_ ? weight_ : 0;
-  }
-
-  bool enabled() {
-    return enabled_;
-  }
-
-  void setEnabled(bool enabled) {
-    enabled_ = enabled;
-  }
-
-  void setWeight(double weight) {
-    weight_ = weight;
-  }
-
   bool operator==(const SequencerNodeAttributes& rhs) const {
-    return weight_ == rhs.weight_ && enabled_ == rhs.enabled_;
+    return weight == rhs.weight && enabled == rhs.enabled;
   }
 
   bool operator!=(const SequencerNodeAttributes& rhs) const {
     return !(*this == rhs);
   }
 
- private:
   /**
    * A non-negative value indicating how many logs this node will run
    * sequencers for relative to other nodes in the cluster.  A value of
    * zero means sequencing is disabled on this node.
    * The weight is assumed to be zero, when enable=false.
    */
-  double weight_ = 1;
+  double weight = 1;
 
   /**
    * Determines if a sequencer is enabled or not. If the sequencer is not
@@ -124,7 +103,7 @@ class SequencerNodeAttributes {
    * to be able to enable/disable sequencers without memorizing its previous
    * weight.
    */
-  bool enabled_ = true;
+  bool enabled = true;
 };
 
 struct StorageNodeAttributes {
@@ -133,11 +112,6 @@ struct StorageNodeAttributes {
    * will receive relative to other shards in the cluster.
    */
   double capacity = 1;
-
-  /**
-   * See the definition of StorageState above
-   */
-  StorageState state = StorageState::READ_WRITE;
 
   /**
    * Number of storage shards on this node.
@@ -151,11 +125,15 @@ struct StorageNodeAttributes {
 };
 
 struct Node {
-  explicit Node(const Node&);
-
   Node() = default;
   Node(Node&&) = default;
+  Node(const Node&);
   Node& operator=(Node&&) = default;
+  Node& operator=(const Node&);
+
+  static Node withTestDefaults(node_index_t idx,
+                               bool sequencer = true,
+                               bool storage = true);
 
   /*
    * This is a unique name for the node in the cluster. This is currently not a
@@ -193,6 +171,22 @@ struct Node {
   folly::Optional<Sockaddr> server_to_server_address;
 
   /**
+   * The IP (v4 or v6) address, including port number, for server-to-server
+   * Thrift API communication. It can also be a unix socket. If it's
+   * folly::none, it means that the node doesn't support server-to-server
+   * communications over Thrift.
+   */
+  folly::Optional<Sockaddr> server_thrift_api_address;
+
+  /**
+   * The IP (v4 or v6) address, including port number, for client-facing
+   * Thrift API communication. It can also be a unix socket. If it's
+   * folly::none, it means that the node doesn't support client-facing
+   * communications over Thrift.
+   */
+  folly::Optional<Sockaddr> client_thrift_api_address;
+
+  /**
    * Generation number of this slot.  Hosts in a cluster are uniquely
    * identified by (index, generation) where index is into the array of
    * nodes.
@@ -220,6 +214,15 @@ struct Node {
    */
   std::bitset<NUM_ROLES> roles;
 
+  std::unordered_map<std::string, std::string> tags;
+
+  /**
+   * Only used in the tests for templating and doesn't reflect the actual
+   * metadata state of this node. This will be fixed when the nodes
+   * configuration migration is done and this class is only used for templating.
+   */
+  bool metadata_node{false};
+
   std::unique_ptr<SequencerNodeAttributes> sequencer_attributes;
   std::unique_ptr<StorageNodeAttributes> storage_attributes;
 
@@ -233,77 +236,35 @@ struct Node {
     roles.set(id);
   }
 
-  double getSequencerWeight() const {
-    if (hasRole(NodeRole::SEQUENCER)) {
-      return sequencer_attributes->getEffectiveWeight();
-    } else {
-      return 0;
-    }
-  }
-  bool includeInNodesets() const {
-    return hasRole(NodeRole::STORAGE) &&
-        !storage_attributes->exclude_from_nodesets;
-  }
-  bool isSequencingEnabled() const {
-    return getSequencerWeight() > 0;
-  }
-
-  bool isReadableStorageNode() const {
-    return hasRole(NodeRole::STORAGE) &&
-        storage_attributes->state != StorageState::DISABLED;
-  }
-  bool isWritableStorageNode() const {
-    return hasRole(NodeRole::STORAGE) &&
-        storage_attributes->state == StorageState::READ_WRITE;
-  }
-  double getWritableStorageCapacity() const {
-    if (!isWritableStorageNode()) {
-      return 0.0;
-    }
-    return storage_attributes->capacity;
-  }
-  StorageState getStorageState() const {
-    return !hasRole(NodeRole::STORAGE) ? StorageState::DISABLED
-                                       : storage_attributes->state;
-  }
-
-  bool isDisabled() const {
-    return !isReadableStorageNode() && !isSequencingEnabled();
-  }
-  shard_size_t getNumShards() const {
-    return !hasRole(NodeRole::STORAGE) ? 0 : storage_attributes->num_shards;
-  }
-  // Should only be used for backwards-compatible config serialization
-  int getLegacyWeight() const {
-    switch (getStorageState()) {
-      case StorageState::READ_WRITE:
-      case StorageState::READ_ONLY: {
-        double res = getWritableStorageCapacity();
-        return res == 0.0 ? 0 : std::max(1, int(std::lround(res)));
-      }
-      case StorageState::DISABLED:
-        return -1;
-    }
-    ld_check(false);
-    return -1;
-  }
-
-  void addSequencerRole(bool enabled = true, double weight = 1.0) {
+  Node& addSequencerRole(bool enabled = true, double weight = 1.0) {
     setRole(NodeRole::SEQUENCER);
     sequencer_attributes = std::make_unique<SequencerNodeAttributes>();
-    sequencer_attributes->setEnabled(enabled);
-    sequencer_attributes->setWeight(weight);
+    sequencer_attributes->enabled = enabled;
+    sequencer_attributes->weight = weight;
+
+    return *this;
   }
 
-  void addStorageRole(shard_size_t num_shards = 1, double capacity = 1.0) {
+  Node& addStorageRole(shard_size_t num_shards = 1, double capacity = 1.0) {
     setRole(NodeRole::STORAGE);
     storage_attributes = std::make_unique<StorageNodeAttributes>();
     storage_attributes->num_shards = num_shards;
     storage_attributes->capacity = capacity;
+
+    return *this;
   }
 
   // return a human-readable string for the location info
   std::string locationStr() const;
+
+  Node& setTags(std::unordered_map<std::string, std::string> tags);
+  Node& setLocation(const std::string& location);
+  Node& setIsMetadataNode(bool metadata_node);
+  Node& setGeneration(node_gen_t generation);
+  Node& setName(std::string name);
+  Node& setAddress(Sockaddr address);
+  Node& setGossipAddress(Sockaddr gossip_address);
+  Node& setSSLAddress(Sockaddr ssl_address);
 };
 
 using Nodes = std::unordered_map<node_index_t, Node>;

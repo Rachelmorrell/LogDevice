@@ -16,6 +16,7 @@
 
 #include <folly/CppAttributes.h>
 #include <folly/Memory.h>
+#include <folly/Overload.h>
 #include <folly/String.h>
 
 #include "logdevice/common/AdminCommandTable.h"
@@ -29,6 +30,7 @@
 #include "logdevice/common/EpochMetaDataCache.h"
 #include "logdevice/common/EpochMetaDataUpdater.h"
 #include "logdevice/common/ExponentialBackoffTimer.h"
+#include "logdevice/common/PayloadGroupCodec.h"
 #include "logdevice/common/Processor.h"
 #include "logdevice/common/ReadStreamDebugInfoSamplingConfig.h"
 #include "logdevice/common/Sender.h"
@@ -40,7 +42,6 @@
 #include "logdevice/common/client_read_stream/ClientReadStreamBufferFactory.h"
 #include "logdevice/common/client_read_stream/ClientReadStreamConnectionHealth.h"
 #include "logdevice/common/client_read_stream/ClientReadStreamScd.h"
-#include "logdevice/common/client_read_stream/ClientReadStreamTracer.h"
 #include "logdevice/common/configuration/Configuration.h"
 #include "logdevice/common/debug.h"
 #include "logdevice/common/event_log/EventLogRebuildingSet.h"
@@ -49,6 +50,7 @@
 #include "logdevice/common/protocol/STARTED_Message.h"
 #include "logdevice/common/protocol/STOP_Message.h"
 #include "logdevice/common/settings/Settings.h"
+#include "logdevice/common/stats/PerMonitoringTagHistograms.h"
 #include "logdevice/common/stats/Stats.h"
 #include "logdevice/include/Record.h"
 
@@ -108,7 +110,7 @@ ClientReadStream::ClientReadStream(
     std::shared_ptr<UpdateableConfig> config,
     ReaderBridge* reader,
     const ReadStreamAttributes* attrs,
-    MonitoringTier tier,
+    const std::set<std::string>& monitoring_tags,
     folly::Optional<SCDCopysetReordering> scd_copyset_reordering)
     : id_(id),
       log_id_(log_id),
@@ -127,17 +129,17 @@ ClientReadStream::ClientReadStream(
       last_epoch_with_metadata_(EPOCH_INVALID),
       gap_end_outside_window_(LSN_INVALID),
       trim_point_(LSN_INVALID),
-      monitoring_tier_(tier),
+      monitoring_tags_(monitoring_tags.begin(), monitoring_tags.end()),
       reader_(reader),
       coordinated_proto_(Compatibility::MAX_PROTOCOL_SUPPORTED),
       window_update_pending_(false),
       gap_tracer_(std::make_unique<ClientGapTracer>(nullptr)),
       read_tracer_(std::make_unique<ClientReadTracer>(nullptr)),
-      events_tracer_(std::make_unique<ClientReadStreamTracer>(nullptr)),
       scd_copyset_reordering_(scd_copyset_reordering) {
   if (attrs != nullptr) {
     attrs_ = *attrs;
   }
+
   calcWindowHigh();
   calcNextLSNToSlideWindow();
   updateServerWindow();
@@ -272,7 +274,8 @@ std::string ClientReadStream::getDebugInfoStr() const {
     shards_slow = toString(scd_->getShardsSlow());
   }
   std::string res;
-  res += "next_lsn_to_deliver_=" + lsn_to_string(next_lsn_to_deliver_);
+  res += "reader_name_=" + getReaderName();
+  res += ", next_lsn_to_deliver_=" + lsn_to_string(next_lsn_to_deliver_);
   res += ", window_high_=" + lsn_to_string(window_high_);
   res += ", gap_end_outside_window_=" + lsn_to_string(gap_end_outside_window_);
   res += ", until_lsn_=" + lsn_to_string(until_lsn_);
@@ -300,6 +303,7 @@ ClientReadStream::getClientReadStreamDebugInfo() const {
   }
 
   info.csid = deps_->getClientSessionID();
+  info.reader_name = deps_->getReaderName();
   info.log_id = log_id_;
   info.next_lsn = next_lsn_to_deliver_;
   info.window_high = window_high_;
@@ -337,18 +341,12 @@ ClientReadStream::getClientReadStreamDebugInfo() const {
   return info;
 }
 
-void ClientReadStream::sampleDebugInfo(
-    const ClientReadStream::ClientReadStreamDebugInfo& info) const {
-  Worker* w = worker_;
-  if (!(w && w->processor_ &&
-        w->processor_->getDebugClientConfig()
-            .isReadStreamDebugInfoSamplingAllowed(info.csid))) {
-    return;
-  }
-
+void ClientReadStream::sampleDebugInfo() const {
+  const auto& info = getClientReadStreamDebugInfo();
   auto sample = std::make_unique<TraceSample>();
   sample->addNormalValue("thread_name", ThreadID::getName());
   sample->addNormalValue("csid", info.csid);
+  sample->addNormalValue("reader_name", info.reader_name);
   sample->addIntValue("log_id", info.log_id.val());
   sample->addIntValue("stream_id", info.stream_id.val());
   sample->addIntValue("next_lsn", info.next_lsn);
@@ -409,7 +407,8 @@ void ClientReadStream::getDebugInfo(InfoClientReadStreamsTable& table) const {
       .set<11>(info.redelivery)
       .set<12>(info.filter_version)
       .set<13>(info.shards_down)
-      .set<14>(info.shards_slow);
+      .set<14>(info.shards_slow)
+      .set<22>(info.reader_name);
 
   if (info.health.has_value()) {
     table.set<10>(info.health.value());
@@ -450,9 +449,6 @@ void ClientReadStream::start() {
   read_tracer_ = std::make_unique<ClientReadTracer>(
       worker_ ? worker_->getTraceLogger() : nullptr);
 
-  events_tracer_ = std::make_unique<ClientReadStreamTracer>(
-      worker_ ? worker_->getTraceLogger() : nullptr);
-
   connection_health_tracker_ =
       std::make_unique<ClientReadStreamConnectionHealth>(this);
 
@@ -462,7 +458,7 @@ void ClientReadStream::start() {
                    // SyncSequencerRequest.
   ) {
     readers_flow_tracer_ = std::make_unique<ClientReadersFlowTracer>(
-        worker_->getTraceLogger(), this, monitoring_tier_);
+        worker_->getTraceLogger(), this);
   }
 
   auto gap_grace_period = deps_->computeGapGracePeriod();
@@ -489,8 +485,7 @@ void ClientReadStream::start() {
   // The first stat counts read streams that are alive, second one counts
   // read stream creation events (i.e. it's not decremented when
   // ClientReadStream is destroyed).
-  MONITORING_TIER_STAT_INCR(
-      Worker::stats(), monitoring_tier_, num_read_streams);
+  TAGGED_STAT_INCR(Worker::stats(), monitoring_tags_, num_read_streams);
   WORKER_STAT_INCR(client_read_streams_created);
 
   // getLogByIDAsync might be synchronously called for LocalLogsConfig and
@@ -581,8 +576,12 @@ void ClientReadStream::ensureSkipEpoch0(
    * the latest epoch.
    */
   if (!done()) {
-    requestEpochMetaData(
-        currentEpoch(), /*require_consistent_from_cache=*/false);
+    if (requestEpochMetaData(
+            currentEpoch(), /*require_consistent_from_cache=*/false)) {
+      // onEpochMetaData() was called synchronously.
+      // *this may be destroyed here.
+      return;
+    }
   }
   disposeIfDone();
 }
@@ -908,9 +907,64 @@ void ClientReadStream::onStarted(ShardID from, const STARTED_Message& msg) {
   disposeIfDone();
 }
 
-void ClientReadStream::onDataRecord(
-    ShardID shard,
-    std::unique_ptr<DataRecordOwnsPayload> record) {
+namespace {
+
+/**
+ * Creates DataRecordOwnsPayload from RawDataRecord with specified payload.
+ */
+template <typename T>
+std::unique_ptr<DataRecordOwnsPayload>
+create_data_record(std::unique_ptr<RawDataRecord> record, T&& payload) {
+  static_assert(std::is_rvalue_reference_v<T&&>);
+  return std::make_unique<DataRecordOwnsPayload>(
+      record->logid,
+      std::move(payload),
+      record->attrs.lsn,
+      record->attrs.timestamp,
+      record->flags,
+      std::move(record->attrs.offsets),
+      std::move(record->extra_metadata),
+      record->attrs.batch_offset,
+      record->invalid_checksum);
+}
+
+} // namespace
+
+ClientReadStream::DecodedPayload
+ClientReadStream::decodePayload(const RawDataRecord& record) const {
+  if (UNLIKELY(additional_start_flags_ & START_Header::NO_PAYLOAD)) {
+    // Reading without payload: create empty record.
+    if (record.payload.size() != 0) {
+      RATELIMIT_ERROR(std::chrono::seconds(1),
+                      1,
+                      "Unexpected payload of size %lu in NO_PAYLOAD stream",
+                      record.payload.size());
+    }
+    // Create with empty payload group to ensure all payloads are empty.
+    return PayloadGroup{};
+  }
+  if (UNLIKELY((additional_start_flags_ & START_Header::PAYLOAD_HASH_ONLY))) {
+    // Reading hash only: ignore record flags and pass raw payload to reader.
+    // In this case payload contains encoded size and hash of the raw payload.
+    return record.payload;
+  }
+  if (record.flags & RECORD_Header::PAYLOAD_GROUP) {
+    // Record contains single payload group.
+    PayloadGroup payload_group;
+    // TODO pass iobuf instead of slice and allow sharing?
+    if (PayloadGroupCodec::decode(Slice(record.payload.getPayload()),
+                                  payload_group,
+                                  /* allow_buffer_sharing */ false) != 0) {
+      return payload_group;
+    }
+    // Failed to decode payload.
+    return nullptr;
+  }
+  return record.payload;
+}
+
+void ClientReadStream::onDataRecord(ShardID shard,
+                                    std::unique_ptr<RawDataRecord> record) {
   ld_check(!done());
 
   // There are several possible actions to take with the record:
@@ -925,13 +979,13 @@ void ClientReadStream::onDataRecord(
   // (3) Buffer: this is one of the next records we will deliver to the
   //     application.
 
-  lsn_t lsn = record->attrs.lsn;
+  const lsn_t lsn = record->attrs.lsn;
 
   ld_spew("Log=%lu,%s%s,%s from %s, next_lsn_to_deliver=%s",
           log_id_.val_,
           lsn_to_string(lsn).c_str(),
-          (record->invalid_checksum_ ||
-           (record->flags_ & RECORD_Header::UNDER_REPLICATED_REGION))
+          (record->invalid_checksum ||
+           (record->flags & RECORD_Header::UNDER_REPLICATED_REGION))
               ? "(UNDERREPLICATED)"
               : "",
           logdevice::toString(RecordTimestamp(record->attrs.timestamp)).c_str(),
@@ -1036,7 +1090,21 @@ void ClientReadStream::onDataRecord(
     return;
   }
 
-  if (record->invalid_checksum_ && !ship_corrupted_records_) {
+  // Try to decode payload and mark record as corrupted if it fails
+  DecodedPayload decoded_payload;
+  if (lsn >= next_lsn_to_deliver_ && !record->invalid_checksum) {
+    RecordState* rstate = buffer_->find(lsn);
+    if (rstate == nullptr || rstate->record == nullptr ||
+        rstate->record_corrupted) {
+      decoded_payload = decodePayload(*record);
+      if (std::holds_alternative<std::nullptr_t>(decoded_payload)) {
+        // Failed to decode payload
+        record->invalid_checksum = true;
+      }
+    }
+  }
+
+  if (record->invalid_checksum && !ship_corrupted_records_) {
     // issuing a gap instead of shipping a record with an invalid checksum
     GAP_Header gap_header = {log_id_,
                              this->getID(),
@@ -1050,8 +1118,8 @@ void ClientReadStream::onDataRecord(
   }
 
   // Update state for the sender.
-  bool under_replicated = record->invalid_checksum_ ||
-      (record->flags_ & RECORD_Header::UNDER_REPLICATED_REGION);
+  bool under_replicated = record->invalid_checksum ||
+      (record->flags & RECORD_Header::UNDER_REPLICATED_REGION);
 
   sender_state.max_data_record_lsn =
       std::max(sender_state.max_data_record_lsn, lsn);
@@ -1119,10 +1187,31 @@ void ClientReadStream::onDataRecord(
                                       trim_point_,
                                       readSetSize());
 
-    if (!rstate->record) {
-      rstate->record = std::move(record);
+    if (!rstate->record || rstate->record_corrupted) {
       // Updating info reg. buffer usage.
-      bytes_buffered_ += rstate->record->payload.size();
+      bytes_buffered_ += record->payload.size();
+      std::unique_ptr<DataRecordOwnsPayload> data_record;
+      std::visit(folly::overload(
+                     [&](auto& payload) {
+                       // Decoding was successful
+                       data_record = create_data_record(
+                           std::move(record), std::move(payload));
+                       rstate->record_corrupted = false;
+                     },
+                     [&](std::nullptr_t) {
+                       // Payload is corrupted: this code is only reachable if
+                       // shipping corrupted records is enabled.
+                       ld_check(ship_corrupted_records_);
+                       // Just put raw data as payload and mark record state as
+                       // corrupted so that decoding can be retried with other
+                       // shards
+                       auto payload = std::move(record->payload);
+                       data_record = create_data_record(
+                           std::move(record), std::move(payload));
+                       rstate->record_corrupted = true;
+                     }),
+                 decoded_payload);
+      rstate->record = std::move(data_record);
     }
     // This shard won't send us anything before `lsn'+1.
     // Use that information for gap detection.
@@ -2225,7 +2314,7 @@ void ClientReadStream::applyShardStatus(const char* context,
   }
 }
 
-void ClientReadStream::requestEpochMetaData(
+bool ClientReadStream::requestEpochMetaData(
     epoch_t epoch,
     bool require_consistent_from_cache) {
   // read stream should not request epoch metadata for an epoch whose
@@ -2241,7 +2330,7 @@ void ClientReadStream::requestEpochMetaData(
     ld_check(epoch == epoch_metadata_requested_.value());
     // the read stream is already requesting this epoch, return and wait
     // for the result
-    return;
+    return false;
   }
 
   epoch_metadata_requested_.assign(epoch);
@@ -2269,9 +2358,11 @@ void ClientReadStream::requestEpochMetaData(
     // Metadata will be fetched asynchronously. Until then, let's update
     // connection health.
     connection_health_tracker_->recalculate();
+    return false;
   } else {
     // onEpochMetaData() was called synchronously.
     // *this may be destroyed here.
+    return true;
   }
 }
 
@@ -3261,13 +3352,21 @@ int ClientReadStream::deliverRecord(
   // Try to set byte offset from accumulated clientReadStream value if
   // current record does not have byte_offset information and client
   // requested byte offset.
-  if (additional_start_flags_ & START_Header::INCLUDE_BYTE_OFFSET &&
-      !record->attrs.offsets.isValid()) {
-    current_offsets = accumulated_offsets_.isValid()
-        ? OffsetMap::mergeOffsets(
-              std::move(accumulated_offsets_), payload_size_map)
-        : OffsetMap();
-    record->attrs.offsets = OffsetMap::toRecord(current_offsets);
+  if (additional_start_flags_ & START_Header::INCLUDE_BYTE_OFFSET) {
+    if (!record->attrs.offsets.isValid()) {
+      WORKER_STAT_INCR(records_missing_byteoffset);
+
+      if (accumulated_offsets_.isValid()) {
+        current_offsets = OffsetMap::mergeOffsets(
+            std::move(accumulated_offsets_), payload_size_map);
+      } else {
+        current_offsets = OffsetMap();
+        WORKER_STAT_INCR(records_delivered_without_byteoffset);
+      }
+      record->attrs.offsets = OffsetMap::toRecord(current_offsets);
+    } else {
+      WORKER_STAT_INCR(records_delivered_with_byteoffset);
+    }
   }
 
   if ((record->flags_ & RECORD_Header::HOLE) && !ship_pseudorecords_) {
@@ -3851,8 +3950,7 @@ void ClientReadStream::updateLastReleased(lsn_t last_released_lsn) {
 
 ClientReadStream::~ClientReadStream() {
   if (started_) {
-    MONITORING_TIER_STAT_DECR(
-        Worker::stats(), monitoring_tier_, num_read_streams);
+    TAGGED_STAT_DECR(Worker::stats(), monitoring_tags_, num_read_streams);
   }
 
   // Not safe to destroy while executing a callback
@@ -4029,7 +4127,7 @@ void ClientReadStream::handleStartPROTONOSUPPORT(ShardID shard_id) {
 void ClientReadStream::scheduleRewind(RewindReason reason,
                                       std::string reason_str) {
   ld_check(!reason_str.empty());
-  rewind_scheduler_->schedule(nullptr, std::move(reason_str));
+  rewind_scheduler_->schedule(std::move(reason_str));
 
   if (!rewind_imminent_) {
     WORKER_STAT_INCR(rewind_scheduled);
@@ -4088,20 +4186,6 @@ void ClientReadStream::scheduleRewind(RewindReason reason,
 void ClientReadStream::rewind(std::string reason) {
   // Clear the buffer and reset gap parameters.
 
-  events_tracer_->traceEvent(log_id_,
-                             deps_->getReadStreamID(),
-                             ClientReadStreamTracer::Events::REWIND,
-                             reason,
-                             start_lsn_,
-                             until_lsn_,
-                             last_delivered_lsn_,
-                             last_in_record_ts_,
-                             last_received_ts_,
-                             epoch_metadata_str_factory_,
-                             unavailable_shards_str_factory_,
-                             currentEpoch(),
-                             trim_point_,
-                             readSetSize());
   ld_debug("Rewinding stream for log %lu: %s", log_id_.val(), reason.c_str());
 
   for (auto it = storage_set_states_.begin(); it != storage_set_states_.end();

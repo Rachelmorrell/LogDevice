@@ -22,8 +22,8 @@ NodeUpdateBuilder& NodeUpdateBuilder::setVersion(uint64_t version) {
   return *this;
 }
 
-NodeUpdateBuilder& NodeUpdateBuilder::setDataAddress(Sockaddr addr) {
-  data_address_ = std::move(addr);
+NodeUpdateBuilder& NodeUpdateBuilder::setDefaultDataAddress(Sockaddr addr) {
+  default_data_address_ = std::move(addr);
   return *this;
 }
 
@@ -47,6 +47,16 @@ NodeUpdateBuilder& NodeUpdateBuilder::setServerToServerAddress(Sockaddr addr) {
   return *this;
 }
 
+NodeUpdateBuilder& NodeUpdateBuilder::setServerThriftApiAddress(Sockaddr addr) {
+  server_thrift_api_address_ = std::move(addr);
+  return *this;
+}
+
+NodeUpdateBuilder& NodeUpdateBuilder::setClientThriftApiAddress(Sockaddr addr) {
+  client_thrift_api_address_ = std::move(addr);
+  return *this;
+}
+
 NodeUpdateBuilder& NodeUpdateBuilder::setLocation(NodeLocation loc) {
   location_ = std::move(loc);
   return *this;
@@ -54,6 +64,13 @@ NodeUpdateBuilder& NodeUpdateBuilder::setLocation(NodeLocation loc) {
 
 NodeUpdateBuilder& NodeUpdateBuilder::setName(std::string name) {
   name_ = std::move(name);
+  return *this;
+}
+
+NodeUpdateBuilder& NodeUpdateBuilder::setAddressForNetworkPriority(
+    NodeServiceDiscovery::ClientNetworkPriority priority,
+    Sockaddr sock_addr) {
+  addresses_per_priority_[priority] = std::move(sock_addr);
   return *this;
 }
 
@@ -82,15 +99,21 @@ NodeUpdateBuilder& NodeUpdateBuilder::setSequencerWeight(double weight) {
   return *this;
 }
 
+NodeUpdateBuilder& NodeUpdateBuilder::setTag(std::string key,
+                                             std::string value) {
+  tags_[std::move(key)] = std::move(value);
+  return *this;
+}
+
 NodeUpdateBuilder::Result NodeUpdateBuilder::validate() const {
   if (!node_index_.has_value()) {
     return Result{
         Status::INVALID_PARAM, "Mandatory field 'node_index' is missing"};
   }
 
-  if (!data_address_.has_value()) {
-    return Result{
-        Status::INVALID_PARAM, "Mandatory field 'data_address' is missing"};
+  if (!default_data_address_.has_value()) {
+    return Result{Status::INVALID_PARAM,
+                  "Mandatory field 'default_client_data_address' is missing"};
   }
 
   if (!name_.has_value()) {
@@ -128,13 +151,17 @@ NodeUpdateBuilder::buildNodeServiceDiscovery() {
 
   sd->name = std::move(name_).value();
   sd->version = version_.value();
-  sd->address = std::move(data_address_).value();
+  sd->default_client_data_address = std::move(default_data_address_).value();
   sd->gossip_address = std::move(gossip_address_);
   sd->ssl_address = std::move(ssl_address_);
   sd->admin_address = std::move(admin_address_);
   sd->server_to_server_address = std::move(server_to_server_address_);
+  sd->server_thrift_api_address = std::move(server_thrift_api_address_);
+  sd->client_thrift_api_address = std::move(client_thrift_api_address_);
+  sd->addresses_per_priority = std::move(addresses_per_priority_);
   sd->location = std::move(location_);
   sd->roles = roles_;
+  sd->tags = std::move(tags_);
 
   return sd;
 }

@@ -7,6 +7,7 @@
  */
 
 namespace cpp2 facebook.logdevice.thrift
+namespace go logdevice.common.if.common
 namespace py3 logdevice
 namespace php LogDevice
 namespace wiki Thriftdoc.LogDevice.Common
@@ -27,6 +28,12 @@ typedef string MaintenanceGroupID
 enum SocketAddressFamily {
   INET = 1, /** IPv4 or IPv6 address */
   UNIX = 2, /** Unix socket address */
+}
+
+enum ClientNetworkPriority {
+  LOW= 0,
+  MEDIUM=1,
+  HIGH=2
 }
 
 struct SocketAddress {
@@ -110,6 +117,19 @@ struct Addresses {
    * The socket address for server-to-server connections.
    */
   4: optional SocketAddress server_to_server;
+  /**
+   * The socket address for server-to-server Thrift API.
+   */
+  5: optional SocketAddress server_thrift_api;
+  /**
+   * The socket address for client-facing Thrift API.
+   */
+  6: optional SocketAddress client_thrift_api;
+  /**
+   * Addresses per network priority.
+   */
+  7: map<ClientNetworkPriority, SocketAddress>
+    addresses_per_priority;
 }
 
 /**

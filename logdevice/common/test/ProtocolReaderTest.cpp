@@ -11,8 +11,6 @@
 
 #include <gtest/gtest.h>
 
-#include "event2/buffer.h"
-#include "logdevice/common/libevent/compat.h"
 #include "logdevice/common/protocol/Compatibility.h"
 #include "logdevice/common/protocol/Message.h"
 
@@ -20,15 +18,7 @@ using namespace facebook::logdevice;
 
 class ProtocolReaderTest : public ::testing::Test {
  protected:
-  void TearDown() override {
-    for (evbuffer* evbuf : evbufs_) {
-      LD_EV(evbuffer_free)(evbuf);
-    }
-    evbufs_.clear();
-  }
-
- private:
-  std::deque<evbuffer*> evbufs_;
+  void TearDown() override {}
 };
 
 TEST_F(ProtocolReaderTest, Basic) {

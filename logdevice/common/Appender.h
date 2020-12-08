@@ -38,8 +38,7 @@ namespace facebook { namespace logdevice {
  * @file an Appender is a state machine for appending a single record to a log.
  *      An Appender is responsible for sending STORE messages with copies of the
  *      record being appended to a set of storage nodes, called the "copyset".
- *      The size of the copyset is equal to the value of the replication factor
- *      plus the number of extras.
+ *      The size of the copyset is equal to the value of the replication factor.
  *
  *      The Appender resides in the EpochSequencer's SlidingWindow until it is
  *      reaped.
@@ -257,8 +256,9 @@ class Appender : public IntrusiveUnorderedMapHook {
    * Send a single STORE message to the specified destination. Log and triage
    * errors.
    *
-   * Pre-condition: Sender::checkConnection() was called on this worker thread
-   * in this event loop iteration, and returned AVAILABLE or AVAILABLE_NOCHAIN.
+   * Pre-condition: Sender::checkServerConnection() was called on this worker
+   * thread in this event loop iteration, and returned AVAILABLE or
+   * AVAILABLE_NOCHAIN.
    *
    * @param  copyset  copyset to put in message header. Its size is in
    *                  store_hdr_.copyset_size. If the message is
@@ -447,8 +447,8 @@ class Appender : public IntrusiveUnorderedMapHook {
   }
 
   // Return socket closed status for clients to cache. If true the socket is
-  // closed.
-  std::shared_ptr<const std::atomic<bool>> getClientSocketToken() const;
+  // active.
+  std::shared_ptr<const std::atomic<bool>> getClientConnectionToken() const;
 
   request_id_t getClientRequestID() const {
     return append_request_id_;
@@ -692,14 +692,10 @@ class Appender : public IntrusiveUnorderedMapHook {
 
   // Initialize/activate/cancel timers used by this Appender.
   virtual void initStoreTimer();
-  virtual void initRetryTimer();
   virtual void cancelStoreTimer();
   virtual void activateStoreTimer(std::chrono::milliseconds delay);
   virtual void fireStoreTimer();
   virtual bool storeTimerIsActive();
-  virtual void cancelRetryTimer();
-  virtual void activateRetryTimer();
-  virtual bool retryTimerIsActive();
   virtual bool isNodeAlive(NodeID node);
 
  private:
@@ -842,11 +838,6 @@ class Appender : public IntrusiveUnorderedMapHook {
   // Note: in tests, this is left uninitialized.
   Timer retry_timer_;
 
-  // Used to diferentiate if we failed due to an error or a timeout. If we
-  // failed with an error we don't want onTimeout to graylist a first node that
-  // did not respond.
-  bool wave_failed_with_error_{false};
-
   // If the append was created by SequencerBatching, this contains the number
   // of constituent appends (APPEND messages that came over the wire).  Used
   // to bump stats (success/failure counters) accurately.
@@ -856,7 +847,7 @@ class Appender : public IntrusiveUnorderedMapHook {
   // with non-zero STORE timeout, used for diagnosing append failures
   bool store_timeout_set_{false};
 
-  // Set to NONE or PER_EPOCH if at some point it is decided that this Appender
+  // Set to NONE if at some point it is decided that this Appender
   // should not send a global RELEASE message. This can happen if the Appender
   // is aborted because we called retire() before the record was fully
   // replicated, or if noteAppenderReaped returns false, meaning the Sequencer
@@ -976,17 +967,6 @@ class Appender : public IntrusiveUnorderedMapHook {
   void onMemoryCorruption();
 
   /**
-   * Send DELETE messages to all nodes in recipients_ for which we do
-   * not have a positive acknowledgement of the record being stored.
-   *
-   * This method must be called only after we receive r positive STORE
-   * acknowledgements from recipients. Because DELETEs are just a space
-   * optimization they are sent best-effort and will not be redelivered
-   * after a failure.
-   */
-  void deleteExtras();
-
-  /**
    * Send RELEASE messages to the specified nodes.
    */
   virtual void sendReleases(const ShardID* dests,
@@ -1041,7 +1021,6 @@ class Appender : public IntrusiveUnorderedMapHook {
   // until a complete wave is sent, or copyset selector is unable to select
   // a copyset
   int trySendingWavesOfStores(const copyset_size_t cfg_synced,
-                              const copyset_size_t cfg_extras,
                               const CopySetManager::AppendContext& append_ctx);
 
   void forgetThePreviousWave(const copyset_size_t cfg_synced);
@@ -1055,7 +1034,6 @@ class Appender : public IntrusiveUnorderedMapHook {
   virtual void checkWorkerThread();
 
   virtual lsn_t getLastKnownGood() const;
-  virtual copyset_size_t getExtras() const;
   virtual copyset_size_t getSynced() const;
   virtual std::shared_ptr<CopySetManager> getCopySetManager() const;
   virtual NodeLocationScope getBiggestReplicationScope() const;
@@ -1075,8 +1053,7 @@ class Appender : public IntrusiveUnorderedMapHook {
   virtual bool noteAppenderReaped(FullyReplicated replicated,
                                   lsn_t reaped_lsn,
                                   std::shared_ptr<TailRecord> tail_record,
-                                  epoch_t* last_released_epoch_out,
-                                  bool* lng_changed_out);
+                                  epoch_t* last_released_epoch_out);
   virtual bool epochMetaDataAvailable(epoch_t epoch) const;
 
   virtual void
@@ -1084,9 +1061,12 @@ class Appender : public IntrusiveUnorderedMapHook {
                        std::chrono::steady_clock::time_point until_time,
                        NodeSetState::NotAvailableReason reason);
   virtual StatsHolder* getStats();
-  virtual int registerOnSocketClosed(NodeID nid, SocketCallback& cb);
+  virtual int registerOnConnectionClosed(NodeID nid, SocketCallback& cb);
   virtual void replyToAppendRequest(APPENDED_Header& replyhdr);
   virtual void schedulePeriodicReleases();
+  // Sends a new wave when previous one fails. We keep this as separate virtual
+  // method to allow tighter control over execution in tests.
+  virtual void sendRetryWave();
 
   // Request that is used to send an E::OK reply back to a client on the worker
   // it received the append message on. Used in onReaped().

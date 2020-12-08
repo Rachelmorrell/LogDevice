@@ -135,6 +135,7 @@ NodesConfigurationInit::buildBootstrappingServerConfig(
     const std::vector<std::string>& host_list,
     std::shared_ptr<ServerConfig> current_server_config) const {
   using namespace configuration::nodes;
+  using Priority = NodeServiceDiscovery::ClientNetworkPriority;
   ld_check(!host_list.empty());
 
   NodesConfiguration::Update update;
@@ -151,9 +152,12 @@ NodesConfigurationInit::buildBootstrappingServerConfig(
     auto sd = std::make_unique<NodeServiceDiscovery>();
 
     sd->name = folly::sformat("server-{}", index);
-    sd->address = maybe_address.value();
+    sd->default_client_data_address = maybe_address.value();
     sd->ssl_address = maybe_address.value();
     sd->roles.set(static_cast<uint8_t>(NodeRole::SEQUENCER));
+    sd->addresses_per_priority = {{Priority::LOW, maybe_address.value()},
+                                  {Priority::MEDIUM, maybe_address.value()},
+                                  {Priority::HIGH, maybe_address.value()}};
 
     update.service_discovery_update->addNode(
         index, {ServiceDiscoveryConfig::UpdateType::PROVISION, std::move(sd)});
@@ -165,7 +169,6 @@ NodesConfigurationInit::buildBootstrappingServerConfig(
   auto config = std::make_shared<UpdateableConfig>();
   config->updateableServerConfig()->update(std::move(current_server_config));
   config->updateableNodesConfiguration()->update(nodes_config);
-  config->updateableNCMNodesConfiguration()->update(nodes_config);
   return config;
 }
 
@@ -177,8 +180,6 @@ std::shared_ptr<Processor> NodesConfigurationInit::buildBootstrappingProcessor(
   settings.num_workers = 1;
   settings.bootstrapping = true;
 
-  // Given that we don't have the cluster name at this point.
-  settings.include_cluster_name_on_handshake = false;
   settings.include_destination_on_handshake = false;
   settings.enable_config_synchronization = false;
   injectExtraSettings(settings);

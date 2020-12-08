@@ -90,7 +90,9 @@ class Listener : public folly::AsyncServerSocket::AcceptCallback {
     bool ssl_;
   };
 
-  explicit Listener(const InterfaceDef& iface, KeepAlive loop);
+  explicit Listener(const InterfaceDef& iface,
+                    KeepAlive loop,
+                    bool enable_dscp_reflection);
 
   virtual ~Listener();
 
@@ -106,21 +108,14 @@ class Listener : public folly::AsyncServerSocket::AcceptCallback {
   virtual folly::SemiFuture<folly::Unit> stopAcceptingConnections();
 
  protected:
-  /**
-   * [DEPRECATED] Triggered by libevent when there is a new incoming connection.
-   * Please use connectionAccepted instead.
-   */
-  virtual void acceptCallback(evutil_socket_t /* sock */,
-                              const folly::SocketAddress& /* addr */) {}
-
   /* Returns true if TLS handshake header is detected in buf. */
   static bool isTLSHeader(const TLSHeader& buf);
 
   void acceptError(const std::exception& ex) noexcept override;
 
-  void
-  connectionAccepted(folly::NetworkSocket fd,
-                     const folly::SocketAddress& clientAddr) noexcept override;
+  void connectionAccepted(
+      folly::NetworkSocket fd,
+      const folly::SocketAddress& clientAddr) noexcept override = 0;
 
   bool isSSL() const;
 
@@ -133,6 +128,9 @@ class Listener : public folly::AsyncServerSocket::AcceptCallback {
 
   // EventLoop on which listener is running
   KeepAlive loop_;
+
+  // Whether to use DSCP value provided by client
+  bool enable_dscp_reflection_;
 
   // Must be accessed only from evenloop thread
   std::shared_ptr<folly::AsyncServerSocket> socket_;

@@ -6,6 +6,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <folly/Optional.h>
+
 #include "logdevice/common/Checksum.h"
 #include "logdevice/common/SnapshotStoreTypes.h"
 #include "logdevice/common/Timestamp.h"
@@ -288,7 +290,7 @@ read_stream_id_t ReplicatedStateMachine<T, D>::createBasicReadStream(
       processor->config_,
       nullptr,
       nullptr,
-      MonitoringTier::MEDIUM_PRI,
+      std::set<std::string>{},
       SCDCopysetReordering(processor->settings()->rsm_scd_copyset_reordering));
 
   // SCD adds complexity and may incur latency on storage node failures. Since
@@ -1308,8 +1310,9 @@ bool ReplicatedStateMachine<T, D>::canTrim() const {
 
   auto cs = w->getClusterState();
   ld_check(cs != nullptr);
-  auto first_idx = cs->getFirstNodeAlive();
-  return first_idx == my_node_id.value().index();
+  folly::Optional<node_index_t> first_alive_node_idx = cs->getFirstNodeAlive();
+  return first_alive_node_idx.has_value() &&
+      first_alive_node_idx.value() == my_node_id.value().index();
 }
 
 template <typename T, typename D>
@@ -1543,27 +1546,22 @@ Status ReplicatedStateMachine<T, D>::getSnapshotFromMemory(
     return E::STALE;
   }
 
-  bool include_read_ptr =
-      Worker::settings().rsm_include_read_pointer_in_snapshot;
-  snapshot_blob_out = createSnapshotPayload(*data_, version_, include_read_ptr);
+  snapshot_blob_out = createSnapshotPayload(*data_, version_);
   version_out = version_;
   return E::OK;
 }
 
 template <typename T, typename D>
-std::string ReplicatedStateMachine<T, D>::createSnapshotPayload(
-    const T& data,
-    lsn_t version,
-    bool rsm_include_read_pointer_in_snapshot) {
+std::string ReplicatedStateMachine<T, D>::createSnapshotPayload(const T& data,
+                                                                lsn_t version) {
   RSMSnapshotHeader header{
-      /*format_version=*/rsm_include_read_pointer_in_snapshot
-          ? RSMSnapshotHeader::CONTAINS_DELTA_LOG_READ_PTR_AND_LENGTH
-          : RSMSnapshotHeader::BASE_VERSION,
+      /*format_version=*/RSMSnapshotHeader::CONTAINS_NODE_METADATA,
       /*flags=*/0,
       /*byte_offset=*/delta_log_byte_offset_,
       /*offset=*/delta_log_offset_,
       /*base_version=*/version,
-      /*delta_log_read_ptr=*/delta_read_ptr_};
+      /*delta_log_read_ptr=*/delta_read_ptr_,
+      /*node_info=*/node_info.value_or("")};
 
   // Determine the size of the header.
   const size_t header_sz = RSMSnapshotHeader::computeLengthInBytes(header);
@@ -1655,17 +1653,15 @@ void ReplicatedStateMachine<T, D>::snapshot(std::function<void(Status st)> cb) {
     return;
   }
 
-  bool include_read_ptr =
-      Worker::settings().rsm_include_read_pointer_in_snapshot;
   rsm_info(
       rsm_type_,
       "Creating snapshot with version %s, delta_log_read_ptr %s, compression "
       "%s",
       lsn_to_string(version_).c_str(),
-      include_read_ptr ? lsn_to_string(delta_read_ptr_).c_str() : "disabled",
+      lsn_to_string(delta_read_ptr_).c_str(),
       snapshot_compression_ ? "enabled" : "disabled");
 
-  if (include_read_ptr && delta_read_ptr_ < version_) {
+  if (delta_read_ptr_ < version_) {
     rsm_critical(rsm_type_,
                  "RSM is in inconsistent state: delta_read_ptr_ = %s while "
                  "version_ = %s. We cannot proceed with taking snapshot",
@@ -1675,8 +1671,7 @@ void ReplicatedStateMachine<T, D>::snapshot(std::function<void(Status st)> cb) {
     return;
   }
 
-  std::string payload =
-      createSnapshotPayload(*data_, version_, include_read_ptr);
+  std::string payload = createSnapshotPayload(*data_, version_);
 
   // We'll capture these in the lambda below.
   const size_t byte_offset_at_time_of_snapshot = delta_log_byte_offset_;
@@ -1689,6 +1684,8 @@ void ReplicatedStateMachine<T, D>::snapshot(std::function<void(Status st)> cb) {
       if (!s) {
         return;
       }
+
+      snapshot_in_flight_ = false;
 
       if (st == E::OK) {
         // We don't want to wait for the snapshot to be read before
@@ -1718,25 +1715,23 @@ void ReplicatedStateMachine<T, D>::snapshot(std::function<void(Status st)> cb) {
         last_written_version_ = LSN_INVALID;
         advertiseVersions(RsmVersionType::DURABLE, LSN_INVALID);
       }
-      snapshot_in_flight_ = false;
       cb_or_noop(st);
     });
   };
 
   bool writing_snapshot = !snapshot_store_ ||
       (version_ > last_written_version_) ||
-      (include_read_ptr && last_snapshot_last_read_ptr_ < delta_read_ptr_copy);
+      (last_snapshot_last_read_ptr_ < delta_read_ptr_copy);
   rsm_info(rsm_type_,
            "%swriting snapshot(version_:%s, delta_read_ptr:%s, payload "
            "size:%lu), last_written_version_:%s, "
-           "last_snapshot_last_read_ptr_:%s, include_read_ptr:%d",
+           "last_snapshot_last_read_ptr_:%s",
            writing_snapshot ? "" : "Not ",
            lsn_to_string(version_).c_str(),
            lsn_to_string(delta_read_ptr_copy).c_str(),
            payload.size(),
            lsn_to_string(last_written_version_).c_str(),
-           lsn_to_string(last_snapshot_last_read_ptr_).c_str(),
-           include_read_ptr);
+           lsn_to_string(last_snapshot_last_read_ptr_).c_str());
   if (!writing_snapshot) {
     snapshot_cb(E::UPTODATE, last_written_version_);
     return;

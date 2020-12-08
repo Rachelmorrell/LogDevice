@@ -258,6 +258,13 @@ MessageReadResult STORE_Message::deserialize(ProtocolReader& reader) {
   });
 }
 
+PermissionParams STORE_Message::getPermissionParams() const {
+  PermissionParams params;
+  params.requiresPermission = true;
+  params.action = ACTION::SERVER_INTERNAL;
+  return params;
+}
+
 void STORE_Message::onSentCommon(Status st, const Address& to) const {
   ld_check(!to.isClientAddress());
 
@@ -472,6 +479,7 @@ std::string STORE_Message::flagsToString(STORE_flags_t flags) {
   FLAG(EPOCH_BEGIN)
   FLAG(DRAINED)
   FLAG(WRITE_STREAM)
+  FLAG(PAYLOAD_GROUP)
 
 #undef FLAG
 

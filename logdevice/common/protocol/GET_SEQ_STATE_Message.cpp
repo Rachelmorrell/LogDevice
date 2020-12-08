@@ -114,17 +114,14 @@ GET_SEQ_STATE_Message::getCopySet(std::shared_ptr<Sequencer> seq,
   ld_spew("Calling getCopysetUsingUnderlyingSelector() for log:%lu, rqid:%lu",
           datalog_id.val_,
           request_id_.val());
-  auto result = copyset_manager_->getCopysetUsingUnderlyingSelector(datalog_id,
-                                                                    0, // extras
-                                                                    copyset,
-                                                                    &ndest);
+  auto result = copyset_manager_->getCopysetUsingUnderlyingSelector(
+      datalog_id, copyset, &ndest);
 
   ld_spew("Copyset selection result for log:%lu, rqid:%lu, result:%d",
           datalog_id.val_,
           request_id_.val(),
           (int)result);
   switch (result) {
-    case CopySetSelector::Result::PARTIAL:
     case CopySetSelector::Result::SUCCESS:
       ld_check(ndest == replication);
       break;
@@ -806,11 +803,13 @@ bool GET_SEQ_STATE_Message::shouldRedirectOrFail(logid_t datalog_id,
   }
 
   if (status_out != E::OK) {
-    RATELIMIT_WARNING(std::chrono::seconds(5),
-                      5,
-                      "No sequencer node found for log:%lu, replying with "
-                      "E::NOSEQUENCER.",
-                      datalog_id.val_);
+    RATELIMIT_WARNING(
+        std::chrono::seconds(5),
+        5,
+        "No sequencer node found for log:%lu (status=%s), replying with "
+        "E::NOSEQUENCER.",
+        datalog_id.val_,
+        error_name(status_out));
     status_out = E::NOSEQUENCER;
     return true;
   }

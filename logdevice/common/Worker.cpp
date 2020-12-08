@@ -8,6 +8,7 @@
 #include "logdevice/common/Worker.h"
 
 #include <algorithm>
+#include <memory>
 #include <pthread.h>
 #include <string>
 #include <unistd.h>
@@ -26,6 +27,7 @@
 #include "logdevice/common/CheckNodeHealthRequest.h"
 #include "logdevice/common/CheckSealRequest.h"
 #include "logdevice/common/ClientIdxAllocator.h"
+#include "logdevice/common/ClientReadStreamDebugInfoHandler.h"
 #include "logdevice/common/ClusterState.h"
 #include "logdevice/common/ConfigurationFetchRequest.h"
 #include "logdevice/common/CopySetManager.h"
@@ -49,19 +51,17 @@
 #include "logdevice/common/MetaDataLogWriter.h"
 #include "logdevice/common/NodesConfigurationUpdatedRequest.h"
 #include "logdevice/common/PermissionChecker.h"
-#include "logdevice/common/PrincipalParser.h"
 #include "logdevice/common/Processor.h"
 #include "logdevice/common/SSLFetcher.h"
 #include "logdevice/common/SequencerBackgroundActivator.h"
 #include "logdevice/common/ServerConfigUpdatedRequest.h"
 #include "logdevice/common/ShapingContainer.h"
+#include "logdevice/common/SocketSender.h"
 #include "logdevice/common/SyncSequencerRequest.h"
-#include "logdevice/common/TimeoutMap.h"
 #include "logdevice/common/TraceLogger.h"
 #include "logdevice/common/TrimRequest.h"
 #include "logdevice/common/WorkerTimeoutStats.h"
 #include "logdevice/common/WriteMetaDataRecord.h"
-#include "logdevice/common/client_read_stream/AllClientReadStreams.h"
 #include "logdevice/common/configuration/ServerConfig.h"
 #include "logdevice/common/configuration/UpdateableConfig.h"
 #include "logdevice/common/configuration/logs/LogsConfigManager.h"
@@ -73,6 +73,7 @@
 #include "logdevice/common/protocol/MessageTracer.h"
 #include "logdevice/common/stats/ServerHistograms.h"
 #include "logdevice/common/stats/Stats.h"
+#include "logdevice/common/thrift/ThriftRouter.h"
 #include "logdevice/include/Err.h"
 
 namespace facebook { namespace logdevice {
@@ -117,19 +118,21 @@ class WorkerImpl {
   WorkerImpl(Worker* w,
              const std::shared_ptr<UpdateableConfig>& config,
              StatsHolder* stats)
-      : sender_(w->immutable_settings_,
-                w->getEventBase(),
-                config->get()->serverConfig()->getTrafficShapingConfig(),
-                &w->processor_->clientIdxAllocator(),
-                w->worker_type_ == WorkerType::FAILURE_DETECTOR,
-                config->getServerConfig()
-                    ->getNodesConfigurationFromServerConfigSource(),
-                getMyNodeIndex(w),
-                getMyLocation(config, w),
-                std::unique_ptr<IConnectionFactory>(
-                    new AsyncSocketConnectionFactory(
-                        w->getEvBase().getEventBase())),
-                stats),
+      : sender_(std::make_unique<SocketSender>(
+            w,
+            w->processor_,
+            w->immutable_settings_,
+            w->getEventBase(),
+            config->get()->serverConfig()->getTrafficShapingConfig(),
+            &w->processor_->clientIdxAllocator(),
+            w->worker_type_ == WorkerType::FAILURE_DETECTOR,
+            config->getNodesConfiguration(),
+            getMyNodeIndex(w),
+            getMyLocation(config, w),
+            std::unique_ptr<IConnectionFactory>(
+                new AsyncSocketConnectionFactory(
+                    w->getEvBase().getEventBase())),
+            stats)),
         activeAppenders_(w->immutable_settings_->server ? N_APPENDER_MAP_BUCKETS
                                                         : 1),
         // AppenderBuffer queue capacity is the system-wide per-log limit
@@ -138,9 +141,15 @@ class WorkerImpl {
                         w->immutable_settings_->num_workers),
         // TODO: Make this configurable
         previously_redirected_appends_(1024),
-        graylistingTracker_(std::make_unique<GraylistingTracker>())
-
-  {
+        graylistingTracker_(std::make_unique<GraylistingTracker>()),
+        clientReadStreamDebugHandler_{
+            w->processor_->csid_,
+            w->getEvBase().getEventBase(),
+            w->immutable_settings_->all_read_streams_sampling_rate,
+            w->processor_->getPluginRegistry(),
+            w->processor_->updateableSettings()
+                ->all_read_streams_debug_config_path,
+            clientReadStreams_} {
     const auto& read_shaping_cfg =
         config->get()->serverConfig()->getReadIOShapingConfig();
     read_shaping_container_ = std::make_unique<ShapingContainer>(
@@ -153,7 +162,7 @@ class WorkerImpl {
   }
 
   ShardAuthoritativeStatusManager shardStatusManager_;
-  Sender sender_;
+  std::unique_ptr<Sender> sender_;
   FindKeyRequestMap runningFindKey_;
   FireAndForgetRequestMap runningFireAndForgets_;
   TrimRequestMap runningTrimRequests_;
@@ -183,10 +192,11 @@ class WorkerImpl {
   WriteMetaDataRecordMap runningWriteMetaDataRecords_;
   AppendRequestEpochMap appendRequestEpochMap_;
   CheckNodeHealthRequestSet pendingHealthChecks_;
-  AllClientReadStreams clientReadStreams_;
   std::unique_ptr<SequencerBackgroundActivator> sequencerBackgroundActivator_;
   std::unique_ptr<GraylistingTracker> graylistingTracker_;
   std::unique_ptr<ShapingContainer> read_shaping_container_;
+  AllClientReadStreams clientReadStreams_;
+  ClientReadStreamDebugInfoHandler clientReadStreamDebugHandler_;
 };
 
 std::string Worker::makeThreadName(Processor* processor,
@@ -298,16 +308,6 @@ std::shared_ptr<ServerConfig> Worker::getServerConfig() const {
 std::shared_ptr<const configuration::nodes::NodesConfiguration>
 Worker::getNodesConfiguration() const {
   return config_->getNodesConfiguration();
-}
-
-std::shared_ptr<const configuration::nodes::NodesConfiguration>
-Worker::getNodesConfigurationFromNCMSource() const {
-  return config_->getNodesConfigurationFromNCMSource();
-}
-
-std::shared_ptr<const configuration::nodes::NodesConfiguration>
-Worker::getNodesConfigurationFromServerConfigSource() const {
-  return config_->getNodesConfigurationFromServerConfigSource();
 }
 
 std::shared_ptr<LogsConfig> Worker::getLogsConfig() const {
@@ -460,7 +460,7 @@ void Worker::onSettingsUpdated() {
     impl_->sequencerBackgroundActivator_->onSettingsUpdated();
   }
 
-  impl_->sender_.onSettingsUpdated(immutable_settings_);
+  impl_->sender_->onSettingsUpdated(immutable_settings_);
 }
 
 void Worker::initializeSubscriptions() {
@@ -542,6 +542,15 @@ void Worker::initializeSubscriptions() {
   onSettingsUpdated();
 }
 
+void Worker::initSSLFetcher() {
+  auto& setting = settings();
+  ssl_fetcher_ = SSLFetcher::create(setting.ssl_cert_path,
+                                    setting.ssl_key_path,
+                                    setting.ssl_ca_path,
+                                    setting.ssl_load_client_cert,
+                                    stats());
+}
+
 void Worker::setupWorker() {
   requests_stuck_timer_ = std::make_unique<Timer>(
       std::bind(&Worker::reportOldestRecoveryRequest, this));
@@ -576,6 +585,8 @@ void Worker::setupWorker() {
   // Initialize load reporting and start timer
   reportLoad();
   reportOldestRecoveryRequest();
+
+  initSSLFetcher();
 }
 
 const std::shared_ptr<TraceLogger> Worker::getTraceLogger() const {
@@ -643,6 +654,13 @@ void Worker::finishWorkAndCloseSockets() {
     ld_info("Aborted %lu configuration-fetch requests", c);
   }
 
+  // abort all running trim requests
+  if (!runningTrimRequests().map.empty()) {
+    c = runningTrimRequests().map.size();
+    runningTrimRequests().map.clear();
+    ld_info("Aborted %lu trim requests", c);
+  }
+
   // Kick off the following async sequence:
   //  1) wait for requestsPending() to become zero
   //  2) tear down state machines such as read streams
@@ -664,7 +682,7 @@ void Worker::finishWorkAndCloseSockets() {
     force_close_conns_counter_ = settings().time_delay_before_force_abort;
   }
 
-  if (requestsPending() == 0 && sender().isClosed()) {
+  if (!requestsPending() && sender().isShutdownCompleted()) {
     // already done
     ld_info("Worker finished closing sockets");
     processor_->noteWorkerQuiescent(idx_, worker_type_);
@@ -692,7 +710,7 @@ void Worker::finishWorkAndCloseSockets() {
         if (force_close_conns_counter_ > 0) {
           --force_close_conns_counter_;
           if (force_close_conns_counter_ == 0) {
-            forceCloseSockets();
+            sender().forceShutdown();
           }
         }
       }));
@@ -715,21 +733,20 @@ void Worker::forceAbortPendingWork() {
   }
 }
 
-void Worker::forceCloseSockets() {
-  {
-    // Close all sockets irrespective of pending work on them.
-    auto sockets_closed = sender().closeAllSockets();
-
-    ld_info("Num server sockets closed: %u, Num clients sockets closed: %u",
-            sockets_closed.first,
-            sockets_closed.second);
-  }
-}
-
 void Worker::disableSequencersDueIsolationTimeout() {
   Worker::onThisThread(false)
       ->processor_->allSequencers()
       .disableAllSequencersDueToIsolation();
+}
+
+folly::SemiFuture<folly::Unit> Worker::shutdownSender() {
+  folly::Promise<folly::Unit> promise;
+  auto future = promise.getSemiFuture();
+  add([this, p = std::move(promise)]() mutable {
+    sender().forceShutdown();
+    p.setValue(folly::unit);
+  });
+  return future;
 }
 
 void Worker::reportOldestRecoveryRequest() {
@@ -1100,7 +1117,15 @@ void Worker::unpackRunContext(
 //
 
 Sender& Worker::sender() const {
-  return impl_->sender_;
+  return *impl_->sender_;
+}
+
+SocketSender* FOLLY_NULLABLE Worker::socketSender() const {
+  return dynamic_cast<SocketSender*>(impl_->sender_.get());
+}
+
+ThriftRouter* Worker::getThriftRouter() const {
+  return processor_->getThriftRouter();
 }
 
 FindKeyRequestMap& Worker::runningFindKey() const {
@@ -1233,7 +1258,7 @@ Worker::runningGetEpochRecoveryMetadata() const {
 }
 
 SSLFetcher& Worker::sslFetcher() const {
-  return processor_->sslFetcher();
+  return *ssl_fetcher_;
 }
 
 std::unique_ptr<SequencerBackgroundActivator>&

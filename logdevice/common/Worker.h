@@ -22,6 +22,7 @@
 #include <folly/Random.h>
 #include <folly/concurrency/UnboundedQueue.h>
 #include <folly/container/F14Map.h>
+#include <folly/futures/Future.h>
 #include <folly/io/async/Request.h>
 
 #include "logdevice/common/ClientID.h"
@@ -30,9 +31,9 @@
 #include "logdevice/common/RecordID.h"
 #include "logdevice/common/RunContext.h"
 #include "logdevice/common/ThreadID.h"
-#include "logdevice/common/TimeoutMap.h"
 #include "logdevice/common/Timer.h"
 #include "logdevice/common/WorkerType.h"
+#include "logdevice/common/client_read_stream/AllClientReadStreams.h"
 #include "logdevice/common/settings/Settings.h"
 #include "logdevice/common/settings/UpdateableSettings.h"
 #include "logdevice/common/types_internal.h"
@@ -110,7 +111,6 @@ namespace facebook { namespace logdevice {
  *       pass the requests to a Worker.
  */
 
-class AllClientReadStreams;
 class AppenderBuffer;
 class BufferedWriterShard;
 class ClusterState;
@@ -129,6 +129,7 @@ class RebuildingCoordinatorInterface;
 class Request;
 class SSLFetcher;
 class Sender;
+class SocketSender;
 class SequencerBackgroundActivator;
 class ServerConfig;
 class ShapingContainer;
@@ -141,6 +142,7 @@ class UpdateableConfig;
 class WorkerImpl;
 class WorkerTimeoutStats;
 class OverloadDetector;
+class ThriftRouter;
 
 namespace maintenance {
 class ClusterMaintenanceStateMachine;
@@ -267,21 +269,10 @@ class Worker : public WorkContext {
   std::shared_ptr<ServerConfig> getServerConfig() const;
 
   /**
-   * @return  NodesConfiguraton object cached on this worker, depending on
-   *          processor settings, the source can be server config or NCM.
+   * @return  NodesConfiguraton object cached on this worker.
    */
   std::shared_ptr<const configuration::nodes::NodesConfiguration>
   getNodesConfiguration() const;
-
-  /**
-   * get the NodesConfiguration updated by NodesConfigurationManager.
-   * Note: only used during NCM migration period, will be removed later
-   */
-  std::shared_ptr<const configuration::nodes::NodesConfiguration>
-  getNodesConfigurationFromNCMSource() const;
-
-  std::shared_ptr<const configuration::nodes::NodesConfiguration>
-  getNodesConfigurationFromServerConfigSource() const;
 
   /**
    * @return logs configuration object cached on this Worker and
@@ -409,6 +400,14 @@ class Worker : public WorkContext {
   // An interface for sending Messages on this Worker. This object owns all
   // Connections on this Worker.
   Sender& sender() const;
+
+  // Returns pointer to SocketSender if the worker supports raw socket API
+  SocketSender* FOLLY_NULLABLE socketSender() const;
+
+  /**
+   * Creates an instance of Thrift client for sending RPC to given node.
+   */
+  ThriftRouter* getThriftRouter() const;
 
   // a map of all currently running FindKeyRequests
   FindKeyRequestMap& runningFindKey() const;
@@ -617,12 +616,6 @@ class Worker : public WorkContext {
    */
   void forceAbortPendingWork();
 
-  /**
-   * This method closes all the Connections during shutdown if connections did
-   * not drain in given time.
-   */
-  void forceCloseSockets();
-
   virtual void subclassFinishWork() {}
   virtual void subclassWorkFinished() {}
 
@@ -805,11 +798,22 @@ class Worker : public WorkContext {
   void setLongExecutionCallback(SlowRequestCallback cb);
   void setLongQueuedCallback(SlowRequestCallback cb);
 
+  virtual void initSSLFetcher();
+
   // Execution probability distribution of different tasks. Hi Priority tasks
   // are called such because they have a higher chance of getting executed.
   static constexpr int kHiPriTaskExecDistribution = 70;
   static constexpr int kMidPriTaskExecDistribution = 0;
   static constexpr int kLoPriTaskExecDistribution = 30;
+
+  /**
+   * Forces shutdown of Sender owned by this Worker. Can be called from
+   * arbtirary thread because it enqueues downstream shudown call to be executed
+   * on this worker.
+   *
+   * @return Future which fullfills when sender shut down.
+   */
+  FOLLY_NODISCARD folly::SemiFuture<folly::Unit> shutdownSender();
 
  private:
   // Periodically called to report load to Processor for load-aware work
@@ -939,6 +943,9 @@ class Worker : public WorkContext {
   double worker_queue_stall_error_injection_chance_;
   std::chrono::milliseconds worker_stall_inj_ms_;
   std::chrono::milliseconds worker_queue_inj_ms_;
+
+ protected:
+  std::unique_ptr<SSLFetcher> ssl_fetcher_;
 
   friend struct ::testing::SocketConnectRequest;
 };

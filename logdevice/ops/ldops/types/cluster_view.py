@@ -193,7 +193,7 @@ class ClusterView:
 
     @property
     def _node_index_to_maintenances(
-        self
+        self,
     ) -> Dict[int, Tuple[MaintenanceDefinition, ...]]:
         if self._node_index_to_maintenances_dict is None:
             self._node_index_to_maintenances_dict = {
@@ -262,6 +262,7 @@ class ClusterView:
         self,
         shards: Optional[Collection[ShardID]] = None,
         node_ids: Optional[Collection[NodeID]] = None,
+        include_sequencers: bool = False,
     ) -> Tuple[ShardID, ...]:
         shards = list(shards or [])
         node_ids = list(node_ids or [])
@@ -274,12 +275,15 @@ class ClusterView:
                 node_index=shard.node.node_index, node_name=shard.node.name
             )
             if not node_view.is_storage:
-                continue
-
-            if shard.shard_index == ALL_SHARDS:
-                r = range(0, node_view.num_shards)
+                if include_sequencers:
+                    r = [ALL_SHARDS]
+                else:
+                    continue  # pragma: nocover; coverage incorrectly doesn't count this line
             else:
-                r = range(shard.shard_index, shard.shard_index + 1)
+                if shard.shard_index == ALL_SHARDS:
+                    r = range(0, node_view.num_shards)
+                else:
+                    r = range(shard.shard_index, shard.shard_index + 1)
 
             for shard_index in r:
                 ret.add(ShardID(node=node_view.node_id, shard_index=shard_index))
@@ -432,7 +436,11 @@ class ClusterView:
 
             normalized_sequencer_node_indexes = tuple(
                 sorted(
-                    self.normalize_node_id(node_id).node_index for node_id in node_ids
+                    # pyre-fixme[6]: Expected `Iterable[Variable[_LT (bound to
+                    #  _SupportsLessThan)]]` for 1st param but got
+                    #  `Generator[Optional[int], None, None]`.
+                    self.normalize_node_id(node_id).node_index
+                    for node_id in node_ids
                 )
             )
 
@@ -461,6 +469,9 @@ class ClusterView:
 
         if sequencer_nodes is not None:
             normalized_sequencer_node_indexes = tuple(
+                # pyre-fixme[6]: Expected `Iterable[Variable[_LT (bound to
+                #  _SupportsLessThan)]]` for 1st param but got
+                #  `Generator[Optional[int], None, None]`.
                 sorted(self.normalize_node_id(n).node_index for n in sequencer_nodes)
             )
             mvs = (

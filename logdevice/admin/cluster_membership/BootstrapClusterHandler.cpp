@@ -16,19 +16,18 @@
 #include "logdevice/common/membership/StorageStateTransitions.h"
 #include "logdevice/common/types_internal.h"
 
+using namespace facebook::logdevice::configuration::nodes;
 namespace facebook { namespace logdevice { namespace admin {
 namespace cluster_membership {
-
-using namespace facebook::logdevice::configuration::nodes;
 
 folly::Expected<BootstrapClusterHandler::Result, thrift::OperationError>
 BootstrapClusterHandler::buildNodesConfigurationUpdates(
     const thrift::BootstrapClusterRequest& req,
     const configuration::nodes::NodesConfiguration& nc) const {
-  if (!nc.getSequencerMembership()->isBootstrapping() ||
-      !nc.getStorageMembership()->isBootstrapping()) {
-    return folly::makeUnexpected(
-        thrift::OperationError("The cluster is already bootstrapped."));
+  if (nc.isBootstrapped()) {
+    // Return an empty result, which contains an empty update.
+    // Make the request idempotent.
+    return Result{};
   }
 
   auto metadata_replication_property =

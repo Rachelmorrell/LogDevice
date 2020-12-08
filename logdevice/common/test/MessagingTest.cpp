@@ -18,14 +18,16 @@
 
 #include "logdevice/common/Address.h"
 #include "logdevice/common/ConnectThrottle.h"
+#include "logdevice/common/ConnectionKind.h"
 #include "logdevice/common/NoopTraceLogger.h"
 #include "logdevice/common/Processor.h"
-#include "logdevice/common/Sender.h"
 #include "logdevice/common/SocketCallback.h"
+#include "logdevice/common/SocketSender.h"
 #include "logdevice/common/Worker.h"
 #include "logdevice/common/configuration/Configuration.h"
 #include "logdevice/common/debug.h"
 #include "logdevice/common/protocol/HELLO_Message.h"
+#include "logdevice/common/test/NodesConfigurationTestUtil.h"
 #include "logdevice/common/test/TestUtil.h"
 
 namespace facebook { namespace logdevice {
@@ -359,24 +361,30 @@ class OnClientCloseTestRequest : public Request {
     snprintf(port, sizeof(port), "%d", cid_.getIdx());
 
     Worker* w = Worker::onThisThread();
-    int rv = w->sender().addClient(sock_,
-                                   Sockaddr("127.0.0.1", port),
-                                   ResourceBudget::Token(),
-                                   SocketType::DATA,
-                                   ConnectionType::PLAIN);
+    auto* sender = w->socketSender();
+    EXPECT_TRUE(sender);
+    int rv = sender->addClient(sock_,
+                               Sockaddr("127.0.0.1", port),
+                               ResourceBudget::Token(),
+                               SocketType::DATA,
+                               ConnectionType::PLAIN,
+                               ConnectionKind::DATA);
     EXPECT_EQ(0, rv);
 
-    rv = w->sender().registerOnSocketClosed(Address(cid_), *(new OnClose()));
+    rv =
+        w->sender().registerOnConnectionClosed(Address(cid_), *(new OnClose()));
     EXPECT_EQ(0, rv);
 
-    rv = w->sender().registerOnSocketClosed(Address(cid_), *(new OnClose()));
+    rv =
+        w->sender().registerOnConnectionClosed(Address(cid_), *(new OnClose()));
     EXPECT_EQ(0, rv);
 
     const ClientID nonexisting_client(100);
 
     OnClose* cb2 = new OnClose();
 
-    rv = w->sender().registerOnSocketClosed(Address(nonexisting_client), *cb2);
+    rv = w->sender().registerOnConnectionClosed(
+        Address(nonexisting_client), *cb2);
 
     delete cb2;
 
@@ -451,13 +459,17 @@ TEST(MessagingTest, SendFromCallback) {
   node.address = Sockaddr("127.0.0.1", "65534"),
   node.gossip_address = Sockaddr("127.0.0.1", "65535"), node.generation = 1;
   node.addStorageRole();
+  node.addSequencerRole();
 
-  Configuration::NodesConfig nodes({{0, std::move(node)}});
-  auto config =
-      std::make_shared<UpdateableConfig>(std::make_shared<Configuration>(
-          ServerConfig::fromDataTest(
-              __FILE__, nodes, Configuration::MetaDataLogsConfig()),
-          nullptr));
+  configuration::Nodes nodes({{0, std::move(node)}});
+
+  auto nodes_configuration =
+      NodesConfigurationTestUtil::provisionNodes(std::move(nodes));
+
+  auto config = std::make_shared<UpdateableConfig>(
+      std::make_shared<Configuration>(ServerConfig::fromDataTest(__FILE__),
+                                      nullptr,
+                                      std::move(nodes_configuration)));
 
   struct SendRequest : public Request {
     explicit SendRequest(NodeID node)
@@ -505,12 +517,15 @@ TEST(MessagingTest, ConnectionLimit) {
           sem_(sem),
           token_(std::move(token)) {}
     Request::Execution execute() override {
-      int rv = Worker::onThisThread()->sender().addClient(
+      auto* socket_sender = Worker::onThisThread()->socketSender();
+      EXPECT_TRUE(socket_sender);
+      int rv = socket_sender->addClient(
           fd_,
           Sockaddr("127.0.0.1", folly::to<std::string>(fd_).c_str()),
           std::move(token_),
           SocketType::DATA,
-          ConnectionType::PLAIN);
+          ConnectionType::PLAIN,
+          ConnectionKind::DATA);
       EXPECT_EQ(0, rv);
       sem_.post();
       return Execution::COMPLETE;

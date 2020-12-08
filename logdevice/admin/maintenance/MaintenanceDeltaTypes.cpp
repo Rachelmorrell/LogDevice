@@ -18,7 +18,6 @@
 
 namespace facebook { namespace logdevice { namespace maintenance {
 
-
 int MaintenanceDeltaTypes::applyMaintenances(
     const std::vector<thrift::MaintenanceDefinition>& defs,
     thrift::ClusterMaintenanceState& state,
@@ -83,10 +82,19 @@ int MaintenanceDeltaTypes::applyMaintenances(
   }
 
   auto modified_defs = std::move(state).get_maintenances();
+  std::vector<std::string> new_defs_description;
   for (const auto& def : defs) {
+    new_defs_description.push_back(
+        folly::sformat("Group ID: {} Reason: {}",
+                       def.group_id_ref().value_or("UNSET"),
+                       def.reason_ref().value()));
     modified_defs.push_back(def);
   }
   state.set_maintenances(std::move(modified_defs));
+  ld_info(
+      "Adding %s",
+      rangeToString(new_defs_description.cbegin(), new_defs_description.cend())
+          .c_str());
   return 0;
 }
 
@@ -134,7 +142,10 @@ int MaintenanceDeltaTypes::removeMaintenances(
   // references in the vector will be invalidated
   auto pos_it = pos_to_remove.rbegin();
   while (pos_it != pos_to_remove.rend()) {
-    ld_info("Removing Group: %s", (*pos_it)->group_id_ref().value().c_str());
+    const auto& def = *pos_it;
+    ld_info("Removing Group: %s Reason: %s",
+            def->group_id_ref().value_or("UNSET").c_str(),
+            req.get_reason().c_str());
     modified_defs.erase(*pos_it);
     pos_it++;
   }

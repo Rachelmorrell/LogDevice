@@ -39,7 +39,6 @@ namespace facebook { namespace logdevice {
  *       messages carrying information about availability of other nodes.
  */
 
-class Connection;
 class GOSSIP_Message;
 class ServerProcessor;
 class StatsHolder;
@@ -333,6 +332,10 @@ class FailureDetector {
     // - storage_membership_version
     std::array<membership::MembershipVersion::Type, 3> ncm_versions_;
 
+    // This is set when a node hasn't been processing gossips for some time
+    // indicated by a setting GOSSIP_Message::LONG_TIME_SINCE_LAST_GOSSIP flag.
+    bool stalled_gossip_processor_{false};
+
     Node()
         : state_(NodeState::DEAD),
           blacklisted_(false),
@@ -434,6 +437,10 @@ class FailureDetector {
   // If so, we'll need to broadcast another round of gossip without the flag
   // to let everyone know we've started.
   bool need_to_broadcast_starting_state_finished_{false};
+
+  // The last time this node processed a gossip message. This is updated
+  // inside FailureDetector::onGossipReceived
+  SteadyTimestamp last_gossip_received_ts_;
 
   // All private and protected methods are called with locked mutex_ and
   // unlocked nodes_mutex_, unless stated otherwise.
@@ -607,7 +614,10 @@ class FailureDetector {
   bool senderUsingHealthMonitor(node_index_t sender_idx,
                                 GOSSIP_Message::node_list_t node_list);
 
-  virtual Connection* getServerConnection(node_index_t idx);
+  virtual void resetServerSocketConnectThrottle(node_index_t);
+
+  virtual int checkServerConnection(node_index_t);
+
   virtual StatsHolder* getStats();
 
   friend class MockFailureDetector;

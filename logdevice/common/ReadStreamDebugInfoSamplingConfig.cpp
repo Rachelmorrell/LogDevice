@@ -34,18 +34,10 @@ struct AllReadStreamsDebugCallback
 };
 
 template <typename F>
-static std::unique_ptr<AllReadStreamsDebugCallback<F>> createCallback(F func) {
+std::unique_ptr<AllReadStreamsDebugCallback<F>> createCallback(F func) {
   return std::make_unique<AllReadStreamsDebugCallback<F>>(func);
 }
 
-std::chrono::seconds currentTimeInSeconds() {
-  return std::chrono::duration_cast<std::chrono::seconds>(
-      std::chrono::system_clock::now().time_since_epoch());
-}
-
-bool isDeadlineExpired(int64_t deadline, std::chrono::seconds current_time) {
-  return current_time > std::chrono::seconds(deadline);
-}
 } // namespace
 
 namespace facebook { namespace logdevice {
@@ -84,27 +76,19 @@ ReadStreamDebugInfoSamplingConfig::ReadStreamDebugInfoSamplingConfig(
   updateCallback(status, out);
 }
 
-bool ReadStreamDebugInfoSamplingConfig::isReadStreamDebugInfoSamplingAllowed(
-    const std::string& csid,
-    std::chrono::seconds current_time) const {
-  auto locked_configs = configs_.rlock();
-  if (csid == "" || *locked_configs == nullptr) {
-    return false;
+void ReadStreamDebugInfoSamplingConfig::setUpdateCallback(
+    Callback&& updateCallback) {
+  auto configWLock = configs_.wlock();
+  updateCallback_ = std::move(updateCallback);
+  auto configRLock = configWLock.moveFromWriteToRead();
+  if (*configRLock) {
+    updateCallback_(**configRLock);
   }
-
-  for (const auto& config : (*locked_configs)->configs) {
-    if (config.csid != csid ||
-        isDeadlineExpired(config.deadline, current_time)) {
-      continue;
-    }
-    return true;
-  }
-  return false;
 }
 
-bool ReadStreamDebugInfoSamplingConfig::isReadStreamDebugInfoSamplingAllowed(
-    const std::string& csid) const {
-  return isReadStreamDebugInfoSamplingAllowed(csid, currentTimeInSeconds());
+void ReadStreamDebugInfoSamplingConfig::unsetUpdateCallback() {
+  auto configWLock = configs_.wlock();
+  updateCallback_ = [](auto&&...) {};
 }
 
 void ReadStreamDebugInfoSamplingConfig::updateCallback(
@@ -125,5 +109,7 @@ void ReadStreamDebugInfoSamplingConfig::updateCallback(
         "Unable to deserialize fetched All Read Streams Debugging Config.");
   }
   configs_.exchange(std::move(deserialized_configs));
+  auto configs = configs_.rlock();
+  updateCallback_(**configs);
 }
 }} // namespace facebook::logdevice

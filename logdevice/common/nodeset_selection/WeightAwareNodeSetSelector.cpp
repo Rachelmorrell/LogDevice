@@ -25,7 +25,7 @@ NodeSetSelector::Result WeightAwareNodeSetSelector::getStorageSet(
     nodeset_size_t target_nodeset_size,
     uint64_t seed,
     const EpochMetaData* prev,
-    const Options* options) {
+    const Options& options) {
   Result res;
   res.decision = Decision::FAILED;
 
@@ -104,7 +104,7 @@ NodeSetSelector::Result WeightAwareNodeSetSelector::getStorageSet(
   const auto& membership = nodes_configuration.getStorageMembership();
   for (const auto node : *membership) {
     // Filter nodes excluded from `options`.
-    if (options != nullptr && options->exclude_nodes.count(node)) {
+    if (options.exclude_nodes.count(node)) {
       continue;
     }
 
@@ -130,7 +130,7 @@ NodeSetSelector::Result WeightAwareNodeSetSelector::getStorageSet(
         ld_error("Can't select nodeset because node %d (%s) does not have "
                  "location information",
                  node,
-                 sd->address.toString().c_str());
+                 sd->default_client_data_address.toString().c_str());
         return res;
       }
 
@@ -141,7 +141,7 @@ NodeSetSelector::Result WeightAwareNodeSetSelector::getStorageSet(
                  "doesn't have location for scope %s.",
                  location.toString().c_str(),
                  node,
-                 sd->address.toString().c_str(),
+                 sd->default_client_data_address.toString().c_str(),
                  NodeLocation::scopeNames()[replication_scope].c_str());
         return res;
       }

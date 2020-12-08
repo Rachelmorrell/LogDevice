@@ -27,17 +27,19 @@
 #include <sys/wait.h>
 #include <thrift/lib/cpp2/async/HeaderClientChannel.h>
 
+#include "common/fb303/if/gen-cpp2/FacebookServiceAsyncClient.h"
+#include "logdevice/admin/AdminAPIUtils.h"
 #include "logdevice/admin/if/gen-cpp2/AdminAPI.h"
+#include "logdevice/admin/maintenance/MaintenanceLogWriter.h"
+#include "logdevice/admin/toString.h"
 #include "logdevice/common/CheckSealRequest.h"
 #include "logdevice/common/EpochMetaDataUpdater.h"
 #include "logdevice/common/FileConfigSource.h"
 #include "logdevice/common/FileConfigSourceThread.h"
-#include "logdevice/common/FileEpochStore.h"
 #include "logdevice/common/FlowGroup.h"
 #include "logdevice/common/HashBasedSequencerLocator.h"
 #include "logdevice/common/LegacyLogToShard.h"
 #include "logdevice/common/NodeHealthStatus.h"
-#include "logdevice/common/NodesConfigurationPublisher.h"
 #include "logdevice/common/NoopTraceLogger.h"
 #include "logdevice/common/Sockaddr.h"
 #include "logdevice/common/StaticSequencerLocator.h"
@@ -45,7 +47,6 @@
 #include "logdevice/common/configuration/InternalLogs.h"
 #include "logdevice/common/configuration/LocalLogsConfig.h"
 #include "logdevice/common/configuration/TextConfigUpdater.h"
-#include "logdevice/common/configuration/nodes/NodesConfigLegacyConverter.h"
 #include "logdevice/common/configuration/nodes/NodesConfigurationCodec.h"
 #include "logdevice/common/configuration/nodes/NodesConfigurationManagerFactory.h"
 #include "logdevice/common/debug.h"
@@ -53,6 +54,7 @@
 #include "logdevice/common/nodeset_selection/NodeSetSelectorFactory.h"
 #include "logdevice/common/plugin/PluginRegistry.h"
 #include "logdevice/common/plugin/SequencerLocatorFactory.h"
+#include "logdevice/common/test/InlineRequestPoster.h"
 #include "logdevice/common/test/TestUtil.h"
 #include "logdevice/include/Client.h"
 #include "logdevice/include/ClientSettings.h"
@@ -60,12 +62,15 @@
 #include "logdevice/lib/ClientPluginHelper.h"
 #include "logdevice/lib/ClientSettingsImpl.h"
 #include "logdevice/lib/ops/EventLogUtils.h"
+#include "logdevice/server/epoch_store/FileEpochStore.h"
 #include "logdevice/server/locallogstore/LocalLogStore.h"
 #include "logdevice/server/locallogstore/RocksDBLogStoreBase.h"
 #include "logdevice/server/locallogstore/ShardedRocksDBLocalLogStore.h"
 #include "logdevice/server/locallogstore/test/StoreUtil.h"
+#include "logdevice/test/utils/AdminAPITestUtils.h"
 #include "logdevice/test/utils/ServerInfo.h"
 #include "logdevice/test/utils/port_selection.h"
+#include "logdevice/test/utils/util.h"
 
 using facebook::logdevice::configuration::LocalLogsConfig;
 #ifdef FB_BUILD_PATHS
@@ -78,6 +83,9 @@ namespace facebook { namespace logdevice { namespace IntegrationTestUtils {
 std::string defaultLogdevicedPath() {
   return "logdevice/server/logdeviced_nofb";
 }
+std::string defaultAdminServerPath() {
+  return "logdevice/ops/admin_server/ld-admin-server-nofb";
+}
 std::string defaultMarkdownLDQueryPath() {
   return "logdevice/ops/ldquery/markdown-ldquery";
 }
@@ -87,11 +95,16 @@ static const char* CHECKER_PATH =
 std::string defaultLogdevicedPath() {
   return "bin/logdeviced";
 }
+std::string defaultAdminServerPath() {
+  return "bin/ld-admin-server";
+}
 std::string defaultMarkdownLDQueryPath() {
   return "bin/markdown-ldquery";
 }
 static const char* CHECKER_PATH = "bin/ld-replication-checker";
 #endif
+
+static std::string_view LOC_PREFIX = "rg1.dc1.cl1.rw1.rk";
 
 namespace fs = boost::filesystem;
 
@@ -99,7 +112,6 @@ namespace fs = boost::filesystem;
 // requested
 static void maybe_pause_for_gdb(Cluster&,
                                 const std::vector<node_index_t>& indices);
-static int dump_file_to_stderr(const char* path);
 
 namespace {
 // Helper classes and functions used to parse the output of admin commands
@@ -298,11 +310,10 @@ Cluster::Cluster(std::string root_path,
                  std::string epoch_store_path,
                  std::string ncs_path,
                  std::string server_binary,
+                 std::string admin_server_binary,
                  std::string cluster_name,
                  bool enable_logsconfig_manager,
-                 bool one_config_per_node,
                  dbg::Level default_log_level,
-                 bool sync_server_config_to_nodes_configuration,
                  NodesConfigurationSourceOfTruth nodes_configuration_sot)
     : root_path_(std::move(root_path)),
       root_pin_(std::move(root_pin)),
@@ -310,13 +321,11 @@ Cluster::Cluster(std::string root_path,
       epoch_store_path_(std::move(epoch_store_path)),
       ncs_path_(std::move(ncs_path)),
       server_binary_(std::move(server_binary)),
+      admin_server_binary_(std::move(admin_server_binary)),
       cluster_name_(std::move(cluster_name)),
       enable_logsconfig_manager_(enable_logsconfig_manager),
       nodes_configuration_sot_(nodes_configuration_sot),
-      one_config_per_node_(one_config_per_node),
-      default_log_level_(default_log_level),
-      sync_server_config_to_nodes_configuration_(
-          sync_server_config_to_nodes_configuration) {
+      default_log_level_(default_log_level) {
   config_ = std::make_shared<UpdateableConfig>();
   client_settings_.reset(ClientSettings::create());
   ClientSettingsImpl* impl_settings =
@@ -361,11 +370,10 @@ Cluster::Cluster(std::string root_path,
     config_->updateableLogsConfig()->update(logs_config);
   }
 
-  nodes_configuration_publisher_ =
-      std::make_unique<NodesConfigurationPublisher>(
-          config_,
-          impl_settings->getSettings(),
-          std::make_unique<NoopTraceLogger>(config_, folly::none));
+  nodes_configuration_updater_ =
+      std::make_unique<NodesConfigurationFileUpdater>(
+          config_->updateableNodesConfiguration(),
+          buildNodesConfigurationStore());
 }
 
 logsconfig::LogAttributes
@@ -375,21 +383,19 @@ ClusterFactory::createLogAttributesStub(int nstorage_nodes) {
           false);
   switch (nstorage_nodes) {
     case 1:
-      attrs =
-          attrs.with_replicationFactor(1).with_extraCopies(0).with_syncedCopies(
-              0);
+      attrs = attrs.with_replicationFactor(1).with_syncedCopies(0);
       break;
     case 2:
-      attrs =
-          attrs.with_replicationFactor(2).with_extraCopies(0).with_syncedCopies(
-              0);
+      attrs = attrs.with_replicationFactor(2).with_syncedCopies(0);
       break;
     default:
-      attrs =
-          attrs.with_replicationFactor(2).with_extraCopies(0).with_syncedCopies(
-              0);
+      attrs = attrs.with_replicationFactor(2).with_syncedCopies(0);
   }
   return attrs;
+}
+
+ClusterFactory::ClusterFactory() {
+  populateDefaultServerSettings();
 }
 
 ClusterFactory& ClusterFactory::enableMessageErrorInjection() {
@@ -463,15 +469,16 @@ ClusterFactory::createDefaultLogAttributes(int nstorage_nodes) {
   return createLogAttributesStub(nstorage_nodes);
 }
 
-std::unique_ptr<Cluster> ClusterFactory::create(int nnodes) {
-  Configuration::Nodes nodes;
+std::shared_ptr<const NodesConfiguration>
+ClusterFactory::provisionNodesConfiguration(int nnodes) const {
+  if (nodes_config_ != nullptr) {
+    return nodes_config_;
+  }
 
-  std::string loc_prefix = "rg1.dc1.cl1.rw1.rk";
+  configuration::Nodes nodes;
 
-  if (node_configs_.has_value()) {
-    nodes = node_configs_.value();
-    nnodes = (int)nodes.size();
-  } else if (hash_based_sequencer_assignment_) {
+  int num_storage_nodes = 0;
+  if (hash_based_sequencer_assignment_) {
     // Hash based sequencer assignment is used, all nodes are both sequencers
     // and storage nodes.
     for (int i = 0; i < nnodes; ++i) {
@@ -479,12 +486,13 @@ std::unique_ptr<Cluster> ClusterFactory::create(int nnodes) {
       node.name = folly::sformat("server-{}", i);
       node.generation = 1;
       NodeLocation location;
-      location.fromDomainString(loc_prefix +
+      location.fromDomainString(std::string(LOC_PREFIX) +
                                 std::to_string(i % num_racks_ + 1));
       node.location = location;
 
       node.addSequencerRole();
       node.addStorageRole(num_db_shards_);
+      num_storage_nodes++;
 
       nodes[i] = std::move(node);
     }
@@ -495,7 +503,7 @@ std::unique_ptr<Cluster> ClusterFactory::create(int nnodes) {
       Configuration::Node node;
       node.name = folly::sformat("server-{}", i);
       NodeLocation location;
-      location.fromDomainString(loc_prefix +
+      location.fromDomainString(std::string(LOC_PREFIX) +
                                 std::to_string(i % num_racks_ + 1));
       node.location = location;
       node.generation = 1;
@@ -504,6 +512,7 @@ std::unique_ptr<Cluster> ClusterFactory::create(int nnodes) {
       }
       if (is_storage_node) {
         node.addStorageRole(num_db_shards_);
+        num_storage_nodes++;
       }
       nodes[i] = std::move(node);
     }
@@ -520,10 +529,44 @@ std::unique_ptr<Cluster> ClusterFactory::create(int nnodes) {
     }
   }
 
-  int nstorage_nodes = std::count_if(
-      nodes.begin(), nodes.end(), [](Configuration::Nodes::value_type kv) {
-        return kv.second.isReadableStorageNode();
-      });
+  ReplicationProperty metadata_replication_property;
+  if (meta_config_.has_value()) {
+    auto meta_config = meta_config_.value();
+    metadata_replication_property = ReplicationProperty::fromLogAttributes(
+        meta_config.metadata_log_group->attrs());
+
+    // Set which nodes are metadata nodes based on the passed nodeset
+    // TODO: Deprecate the ability to pass nodesets in the MetaDataLogConfig
+    // structure.
+    std::set<node_index_t> metadata_nodes = {
+        meta_config.metadata_nodes.begin(), meta_config.metadata_nodes.end()};
+    for (auto& [nid, node] : nodes) {
+      if (metadata_nodes.find(nid) != metadata_nodes.end()) {
+        node.metadata_node = true;
+      }
+    }
+  } else {
+    int rep_factor = internal_logs_replication_factor_ > 0
+        ? internal_logs_replication_factor_
+        : 3;
+    rep_factor = std::min(rep_factor, num_storage_nodes);
+
+    metadata_replication_property =
+        ReplicationProperty{{NodeLocationScope::NODE, rep_factor}};
+
+    // metadata stored on all storage nodes with max replication factor 3
+    for (auto& [_, node] : nodes) {
+      node.metadata_node = true;
+    }
+  }
+
+  return NodesConfigurationTestUtil::provisionNodes(
+      std::move(nodes), std::move(metadata_replication_property));
+}
+
+std::unique_ptr<Cluster> ClusterFactory::create(int nnodes) {
+  auto nodes_configuration = provisionNodesConfiguration(nnodes);
+  int nstorage_nodes = nodes_configuration->getStorageNodes().size();
 
   logsconfig::LogAttributes log0;
   if (log_attributes_.has_value()) {
@@ -541,19 +584,11 @@ std::unique_ptr<Cluster> ClusterFactory::create(int nnodes) {
   logs_config->insert(logid_interval, log_group_name_, log0);
   logs_config->markAsFullyLoaded();
 
-  Configuration::NodesConfig nodes_config(std::move(nodes));
-
   Configuration::MetaDataLogsConfig meta_config;
   if (meta_config_.has_value()) {
     meta_config = meta_config_.value();
   } else {
-    // metadata stored on all storage nodes with max replication factor 3
-    meta_config =
-        createMetaDataLogsConfig(nodes_config,
-                                 nodes_config.getNodes().size(),
-                                 internal_logs_replication_factor_ > 0
-                                     ? internal_logs_replication_factor_
-                                     : 3);
+    meta_config = createMetaDataLogsConfig({}, 0);
     if (!let_sequencers_provision_metadata_) {
       meta_config.sequencers_write_metadata_logs = false;
       meta_config.sequencers_provision_epoch_store = false;
@@ -562,7 +597,7 @@ std::unique_ptr<Cluster> ClusterFactory::create(int nnodes) {
 
   // Generic log configuration for internal logs
   logsconfig::LogAttributes internal_log_attrs =
-      createLogAttributesStub(nstorage_nodes).with_extraCopies(0);
+      createLogAttributesStub(nstorage_nodes);
 
   // Internal logs shouldn't have a lower replication factor than data logs
   if (log_attributes_.has_value() &&
@@ -688,7 +723,6 @@ std::unique_ptr<Cluster> ClusterFactory::create(int nnodes) {
 
   auto config = std::make_unique<Configuration>(
       ServerConfig::fromDataTest(cluster_name_,
-                                 std::move(nodes_config),
                                  std::move(meta_config),
                                  ServerConfig::PrincipalsConfig(),
                                  ServerConfig::SecurityConfig(),
@@ -697,7 +731,8 @@ std::unique_ptr<Cluster> ClusterFactory::create(int nnodes) {
                                  std::move(server_settings),
                                  std::move(client_settings),
                                  internal_logs_),
-      enable_logsconfig_manager_ ? nullptr : logs_config);
+      enable_logsconfig_manager_ ? nullptr : logs_config,
+      std::move(nodes_configuration));
   logs_config->setInternalLogsConfig(
       config->serverConfig()->getInternalLogsConfig());
 
@@ -717,17 +752,23 @@ ClusterFactory::createOneTry(const Configuration& source_config) {
     // Abort early if this failed
     return nullptr;
   }
+  const std::string actual_admin_server_binary = actualAdminServerBinary();
+  if (actual_admin_server_binary.empty()) {
+    // Abort early if this failed
+    return nullptr;
+  }
 
-  Configuration::Nodes nodes = source_config.serverConfig()->getNodes();
-  const int nnodes = nodes.size();
+  auto nodes_configuration = source_config.getNodesConfiguration();
+  const int nnodes = nodes_configuration->clusterSize();
   std::vector<node_index_t> node_ids(nnodes);
   std::map<node_index_t, node_gen_t> replacement_counters;
 
   int j = 0;
-  for (auto it : nodes) {
+  for (const auto& [nid, _] : *nodes_configuration->getServiceDiscovery()) {
     ld_check(j < nnodes);
-    node_ids[j++] = it.first;
-    replacement_counters[it.first] = it.second.generation;
+    node_ids[j++] = nid;
+    auto* attrs = nodes_configuration->getNodeStorageAttribute(nid);
+    replacement_counters[nid] = attrs ? attrs->generation : 1;
   }
   ld_check(j == nnodes);
 
@@ -744,13 +785,15 @@ ClusterFactory::createOneTry(const Configuration& source_config) {
 
   std::string epoch_store_path = root_path + "/epoch_store";
   mkdir(epoch_store_path.c_str(), 0777);
+  setServerSetting("epoch-store-path", epoch_store_path);
+
+  ServerConfig::SettingsConfig server_settings =
+      source_config.serverConfig()->getServerSettingsConfig();
 
   std::string ncs_path;
   {
     // If the settings specify a certain NCS path, use it, otherwise, use a
     // default one under root_path.
-    const auto& server_settings =
-        source_config.serverConfig()->getServerSettingsConfig();
     auto config_ncs_path =
         server_settings.find("nodes-configuration-file-store-dir");
     if (config_ncs_path != server_settings.end()) {
@@ -760,6 +803,7 @@ ClusterFactory::createOneTry(const Configuration& source_config) {
       mkdir(ncs_path.c_str(), 0777);
     }
   }
+  setServerSetting("nodes-configuration-file-store-dir", ncs_path);
 
   std::vector<ServerAddresses> addrs;
   if (Cluster::pickAddressesForServers(
@@ -767,16 +811,30 @@ ClusterFactory::createOneTry(const Configuration& source_config) {
     return nullptr;
   }
 
-  for (int i = 0; i < nnodes; ++i) {
-    addrs[i].toNodeConfig(nodes[node_ids[i]], !no_ssl_address_);
+  if (nodes_configuration->clusterSize() > 0) {
+    // Set the final list of addresses
+    NodesConfiguration::Update update{};
+    update.service_discovery_update = std::make_unique<
+        configuration::nodes::ServiceDiscoveryConfig::Update>();
+
+    for (int i = 0; i < nnodes; ++i) {
+      auto sd = nodes_configuration->getNodeServiceDiscovery(node_ids[i]);
+      ld_check(sd);
+      auto new_sd = *sd;
+      addrs[i].toNodeConfig(new_sd, !no_ssl_address_);
+      update.service_discovery_update->addNode(
+          node_ids[i],
+          {configuration::nodes::ServiceDiscoveryConfig::UpdateType::RESET,
+           std::make_unique<configuration::nodes::NodeServiceDiscovery>(
+               new_sd)});
+    }
+    nodes_configuration = nodes_configuration->applyUpdate(std::move(update));
+    ld_check(nodes_configuration);
   }
 
   if (!nodes_configuration_sot_.has_value()) {
     // sot setting not provided. randomize the source of truth of NC.
-    nodes_configuration_sot_.assign(
-        folly::Random::rand64(2) == 0
-            ? NodesConfigurationSourceOfTruth::NCM
-            : NodesConfigurationSourceOfTruth::SERVER_CONFIG);
+    nodes_configuration_sot_.assign(NodesConfigurationSourceOfTruth::NCM);
   }
 
   ld_check(nodes_configuration_sot_.has_value());
@@ -785,12 +843,47 @@ ClusterFactory::createOneTry(const Configuration& source_config) {
       nodes_configuration_sot_.value() == NodesConfigurationSourceOfTruth::NCM
           ? "NCM"
           : "SERVER_CONFIG");
-  ld_info("Cluster created with data in %s", root_path.c_str());
+  switch (nodes_configuration_sot_.value()) {
+    case NodesConfigurationSourceOfTruth::NCM:
+      setServerSetting("enable-nodes-configuration-manager", "true");
+      setServerSetting(
+          "use-nodes-configuration-manager-nodes-configuration", "true");
+      break;
+    case NodesConfigurationSourceOfTruth::SERVER_CONFIG:
+      setServerSetting(
+          "use-nodes-configuration-manager-nodes-configuration", "false");
+      break;
+  }
 
-  Configuration::NodesConfig nodes_config(std::move(nodes));
-  std::unique_ptr<Configuration> config = std::make_unique<Configuration>(
-      source_config.serverConfig()->withNodes(nodes_config),
-      source_config.logsConfig());
+  {
+    // Set NCM seed for clients in the config.
+    std::vector<std::string> addrs;
+    for (const auto& [_, node] : *nodes_configuration->getServiceDiscovery()) {
+      addrs.push_back(node.default_client_data_address.toString());
+    }
+    auto seed = folly::sformat("data:{}", folly::join(",", addrs));
+    setClientSetting("nodes-configuration-seed-servers", seed);
+  }
+
+  // Merge the provided server settings with the existing settings
+  for (const auto& [key, value] : server_settings_) {
+    server_settings.emplace(key, value);
+  }
+
+  ServerConfig::SettingsConfig client_settings =
+      source_config.serverConfig()->getClientSettingsConfig();
+  // Merge the provided client settings with the client settings
+  for (const auto& [key, value] : client_settings_) {
+    client_settings[key] = value;
+  }
+
+  ld_info("Cluster created with data in %s", root_path.c_str());
+  std::unique_ptr<Configuration> config =
+      std::make_unique<Configuration>(source_config.serverConfig()
+                                          ->withServerSettings(server_settings)
+                                          ->withClientSettings(client_settings),
+                                      source_config.logsConfig(),
+                                      std::move(nodes_configuration));
 
   // Write new config to disk so that logdeviced processes can access it
   std::string config_path = root_path + "/logdevice.conf";
@@ -807,11 +900,10 @@ ClusterFactory::createOneTry(const Configuration& source_config) {
                   epoch_store_path,
                   ncs_path,
                   actual_server_binary,
+                  actual_admin_server_binary,
                   cluster_name_,
                   enable_logsconfig_manager_,
-                  one_config_per_node_,
                   default_log_level_,
-                  sync_server_config_to_nodes_configuration_,
                   nodes_configuration_sot_.value()));
   if (use_tcp_) {
     cluster->use_tcp_ = true;
@@ -826,11 +918,19 @@ ClusterFactory::createOneTry(const Configuration& source_config) {
   cluster->rocksdb_type_ = rocksdb_type_;
   cluster->hash_based_sequencer_assignment_ = hash_based_sequencer_assignment_;
   cluster->setNodeReplacementCounters(std::move(replacement_counters));
-  cluster->maintenance_manager_node_ = maintenance_manager_node_;
 
-  if (cluster->rocksdb_type_ == RocksDBType::SINGLE) {
-    cluster->setParam(
-        "--rocksdb-partitioned", "false", ParamScope::STORAGE_NODE);
+  if (cluster->updateNodesConfiguration(*config->getNodesConfiguration()) !=
+      0) {
+    return nullptr;
+  }
+  cluster->nodes_configuration_updater_->start();
+  wait_until("NodesConfiguration is picked by the updater", [&]() {
+    return cluster->getConfig()->getNodesConfiguration() != nullptr;
+  });
+
+  // Start Admin Server if enabled
+  if (use_standalone_admin_server_) {
+    cluster->admin_server_ = cluster->createAdminServer();
   }
 
   // create Node objects, but don't start the processes
@@ -844,14 +944,6 @@ ClusterFactory::createOneTry(const Configuration& source_config) {
   if (provision_epoch_metadata_) {
     if (cluster->provisionEpochMetaData(
             provision_nodeset_selector_, allow_existing_metadata_) != 0) {
-      return nullptr;
-    }
-  }
-
-  if (provision_nodes_configuration_store_) {
-    const auto& server_config = config->serverConfig();
-    if (cluster->updateNodesConfigurationFromServerConfig(
-            server_config.get()) != 0) {
       return nullptr;
     }
   }
@@ -872,13 +964,8 @@ ClusterFactory::createOneTry(const Configuration& source_config) {
 
 std::unique_ptr<client::LogGroup>
 ClusterFactory::createLogsConfigManagerLogs(std::unique_ptr<Cluster>& cluster) {
-  auto nodes = cluster->getConfig()->getServerConfig()->getNodes();
-  int num_storage_nodes = 0;
-  for (const auto& node : nodes) {
-    if (node.second.isReadableStorageNode()) {
-      num_storage_nodes++;
-    }
-  }
+  int num_storage_nodes =
+      cluster->getConfig()->getNodesConfiguration()->getStorageNodes().size();
   logsconfig::LogAttributes attrs = log_attributes_.has_value()
       ? log_attributes_.value()
       : createDefaultLogAttributes(num_storage_nodes);
@@ -887,6 +974,68 @@ ClusterFactory::createLogsConfigManagerLogs(std::unique_ptr<Cluster>& cluster) {
       "/test_logs",
       logid_range_t(logid_t(1), logid_t(num_logs_config_manager_logs_)),
       attrs);
+}
+
+void ClusterFactory::populateDefaultServerSettings() {
+  // Poll for config updates more frequently in tests so that they
+  // progress faster
+  setServerSetting("file-config-update-interval", "100ms");
+
+  setServerSetting("assert-on-data", "true");
+  setServerSetting("enable-config-synchronization", "true");
+  // Disable rebuilding by default in tests, the test framework
+  // (`waitUntilRebuilt' etc) is not ready for it: #14697277
+  setServerSetting("disable-rebuilding", "true");
+  // Disable the random delay for SHARD_IS_REBUILT messages
+  setServerSetting("shard-is-rebuilt-msg-delay", "0s..0s");
+  // TODO(T22614431): remove this option once it's been enabled
+  // everywhere.
+  setServerSetting("allow-conditional-rebuilding-restarts", "true");
+  setServerSetting("rebuilding-restarts-grace-period", "1ms");
+  setServerSetting("planner-scheduling-delay", "1s");
+  // RebuildingTest does not expect this: #14697312
+  setServerSetting("enable-self-initiated-rebuilding", "false");
+  // disable failure detector because it delays sequencer startup
+  setServerSetting("gossip-enabled", "false");
+  setServerSetting("ignore-cluster-marker", "true");
+  setServerSetting("rocksdb-auto-create-shards", "true");
+  setServerSetting("num-workers", "5");
+  // always enable NCM
+  setServerSetting("enable-nodes-configuration-manager", "true");
+  setServerSetting(
+      "nodes-configuration-manager-store-polling-interval", "100ms");
+
+  // Small timeout is needed so that appends that happen right after
+  // rebuilding, when socket isn't reconnected yet, retry quickly.
+  setServerSetting("store-timeout", "10ms..1s");
+  // smaller recovery retry timeout for reading seqencer metadata
+  setServerSetting("recovery-seq-metadata-timeout", "100ms..500ms");
+  // Smaller mutation and cleaning timeout, to make recovery retry faster
+  // if a participating node died at the wrong moment.
+  // TODO (#54460972): Would be better to make recovery detect such
+  // situations by itself, probably using ClusterState.
+  setServerSetting("recovery-timeout", "5s");
+  // if we fail to store something on a node, we should retry earlier than
+  // the default 60s
+  setServerSetting("unroutable-retry-interval", "1s");
+
+  // Disable disk space checking by default; tests that want it can
+  // override
+  setServerSetting("free-disk-space-threshold", "0.000001");
+  // Run fewer than the default 4 threads to perform better under load
+  setServerSetting("storage-threads-per-shard-slow", "2");
+  setServerSetting("rocksdb-allow-fallocate", "false");
+  // Reduce memory usage for storage thread queues compared to the
+  // default setting
+  setServerSetting("max-inflight-storage-tasks", "512");
+
+  if (!no_ssl_address_) {
+    setServerSetting(
+        "ssl-ca-path", TEST_SSL_FILE("logdevice_test_valid_ca.cert"));
+    setServerSetting(
+        "ssl-cert-path", TEST_SSL_FILE("logdevice_test_valid.cert"));
+    setServerSetting("ssl-key-path", TEST_SSL_FILE("logdevice_test.key"));
+  }
 }
 
 int Cluster::pickAddressesForServers(
@@ -925,27 +1074,151 @@ int Cluster::pickAddressesForServers(
   return 0;
 }
 
-int Cluster::expand(std::vector<node_index_t> new_indices,
-                    bool start_nodes,
-                    bool bump_config_version) {
-  // TODO: make it work with one config per nodes.
-  ld_check(!one_config_per_node_);
-  Configuration::Nodes nodes = config_->get()->serverConfig()->getNodes();
+int Cluster::expandViaAdminServer(thrift::AdminAPIAsyncClient& admin_client,
+                                  int nnodes,
+                                  bool start_nodes,
+                                  int num_racks) {
+  std::vector<node_index_t> new_indices;
+  node_index_t first = config_->getNodesConfiguration()->getMaxNodeIndex() + 1;
+  for (int i = 0; i < nnodes; ++i) {
+    new_indices.push_back(first + i);
+  }
+  return expandViaAdminServer(
+      admin_client, std::move(new_indices), start_nodes, num_racks);
+}
 
+int Cluster::expandViaAdminServer(thrift::AdminAPIAsyncClient& admin_client,
+                                  std::vector<node_index_t> new_indices,
+                                  bool start_nodes,
+                                  int num_racks) {
+  std::sort(new_indices.begin(), new_indices.end());
+  if (std::unique(new_indices.begin(), new_indices.end()) !=
+      new_indices.end()) {
+    ld_error("expandViaAdminServer() called with duplicate indices");
+    return -1;
+  }
+
+  auto nodes_config = getConfig()->getNodesConfiguration();
+  for (node_index_t i : new_indices) {
+    if (nodes_config->isNodeInServiceDiscoveryConfig(i) || nodes_.count(i)) {
+      ld_error("expandViaAdminServer() called with node index %d that already "
+               "exists",
+               (int)i);
+      return -1;
+    }
+  }
+  ld_info("Expanding with nodes %s", toString(new_indices).c_str());
+
+  configuration::Nodes nodes;
+  for (node_index_t idx : new_indices) {
+    Configuration::Node node;
+    node.name = folly::sformat("server-{}", idx);
+    node.generation = 1;
+    NodeLocation location;
+    location.fromDomainString(std::string(LOC_PREFIX) +
+                              std::to_string(idx % num_racks + 1));
+    node.location = location;
+    setNodeReplacementCounter(idx, 1);
+
+    // Storage only node.
+    node.addStorageRole(num_db_shards_);
+    nodes[idx] = std::move(node);
+  }
+
+  nodes_config = nodes_config->applyUpdate(
+      NodesConfigurationTestUtil::addNewNodesUpdate(*nodes_config, nodes));
+  ld_check(nodes_config);
+
+  std::vector<ServerAddresses> addrs;
+  if (pickAddressesForServers(new_indices,
+                              use_tcp_,
+                              root_path_,
+                              node_replacement_counters_,
+                              addrs) != 0) {
+    return -1;
+  }
+
+  // Set the addresses
+  NodesConfiguration::Update update{};
+  update.service_discovery_update =
+      std::make_unique<configuration::nodes::ServiceDiscoveryConfig::Update>();
+
+  for (size_t i = 0; i < new_indices.size(); ++i) {
+    auto idx = new_indices[i];
+    auto sd = nodes_config->getNodeServiceDiscovery(idx);
+    ld_check(sd);
+    auto new_sd = *sd;
+    addrs[i].toNodeConfig(new_sd, !no_ssl_address_);
+
+    update.service_discovery_update->addNode(
+        idx,
+        {configuration::nodes::ServiceDiscoveryConfig::UpdateType::RESET,
+         std::make_unique<configuration::nodes::NodeServiceDiscovery>(new_sd)});
+  }
+  nodes_config = nodes_config->applyUpdate(std::move(update));
+  ld_check(nodes_config);
+
+  // Tests expect the nodes to be enabled. Let's force enable the new nodes.
+  std::vector<ShardID> shards;
+  for (node_index_t idx : new_indices) {
+    shards.emplace_back(idx, -1);
+  }
+
+  // Submit the request to Admin Server
+  thrift::AddNodesRequest req;
+  thrift::AddNodesResponse resp;
+  for (node_index_t i : new_indices) {
+    thrift::NodeConfig node_cfg;
+    fillNodeConfig(node_cfg, i, *nodes_config);
+    thrift::AddSingleNodeRequest single;
+
+    ld_info("Adding Node: %s", thriftToJson(node_cfg).c_str());
+    single.set_new_config(std::move(node_cfg));
+    req.new_node_requests_ref()->push_back(std::move(single));
+  }
+  try {
+    admin_client.sync_addNodes(resp, req);
+  } catch (const thrift::ClusterMembershipOperationFailed& exception) {
+    ld_error("Failed to expand the cluster with nodes %s: %s (%s)",
+             toString(new_indices).c_str(),
+             exception.what(),
+             thriftToJson(exception).c_str());
+    return -1;
+  }
+  vcs_config_version_t new_config_version(
+      static_cast<uint64_t>(resp.get_new_nodes_configuration_version()));
+  ld_info("Nodes added via Admin API in new config version %lu",
+          new_config_version.val_);
+
+  waitForServersAndClientsToProcessNodesConfiguration(new_config_version);
+  for (size_t i = 0; i < new_indices.size(); ++i) {
+    node_index_t idx = new_indices[i];
+    nodes_[idx] = createNode(idx, std::move(addrs[i]));
+  }
+  if (!start_nodes) {
+    return 0;
+  }
+  return start(new_indices);
+}
+
+int Cluster::expand(std::vector<node_index_t> new_indices, bool start_nodes) {
   std::sort(new_indices.begin(), new_indices.end());
   if (std::unique(new_indices.begin(), new_indices.end()) !=
       new_indices.end()) {
     ld_error("expand() called with duplicate indices");
     return -1;
   }
+
+  auto nodes_config = getConfig()->getNodesConfiguration();
   for (node_index_t i : new_indices) {
-    if (nodes.count(i) || nodes_.count(i)) {
+    if (nodes_config->isNodeInServiceDiscoveryConfig(i) || nodes_.count(i)) {
       ld_error(
           "expand() called with node index %d that already exists", (int)i);
       return -1;
     }
   }
 
+  configuration::Nodes nodes;
   for (node_index_t idx : new_indices) {
     Configuration::Node node;
     node.name = folly::sformat("server-{}", idx);
@@ -957,6 +1230,10 @@ int Cluster::expand(std::vector<node_index_t> new_indices,
     nodes[idx] = std::move(node);
   }
 
+  nodes_config = nodes_config->applyUpdate(
+      NodesConfigurationTestUtil::addNewNodesUpdate(*nodes_config, nodes));
+  ld_check(nodes_config);
+
   std::vector<ServerAddresses> addrs;
   if (pickAddressesForServers(new_indices,
                               use_tcp_,
@@ -966,24 +1243,47 @@ int Cluster::expand(std::vector<node_index_t> new_indices,
     return -1;
   }
 
-  for (size_t i = 0; i < new_indices.size(); ++i) {
-    addrs[i].toNodeConfig(nodes[new_indices[i]], !no_ssl_address_);
+  {
+    // Set the addresses
+    NodesConfiguration::Update update{};
+    update.service_discovery_update = std::make_unique<
+        configuration::nodes::ServiceDiscoveryConfig::Update>();
+
+    for (size_t i = 0; i < new_indices.size(); ++i) {
+      auto idx = new_indices[i];
+      auto sd = nodes_config->getNodeServiceDiscovery(idx);
+      ld_check(sd);
+      auto new_sd = *sd;
+      addrs[i].toNodeConfig(new_sd, !no_ssl_address_);
+      update.service_discovery_update->addNode(
+          idx,
+          {configuration::nodes::ServiceDiscoveryConfig::UpdateType::RESET,
+           std::make_unique<configuration::nodes::NodeServiceDiscovery>(
+               new_sd)});
+    }
+    nodes_config = nodes_config->applyUpdate(std::move(update));
+    ld_check(nodes_config);
   }
 
-  Configuration::NodesConfig nodes_config(std::move(nodes));
-  auto config = config_->get();
-  auto new_server_config =
-      config->serverConfig()->withNodes(std::move(nodes_config));
-
-  if (bump_config_version) {
-    new_server_config = new_server_config->withIncrementedVersion();
+  {
+    // Tests expect the nodes to be enabled. Let's force enable the new nodes.
+    std::vector<ShardID> shards;
+    for (node_index_t idx : new_indices) {
+      shards.emplace_back(idx, -1);
+    }
+    nodes_config = nodes_config->applyUpdate(
+        NodesConfigurationTestUtil::setStorageMembershipUpdate(
+            *nodes_config,
+            std::move(shards),
+            membership::StorageState::READ_WRITE,
+            folly::none));
+    ld_check(nodes_config);
   }
 
-  int rv = writeConfig(new_server_config.get(), config->logsConfig().get());
+  int rv = updateNodesConfiguration(*nodes_config);
   if (rv != 0) {
     return -1;
   }
-  waitForServersToPartiallyProcessConfigUpdate();
 
   if (!start_nodes) {
     return 0;
@@ -997,39 +1297,24 @@ int Cluster::expand(std::vector<node_index_t> new_indices,
   return start(new_indices);
 }
 
-int Cluster::expand(int nnodes, bool start, bool bump_config_version) {
+int Cluster::expand(int nnodes, bool start) {
   std::vector<node_index_t> new_indices;
   node_index_t first = config_->getNodesConfiguration()->getMaxNodeIndex() + 1;
   for (int i = 0; i < nnodes; ++i) {
     new_indices.push_back(first + i);
   }
-  return expand(new_indices, start, bump_config_version);
+  return expand(new_indices, start);
 }
 
 int Cluster::shrink(std::vector<node_index_t> indices) {
-  // TODO: make it work with one config per nodes.
-  ld_check(!one_config_per_node_);
-
   if (indices.empty()) {
     ld_error("shrink() called with no nodes");
     return -1;
   }
 
-  Configuration::Nodes nodes = config_->get()->serverConfig()->getNodes();
-
   std::sort(indices.begin(), indices.end());
   if (std::unique(indices.begin(), indices.end()) != indices.end()) {
     ld_error("shrink() called with duplicate indices");
-    return -1;
-  }
-  for (node_index_t i : indices) {
-    if (!nodes.count(i) || !nodes_.count(i)) {
-      ld_error("shrink() called with node index %d that doesn't exist", (int)i);
-      return -1;
-    }
-  }
-  if (indices.size() >= std::min(nodes.size(), nodes_.size())) {
-    ld_error("Cannot remove all nodes from the cluster");
     return -1;
   }
 
@@ -1042,21 +1327,32 @@ int Cluster::shrink(std::vector<node_index_t> indices) {
 
   for (node_index_t i : indices) {
     nodes_.erase(i);
-    nodes.erase(i);
   }
 
-  Configuration::NodesConfig nodes_config(std::move(nodes));
-  auto config = config_->get();
-  auto new_server_config = config->serverConfig()
-                               ->withNodes(std::move(nodes_config))
-                               ->withIncrementedVersion();
+  // We need to force set the storage state to EMPTY so that NCM can allow us
+  // to shrink them.
+  auto nodes_config = getConfig()->getNodesConfiguration();
 
-  int rv = writeConfig(new_server_config.get(), config->logsConfig().get());
+  std::vector<ShardID> shards;
+  std::transform(indices.begin(),
+                 indices.end(),
+                 std::back_inserter(shards),
+                 [](node_index_t idx) { return ShardID(idx, -1); });
+
+  nodes_config = nodes_config->applyUpdate(
+      NodesConfigurationTestUtil::setStorageMembershipUpdate(
+          *nodes_config,
+          shards,
+          membership::StorageState::NONE,
+          membership::MetaDataStorageState::NONE));
+
+  nodes_config = nodes_config->applyUpdate(
+      NodesConfigurationTestUtil::shrinkNodesUpdate(*nodes_config, indices));
+
+  int rv = updateNodesConfiguration(*nodes_config);
   if (rv != 0) {
     return -1;
   }
-  waitForServersToPartiallyProcessConfigUpdate();
-
   return 0;
 }
 
@@ -1077,6 +1373,80 @@ int Cluster::shrink(int nnodes) {
   return shrink(indices);
 }
 
+int Cluster::shrinkViaAdminServer(thrift::AdminAPIAsyncClient& admin_client,
+                                  std::vector<node_index_t> indices) {
+  if (indices.empty()) {
+    ld_error("shrink() called with no nodes");
+    return -1;
+  }
+
+  std::sort(indices.begin(), indices.end());
+  if (std::unique(indices.begin(), indices.end()) != indices.end()) {
+    ld_error("shrink() called with duplicate indices");
+    return -1;
+  }
+
+  // Kill the nodes before we remove them from the cluster.
+  ld_info("Killing nodes (for shrink) %s", toString(indices).c_str());
+  for (node_index_t i : indices) {
+    if (getNode(i).isRunning()) {
+      getNode(i).kill();
+    }
+  }
+
+  ld_info("Shrinking with nodes %s", toString(indices).c_str());
+
+  // Submit the request to Admin Server
+  thrift::RemoveNodesRequest req;
+  thrift::RemoveNodesResponse resp;
+  for (node_index_t i : indices) {
+    thrift::NodesFilter filter;
+    thrift::NodeID node;
+    node.set_node_index(i);
+    filter.set_node(node);
+    req.node_filters_ref()->push_back(std::move(filter));
+  }
+
+  try {
+    admin_client.sync_removeNodes(resp, req);
+  } catch (const thrift::ClusterMembershipOperationFailed& exception) {
+    ld_error("Failed to shrink the cluster with nodes %s: %s (%s)",
+             toString(indices).c_str(),
+             exception.what(),
+             thriftToJson(exception).c_str());
+    return -1;
+  }
+  vcs_config_version_t new_config_version(
+      static_cast<uint64_t>(resp.get_new_nodes_configuration_version()));
+  ld_info("Nodes removed via Admin API in new config version %lu",
+          new_config_version.val_);
+
+  waitForServersAndClientsToProcessNodesConfiguration(new_config_version);
+  // After we have removed the nodes from config.
+  for (node_index_t i : indices) {
+    nodes_.erase(i);
+  }
+  return 0;
+}
+
+int Cluster::shrinkViaAdminServer(thrift::AdminAPIAsyncClient& admin_client,
+                                  int nnodes) {
+  auto cfg = config_->get();
+
+  // Find nnodes highest node indices.
+  std::vector<node_index_t> indices;
+  for (auto it = nodes_.crbegin(); it != nodes_.crend() && nnodes > 0;
+       ++it, --nnodes) {
+    indices.push_back(it->first);
+  }
+  if (nnodes != 0) {
+    ld_error("shrinkViaAdminServer() called with too many nodes");
+    return -1;
+  }
+
+  return shrinkViaAdminServer(admin_client, indices);
+}
+
 void Cluster::stop() {
   for (auto& it : nodes_) {
     it.second->kill();
@@ -1084,6 +1454,11 @@ void Cluster::stop() {
 }
 
 int Cluster::start(std::vector<node_index_t> indices) {
+  // Start admin server if we are configured to start one first.
+  if (admin_server_) {
+    admin_server_->start();
+    admin_server_->waitUntilStarted();
+  }
   if (indices.size() == 0) {
     for (auto& it : nodes_) {
       indices.push_back(it.first);
@@ -1120,25 +1495,69 @@ int Cluster::provisionEpochMetaData(std::shared_ptr<NodeSetSelector> selector,
   return rv;
 }
 
-int Cluster::updateNodesConfigurationFromServerConfig(
-    const ServerConfig* server_config) {
+int Cluster::updateNodesConfiguration(
+    const NodesConfiguration& nodes_configuration) {
   using namespace logdevice::configuration::nodes;
-  auto nc = NodesConfigLegacyConverter::fromLegacyNodesConfig(
-      server_config->getNodesConfig(),
-      server_config->getMetaDataLogsConfig(),
-      server_config->getVersion());
   auto store = buildNodesConfigurationStore();
   if (store == nullptr) {
     return -1;
   }
-  auto serialized = NodesConfigurationCodec::serialize(*nc);
+  auto serialized = NodesConfigurationCodec::serialize(nodes_configuration);
   if (serialized.empty()) {
     return -1;
   }
   store->updateConfigSync(
       std::move(serialized), NodesConfigurationStore::Condition::overwrite());
+  waitForServersAndClientsToProcessNodesConfiguration(
+      nodes_configuration.getVersion());
   return 0;
 }
+
+std::unique_ptr<AdminServer> Cluster::createAdminServer() {
+  std::unique_ptr<AdminServer> server = std::make_unique<AdminServer>();
+  server->data_path_ = root_path_ + "/admin_server";
+  // Create the directory for logs and unix socket
+  mkdir(server->data_path_.c_str(), 0777);
+  // This test uses TCP. Look for enough free ports for each node.
+  Sockaddr admin_address;
+  std::vector<detail::PortOwner> port_owners;
+  if (use_tcp_) {
+    if (detail::find_free_port_set(1, port_owners) != 0) {
+      ld_error("No free ports on system for admin server");
+      return nullptr;
+    }
+
+    admin_address = Sockaddr(get_localhost_address_str(), port_owners[0].port);
+  } else {
+    // This test uses unix domain sockets. These will be created in the
+    // test directory.
+    admin_address = Sockaddr(server->data_path_ + "/socket_admin");
+  }
+  auto protocol_addr_param = admin_address.isUnixAddress()
+      ? std::make_pair(
+            "--admin-unix-socket", ParamValue{admin_address.getPath()})
+      : std::make_pair(
+            "--admin-port", ParamValue{std::to_string(admin_address.port())});
+  server->address_ = admin_address;
+  server->port_owners_ = std::move(port_owners);
+  server->admin_server_binary_ = admin_server_binary_;
+  server->config_path_ = config_path_;
+  server->cmd_args_ = {
+      protocol_addr_param,
+      {"--config-path", ParamValue{"file:" + server->config_path_}},
+      {"--loglevel", ParamValue{loglevelToString(default_log_level_)}},
+      {"--log-file", ParamValue{server->getLogPath()}},
+      {"--enable-maintenance-manager", ParamValue{"true"}},
+      {"--enable-cluster-maintenance-state-machine", ParamValue{"true"}},
+      {"--maintenance-manager-reevaluation-timeout", ParamValue{"5s"}},
+      {"--enable-safety-check-periodic-metadata-update", ParamValue{"true"}},
+      {"--safety-check-metadata-update-period", ParamValue{"30s"}},
+      {"--maintenance-log-snapshotting", ParamValue{"true"}},
+  };
+  ld_info("Admin Server will be started on address: %s",
+          server->address_.toString().c_str());
+  return server;
+} // namespace IntegrationTestUtils
 
 std::unique_ptr<Node> Cluster::createNode(node_index_t index,
                                           ServerAddresses addrs) const {
@@ -1155,24 +1574,17 @@ std::unique_ptr<Node> Cluster::createNode(node_index_t index,
   // /tmp/logdevice/IntegrationTestUtils.MkkZyS/N0:1/
   node->data_path_ = Cluster::getNodeDataPath(root_path_, index);
   boost::filesystem::create_directories(node->data_path_);
-
-  if (one_config_per_node_) {
-    // create individual config file for each node under their own directory
-    node->config_path_ = node->data_path_ + "/logdevice.conf";
-    overwriteConfigFile(node->config_path_.c_str(), config_->get()->toString());
-  } else {
-    node->config_path_ = config_path_;
-  }
+  node->config_path_ = config_path_;
 
   node->is_storage_node_ =
       config_->getNodesConfiguration()->isStorageNode(index);
   node->is_sequencer_node_ =
       config_->getNodesConfiguration()->isSequencerNode(index);
-  node->should_run_maintenance_manager_ = maintenance_manager_node_ == index;
   node->cmd_args_ = commandArgsForNode(*node);
 
   ld_info("Node N%d:%d will be started on addresses: protocol:%s, ssl:%s"
-          ", gossip:%s, admin:%s (data in %s), server-to-server:%s",
+          ", gossip:%s, admin:%s (data in %s), server-to-server:%s"
+          ", server thrift:%s, client thrift:%s",
           index,
           getNodeReplacementCounter(index),
           node->addrs_.protocol.toString().c_str(),
@@ -1180,7 +1592,9 @@ std::unique_ptr<Node> Cluster::createNode(node_index_t index,
           node->addrs_.gossip.toString().c_str(),
           node->addrs_.admin.toString().c_str(),
           node->data_path_.c_str(),
-          node->addrs_.server_to_server.toString().c_str());
+          node->addrs_.server_to_server.toString().c_str(),
+          node->addrs_.server_thrift_api.toString().c_str(),
+          node->addrs_.client_thrift_api.toString().c_str());
 
   return node;
 }
@@ -1192,8 +1606,6 @@ Cluster::createSelfRegisteringNode(const std::string& name) const {
   ld_check(isGossipEnabled());
   // Self registration only works with the NCM being the source of truth.
   ld_check(nodes_configuration_sot_ == NodesConfigurationSourceOfTruth::NCM);
-  // NCM doesn't work with one_config_per_node.
-  ld_check(!one_config_per_node_);
 
   std::unique_ptr<Node> node = std::make_unique<Node>();
   node->name_ = name;
@@ -1226,20 +1638,21 @@ Cluster::createSelfRegisteringNode(const std::string& name) const {
   // if needed we can change this function to accept the roles.
   node->is_storage_node_ = true;
   node->is_sequencer_node_ = true;
-  node->should_run_maintenance_manager_ = false;
 
   node->cmd_args_ = commandArgsForNode(*node);
 
   ld_info("Node %s (with self registration) will be started on addresses: "
           "protocol:%s, ssl: %s, gossip:%s, admin:%s (data in %s), "
-          "server-to-server:%s",
+          "server-to-server:%s, server thrift api:%s, client thrift api:%s",
           name.c_str(),
           node->addrs_.protocol.toString().c_str(),
           node->addrs_.protocol_ssl.toString().c_str(),
           node->addrs_.gossip.toString().c_str(),
           node->addrs_.admin.toString().c_str(),
           node->data_path_.c_str(),
-          node->addrs_.server_to_server.toString().c_str());
+          node->addrs_.server_to_server.toString().c_str(),
+          node->addrs_.server_thrift_api.toString().c_str(),
+          node->addrs_.client_thrift_api.toString().c_str());
 
   return node;
 }
@@ -1269,6 +1682,22 @@ ParamMap Cluster::commandArgsForNode(const Node& node) const {
       : std::make_pair(
             "--server-to-server-port", ParamValue{std::to_string(s2s.port())});
 
+  const auto& server_thrift = node.addrs_.server_thrift_api;
+  auto server_thrift_addr_param = server_thrift.isUnixAddress()
+      ? std::make_pair("--server-thrift-api-unix-socket",
+                       ParamValue{server_thrift.getPath()})
+      : std::make_pair("--server-thrift-api-port",
+                       ParamValue{std::to_string(server_thrift.port())});
+
+  const auto& client_thrift = node.addrs_.client_thrift_api;
+  auto client_thrift_addr_param = client_thrift.isUnixAddress()
+      ? std::make_pair("--client-thrift-api-unix-socket",
+                       ParamValue{client_thrift.getPath()})
+      : std::make_pair("--client-thrift-api-port",
+                       ParamValue{std::to_string(client_thrift.port())});
+
+  // TODO: T71290188 add ports per network priority here too
+
   // clang-format off
 
   // Construct the default parameters.
@@ -1276,112 +1705,27 @@ ParamMap Cluster::commandArgsForNode(const Node& node) const {
     { ParamScope::ALL,
       {
         protocol_addr_param, gossip_addr_param, admin_addr_param, s2s_addr_param,
+        server_thrift_addr_param, client_thrift_addr_param,
         {"--name", ParamValue{node.name_}},
         {"--test-mode", ParamValue{"true"}},
         {"--config-path", ParamValue{"file:" + node.config_path_}},
-        {"--epoch-store-path", ParamValue{epoch_store_path_}},
-        {"--nodes-configuration-file-store-dir", ParamValue{ncs_path_}},
-        // Poll for config updates more frequently in tests so that they
-        // progress faster
-        {"--file-config-update-interval", ParamValue{"100ms"}},
         {"--loglevel", ParamValue{loglevelToString(default_log_level_)}},
         {"--log-file", ParamValue{node.getLogPath()}},
         {"--server-id", ParamValue{node.server_id_}},
-        {"--assert-on-data", ParamValue{}},
-        {"--enable-config-synchronization", ParamValue{}},
-        // Disable rebuilding by default in tests, the test framework
-        // (`waitUntilRebuilt' etc) is not ready for it: #14697277
-        {"--disable-rebuilding", ParamValue{"true"}},
-        // Disable the random delay for SHARD_IS_REBUILT messages
-        {"--shard-is-rebuilt-msg-delay", ParamValue{"0s..0s"}},
-        // TODO(T22614431): remove this option once it's been enabled
-        // everywhere.
-        {"--allow-conditional-rebuilding-restarts", ParamValue{"true"}},
-        {"--rebuilding-restarts-grace-period", ParamValue{"1ms"}},
-        {"--planner-scheduling-delay", ParamValue{"1s"}},
-        // RebuildingTest does not expect this: #14697312
-        {"--enable-self-initiated-rebuilding", ParamValue{"false"}},
-        // disable failure detector because it delays sequencer startup
-        {"--gossip-enabled", ParamValue{"false"}},
-        {"--ignore-cluster-marker", ParamValue{"true"}},
-        {"--rocksdb-auto-create-shards", ParamValue{"true"}},
-        {"--num-workers", ParamValue{"5"}},
-        {"--nodes-configuration-manager-store-polling-interval", ParamValue{"100ms"}},
-        {"--enable-maintenance-manager",
-          ParamValue{node.should_run_maintenance_manager_ ?"true" : "false"}},
       }
     },
     { ParamScope::SEQUENCER,
       {
         {"--sequencers", ParamValue{"all"}},
-        // Small timeout is needed so that appends that happen right after
-        // rebuilding, when socket isn't reconnected yet, retry quickly.
-        {"--store-timeout", ParamValue{"10ms..1s"}},
-        // smaller recovery retry timeout for reading seqencer metadata
-        {"--recovery-seq-metadata-timeout", ParamValue{"100ms..500ms"}},
-        // Smaller mutation and cleaning timeout, to make recovery retry faster
-        // if a participating node died at the wrong moment.
-        // TODO (#54460972): Would be better to make recovery detect such
-        // situations by itself, probably using ClusterState.
-        {"--recovery-timeout", ParamValue{"5s"}},
-        // if we fail to store something on a node, we should retry earlier than
-        // the default 60s
-        {"--unroutable-retry-interval", ParamValue{"1s"}},
       }
     },
     { ParamScope::STORAGE_NODE,
       {
         {"--local-log-store-path", ParamValue{node.getDatabasePath()}},
         {"--num-shards", ParamValue{std::to_string(node.num_db_shards_)}},
-        // Disable disk space checking by default; tests that want it can
-        // override
-        {"--free-disk-space-threshold", ParamValue{"0.000001"}},
-        // Run fewer than the default 4 threads to perform better under load
-        {"--storage-threads-per-shard-slow", ParamValue{"2"}},
-        {"--rocksdb-allow-fallocate", ParamValue{"false"}},
-        // Reduce memory usage for storage thread queues compared to the
-        // default setting
-        {"--max-inflight-storage-tasks", ParamValue{"512"}},
       }
     }
   };
-
-  // TODO(tau0) Remove this.
-  if (enable_logsconfig_manager_) {
-    default_param_map[ParamScope::ALL]
-      ["--enable-logsconfig-manager"] = ParamValue{"true"};
-  } else {
-    default_param_map[ParamScope::ALL]
-      ["--enable-logsconfig-manager"] = ParamValue{"false"};
-  }
-
-  // always enable NCM
-  default_param_map[ParamScope::ALL]["--enable-nodes-configuration-manager"]
-    = ParamValue{"true"};
-
-  switch (nodes_configuration_sot_) {
-    case NodesConfigurationSourceOfTruth::NCM:
-      default_param_map[ParamScope::ALL][
-          "--enable-nodes-configuration-manager"] = ParamValue{"true"};
-      default_param_map[ParamScope::ALL][
-          "--use-nodes-configuration-manager-nodes-configuration"]
-        = ParamValue{"true"};
-      break;
-    case NodesConfigurationSourceOfTruth::SERVER_CONFIG:
-      default_param_map[ParamScope::ALL][
-          "--use-nodes-configuration-manager-nodes-configuration"]
-        = ParamValue{"false"};
-      break;
-  }
-
-  if (!no_ssl_address_) {
-    default_param_map[ParamScope::ALL]["--ssl-ca-path"] =
-        ParamValue(TEST_SSL_FILE("logdevice_test_valid_ca.cert"));
-    default_param_map[ParamScope::ALL]["--ssl-cert-path"] =
-        ParamValue(TEST_SSL_FILE("logdevice_test_valid.cert"));
-    default_param_map[ParamScope::ALL]["--ssl-key-path"] =
-        ParamValue(TEST_SSL_FILE("logdevice_test.key"));
-  }
 
   // clang-format on
 
@@ -1419,41 +1763,71 @@ ParamMap Cluster::commandArgsForNode(const Node& node) const {
 }
 
 void Cluster::partition(std::vector<std::set<int>> partitions) {
-  // one_config_per_node_ is required
-  ld_check(one_config_per_node_);
-  // TODO T52924503: current only ServerConfig source of truth is
-  // supported.
-  ld_check(getNodesConfigurationSourceOfTruth() ==
-           NodesConfigurationSourceOfTruth::SERVER_CONFIG);
-
   // for every node in a partition, update the address of nodes outside
   // the partition to a non-existent unix socket. this effectively create a
   // virtual network partition.
   for (auto p : partitions) {
-    Configuration::Nodes nodes = getConfig()->get()->serverConfig()->getNodes();
+    auto same_parition_nodes = folly::join(",", p);
 
-    for (auto& n : nodes) {
-      if (p.find(n.first) == p.end()) {
-        // node is outside the partition, update its address to unreachable
-        // unix socket (to trigger sender reload on config update)
-        std::string addr = "/nonexistent" + folly::to<std::string>(n.first);
-        n.second.address = Sockaddr(addr);
-        n.second.gossip_address = Sockaddr(addr);
-      }
-    }
-
-    Configuration::NodesConfig nodes_config(std::move(nodes));
-    auto old_config = config_->get();
-    Configuration config(old_config->serverConfig()
-                             ->withNodes(nodes_config)
-                             ->withIncrementedVersion(),
-                         old_config->logsConfig());
-    for (auto i : p) {
-      // replace config file of all the nodes within that partition.
-      overwriteConfigFile(getNode(i).config_path_.c_str(), config.toString());
+    for (auto& n : p) {
+      nodes_[n]->cmd_args_.emplace(
+          "--test-same-partition-nodes", same_parition_nodes);
+      nodes_[n]->updateSetting(
+          "test-same-partition-nodes", same_parition_nodes);
     }
   }
+
+  updateNodesConfiguration(*getConfig()
+                                ->getNodesConfiguration()
+                                ->withIncrementedVersionAndTimestamp());
 }
+bool Cluster::applyInternalMaintenance(Client& client,
+                                       node_index_t node_id,
+                                       uint32_t shard_idx,
+                                       const std::string& reason) {
+  maintenance::MaintenanceDelta delta;
+  delta.set_apply_maintenances({maintenance::MaintenanceLogWriter::
+                                    buildMaintenanceDefinitionForRebuilding(
+                                        ShardID(node_id, shard_idx), reason)});
+  // write_to_maintenance_log will set err if it returns LSN_INVALID
+  ld_info("Applying INTERNAL maintenance on N%u:S%u: %s",
+          node_id,
+          shard_idx,
+          reason.c_str());
+  return write_to_maintenance_log(client, delta) != LSN_INVALID;
+}
+
+std::string Cluster::applyMaintenance(thrift::AdminAPIAsyncClient& admin_client,
+                                      node_index_t node_id,
+                                      uint32_t shard_idx,
+                                      const std::string& user,
+                                      bool drain,
+                                      bool force_restore,
+                                      const std::string& reason,
+                                      bool disable_sequencer) {
+  thrift::MaintenanceDefinitionResponse resp;
+  thrift::MaintenanceDefinition req;
+  req.set_user(user);
+  req.set_reason(reason);
+  req.set_shard_target_state(
+      drain ? thrift::ShardOperationalState::DRAINED
+            : thrift::ShardOperationalState::MAY_DISAPPEAR);
+  req.set_priority(thrift::MaintenancePriority::IMMINENT);
+  if (disable_sequencer) {
+    req.set_sequencer_nodes({mkNodeID(node_id)});
+    req.set_sequencer_target_state(thrift::SequencingState::DISABLED);
+  }
+  req.set_force_restore_rebuilding(force_restore);
+  req.set_shards({mkShardID(node_id, shard_idx)});
+  req.set_force_restore_rebuilding(force_restore);
+  admin_client.sync_applyMaintenance(resp, req);
+  if (resp.get_maintenances().empty()) {
+    throw std::runtime_error("Could not create requested maintenances on N" +
+                             std::to_string(node_id) + ":S" +
+                             std::to_string(shard_idx));
+  }
+  return *resp.get_maintenances()[0].get_group_id();
+} // namespace IntegrationTestUtils
 
 std::unique_ptr<Cluster>
 ClusterFactory::create(const Configuration& source_config) {
@@ -1584,7 +1958,7 @@ std::string Node::sendCommand(const std::string& command,
   rpc_options.setTimeout(command_timeout);
 
   thrift::AdminCommandRequest req;
-  req.request = command;
+  *req.request_ref() = command;
 
   thrift::AdminCommandResponse resp;
   try {
@@ -1602,7 +1976,7 @@ std::string Node::sendCommand(const std::string& command,
              e.what());
     return "";
   }
-  std::string response = resp.response;
+  std::string response = *resp.response_ref();
 
   // Strip the trailing END
   if (folly::StringPiece(response).endsWith("END\r\n")) {
@@ -1705,6 +2079,61 @@ int Node::waitUntilStarted(std::chrono::steady_clock::time_point deadline) {
     ld_info("Node %d started", node_index_);
   }
   return rv;
+}
+
+bool Node::waitUntilShardState(
+    thrift::AdminAPIAsyncClient& admin_client,
+    shard_index_t shard,
+    folly::Function<bool(const thrift::ShardState&)> predicate,
+    const std::string& reason,
+    std::chrono::steady_clock::time_point deadline) {
+  int rv = wait_until(
+      ("Shard N" + std::to_string(node_index_) + ":" + std::to_string(shard) +
+       " matches predicate, " + reason)
+          .c_str(),
+      [&]() {
+        return predicate(*get_shard_state(
+            get_nodes_state(admin_client), ShardID(node_index_, shard)));
+      },
+      deadline);
+  if (rv != 0) {
+    ld_info(
+        "Failed on waiting for shard state to finish for node %d", node_index_);
+    return false;
+  }
+  return true;
+}
+
+bool Node::waitUntilInternalMaintenances(
+    thrift::AdminAPIAsyncClient& admin_client,
+    folly::Function<bool(const std::vector<thrift::MaintenanceDefinition>&)>
+        predicate,
+    const std::string& reason,
+    std::chrono::steady_clock::time_point deadline) {
+  thrift::MaintenancesFilter filter;
+  thrift::MaintenanceDefinitionResponse resp;
+  std::vector<std::string> groups;
+  for (shard_index_t s = 0; s < num_db_shards_; ++s) {
+    groups.push_back("N" + std::to_string(node_index_) + ":S" +
+                     std::to_string(s));
+  }
+  filter.set_group_ids(groups);
+  int rv = wait_until(
+      ("Node " + std::to_string(node_index_) + " internal maintenances (" +
+       toString(groups) + ") matches predicate, " + reason)
+          .c_str(),
+      [&]() {
+        admin_client.sync_getMaintenances(resp, filter);
+        return predicate(resp.get_maintenances());
+      },
+      deadline);
+  if (rv != 0) {
+    ld_info(
+        "Failed on waiting for internal maintenances to finished for node %d",
+        node_index_);
+    return false;
+  }
+  return true;
 }
 
 lsn_t Node::waitUntilAllShardsFullyAuthoritative(
@@ -1878,7 +2307,8 @@ std::unique_ptr<thrift::AdminAPIAsyncClient> Node::createAdminClient() const {
   folly::SocketAddress address = getAdminAddress();
   auto transport = folly::AsyncSocket::newSocket(
       folly::EventBaseManager::get()->getEventBase(), address);
-  auto channel = apache::thrift::HeaderClientChannel::newChannel(transport);
+  auto channel =
+      apache::thrift::HeaderClientChannel::newChannel(std::move(transport));
   channel->setTimeout(5000);
   if (!channel->good()) {
     ld_debug("Couldn't create a thrift client for the Admin server for node "
@@ -1904,38 +2334,6 @@ int Node::waitUntilNodeStateReady() {
           ld_info("getNodesState thrown NodeNotReady exception. Node %d is not "
                   "ready yet",
                   node_index_);
-          return false;
-        } catch (apache::thrift::transport::TTransportException& ex) {
-          ld_info("AdminServer is not fully started yet, connections are "
-                  "failing to node %d. ex: %s",
-                  node_index_,
-                  ex.what());
-          return false;
-        } catch (std::exception& ex) {
-          ld_critical("An exception in AdminClient that we didn't expect: %s",
-                      ex.what());
-          return false;
-        }
-      });
-}
-
-int Node::waitUntilMaintenanceRSMReady() {
-  waitUntilAvailable();
-  auto admin_client = createAdminClient();
-  return wait_until(
-      "LogDevice started but we are waiting for the Maintenance RSM to be "
-      "replayed",
-      [&]() {
-        try {
-          thrift::MaintenancesFilter req;
-          thrift::MaintenanceDefinitionResponse resp;
-          admin_client->sync_getMaintenances(resp, req);
-          return true;
-        } catch (thrift::NodeNotReady& e) {
-          ld_info(
-              "getMaintenances thrown NodeNotReady exception. Node %d is not "
-              "ready yet",
-              node_index_);
           return false;
         } catch (apache::thrift::transport::TTransportException& ex) {
           ld_info("AdminServer is not fully started yet, connections are "
@@ -2036,7 +2434,12 @@ int Node::waitUntilRSMSynced(const char* rsm,
 
 int Node::waitUntilExited() {
   ld_info("Waiting for node %d to exit", node_index_);
-  auto res = logdeviced_->wait();
+  folly::ProcessReturnCode res;
+  if (isRunning()) {
+    res = logdeviced_->wait();
+  } else {
+    res = logdeviced_->returnCode();
+  }
   ld_check(res.exited() || res.killed());
   if (res.killed()) {
     ld_warning("Node %d did not exit cleanly (signal %d)",
@@ -2401,6 +2804,21 @@ Node::partitionsInfo(shard_index_t shard, int level) const {
   return data;
 }
 
+std::map<shard_index_t, std::string> Node::rebuildingStateInfo() const {
+  auto data = sendJsonCommand("info shards --json");
+  ld_check(!data.empty());
+  std::map<shard_index_t, std::string> result;
+  for (const auto& row : data) {
+    const auto shard = row.find("Shard");
+    const auto rebuilding_state = row.find("Rebuilding state");
+    if (shard == row.end() || rebuilding_state == row.end()) {
+      continue;
+    }
+    result.emplace(std::stoi(shard->second), rebuilding_state->second);
+  }
+  return result;
+}
+
 std::map<shard_index_t, RebuildingRangesMetadata> Node::dirtyShardInfo() const {
   auto data = sendJsonCommand("info shards --json --dirty-as-json");
   ld_check(!data.empty());
@@ -2574,10 +2992,13 @@ void Cluster::populateClientSettings(std::unique_ptr<ClientSettings>& settings,
       ld_check(rv == 0);
     }
 
-    if (settings->isOverridden("nodes-configuration-seed-servers") &&
-        use_file_based_ncs) {
-      ld_error("Can't have nodes-configuration-seed-servers set and require a "
-               "file based NCS");
+    if (settings->isOverridden("nodes-configuration-seed-servers")) {
+      // TODO(mbassem): Remove this limitation when client settings have higher
+      // precedence than config.
+      ld_error("Due to a limitation in the test frameowrk, you can't override "
+               "the nodes configuration seed for now. This is mainly because "
+               "the seed is defined in the config and config settings have "
+               "higher precedence over client settings as of now.");
       ld_check(false);
     }
 
@@ -2585,16 +3006,6 @@ void Cluster::populateClientSettings(std::unique_ptr<ClientSettings>& settings,
       rv = settings->set("admin-client-capabilities", "true");
       ld_check(rv == 0);
       rv = settings->set("nodes-configuration-file-store-dir", getNCSPath());
-      ld_check(rv == 0);
-    } else if (!settings->isOverridden("nodes-configuration-seed-servers")) {
-      auto nc = readNodesConfigurationFromStore();
-      std::vector<std::string> addrs;
-      for (const auto& [_, node] : *nc->getServiceDiscovery()) {
-        addrs.push_back(node.address.toString());
-      }
-      std::string seed_addr =
-          folly::sformat("data:{}", folly::join(",", addrs));
-      rv = settings->set("nodes-configuration-seed-servers", seed_addr);
       ld_check(rv == 0);
     }
 
@@ -2626,36 +3037,13 @@ Cluster::createClient(std::chrono::milliseconds timeout,
   return client;
 }
 
-namespace {
-class IntegrationTestFileEpochStore : public FileEpochStore {
- public:
-  explicit IntegrationTestFileEpochStore(
-      std::string path,
-      const std::shared_ptr<UpdateableNodesConfiguration>& config)
-      : FileEpochStore(std::move(path), nullptr, config) {}
-
- protected:
-  void postCompletionMetaData(
-      EpochStore::CompletionMetaData cf,
-      Status status,
-      logid_t log_id,
-      std::unique_ptr<EpochMetaData> metadata = nullptr,
-      std::unique_ptr<EpochStoreMetaProperties> meta_props = nullptr) override {
-    cf(status, log_id, std::move(metadata), std::move(meta_props));
-  }
-  void postCompletionLCE(EpochStore::CompletionLCE cf,
-                         Status status,
-                         logid_t log_id,
-                         epoch_t epoch,
-                         TailRecord tail_record) override {
-    cf(status, log_id, epoch, tail_record);
-  }
-};
-} // namespace
-
 std::unique_ptr<EpochStore> Cluster::createEpochStore() {
-  return std::make_unique<IntegrationTestFileEpochStore>(
-      epoch_store_path_, getConfig()->updateableNodesConfiguration());
+  static InlineRequestPoster inline_request_poster{};
+  return std::make_unique<FileEpochStore>(
+      epoch_store_path_,
+      RequestExecutor(&inline_request_poster),
+      folly::none,
+      getConfig()->updateableNodesConfiguration());
 }
 
 void Cluster::setStartingEpoch(logid_t log_id,
@@ -2690,8 +3078,9 @@ void Cluster::setStartingEpoch(logid_t log_id,
     epoch_store->createOrUpdateMetaData(
         log_id,
         std::make_shared<EpochMetaDataUpdateToNextEpoch>(
+            EpochMetaData::Updater::Options().setProvisionIfEmpty(),
             getConfig()->get(),
-            getConfig()->get()->getNodesConfigurationFromServerConfigSource()),
+            getConfig()->getNodesConfiguration()),
         [&semaphore, e](Status status,
                         logid_t,
                         std::unique_ptr<EpochMetaData> info,
@@ -2714,14 +3103,105 @@ std::unique_ptr<MetaDataProvisioner> Cluster::createMetaDataProvisioner() {
       createEpochStore(), getConfig(), fn);
 }
 
+int Cluster::replaceViaAdminServer(thrift::AdminAPIAsyncClient& admin_client,
+                                   node_index_t index,
+                                   bool defer_start) {
+  ld_info("Replacing node %d", (int)index);
+  thrift::NodesFilter filter;
+  thrift::NodeID node;
+  node.set_node_index(index);
+  filter.set_node(node);
+  // Kill the existing node and wipe its data.
+  for (int outer_try = 0; outer_try < outer_tries_; ++outer_try) {
+    auto current_generation =
+        getConfig()->getNodesConfiguration()->getNodeGeneration(index);
+    nodes_.at(index).reset();
+    if (hasStorageRole(index)) {
+      ld_check(getNodeReplacementCounter(index) ==
+               getConfig()->getNodesConfiguration()->getNodeGeneration(index));
+    }
+    // Bump the node generation
+    {
+      thrift::BumpGenerationRequest req;
+      req.set_node_filters({filter});
+      thrift::BumpGenerationResponse resp;
+      admin_client.sync_bumpNodeGeneration(resp, req);
+      current_generation++;
+      if (resp.bumped_nodes_ref()->size() != 1) {
+        ld_error(
+            "Failed to find the node %d in the nodes configuration.", index);
+        return -1;
+      }
+      ld_info(
+          "Node %d generation is bumped at nodes config version %s",
+          index,
+          std::to_string(resp.get_new_nodes_configuration_version()).c_str());
+      waitForServersAndClientsToProcessNodesConfiguration(
+          vcs_config_version_t(resp.get_new_nodes_configuration_version()));
+      // bump the internal node replacement counter
+      setNodeReplacementCounter(index, current_generation);
+    }
+
+    // Update the addresses
+    std::vector<ServerAddresses> addrs;
+    if (pickAddressesForServers(std::vector<node_index_t>{index},
+                                use_tcp_,
+                                root_path_,
+                                node_replacement_counters_,
+                                addrs) != 0) {
+      return -1;
+    }
+
+    auto nodes_config = getConfig()->getNodesConfiguration();
+    thrift::NodeConfig new_config;
+
+    {
+      auto sd = nodes_config->getNodeServiceDiscovery(index);
+      ld_check(sd);
+      auto new_sd = *sd;
+      addrs[0].toNodeConfig(new_sd, !no_ssl_address_);
+
+      nodes_config = nodes_config->applyUpdate(
+          NodesConfigurationTestUtil::setNodeAttributesUpdate(
+              index, std::move(new_sd), folly::none, folly::none));
+      ld_check(nodes_config);
+
+      fillNodeConfig(new_config, index, *nodes_config);
+    }
+    // Sending the update request
+    thrift::UpdateSingleNodeRequest update;
+    update.set_node_to_be_updated(mkNodeID(index));
+    update.set_new_config(new_config);
+    {
+      thrift::UpdateNodesRequest req;
+      thrift::UpdateNodesResponse resp;
+      req.set_node_requests({std::move(update)});
+      admin_client.sync_updateNodes(resp, req);
+      if (resp.updated_nodes_ref()->size() != 1) {
+        ld_error("NodesConfig update failed to find the node %d", index);
+        return -1;
+      }
+      // Wait for new config
+      waitForServersAndClientsToProcessNodesConfiguration(
+          vcs_config_version_t(resp.get_new_nodes_configuration_version()));
+    }
+    nodes_[index] = createNode(index, std::move(addrs[0]));
+    if (defer_start) {
+      return 0;
+    }
+    if (start({index}) == 0) {
+      return 0;
+    }
+  }
+  return -1;
+}
+
 int Cluster::replace(node_index_t index, bool defer_start) {
-  // TODO: make it work with one config per nodes.
-  ld_check(!one_config_per_node_);
   ld_debug("replacing node %d", (int)index);
 
   if (hasStorageRole(index)) {
     ld_check(getNodeReplacementCounter(index) ==
-             config_->get()->serverConfig()->getNode(index)->generation);
+             getConfig()->getNodesConfiguration()->getNodeGeneration(index));
   }
 
   for (int outer_try = 0, gen = getNodeReplacementCounter(index) + 1;
@@ -2729,8 +3209,6 @@ int Cluster::replace(node_index_t index, bool defer_start) {
        ++outer_try, ++gen) {
     // Kill current node and erase its data
     nodes_.at(index).reset();
-
-    Configuration::Nodes nodes = config_->get()->serverConfig()->getNodes();
 
     // bump the internal node replacement counter
     setNodeReplacementCounter(index, gen);
@@ -2744,28 +3222,42 @@ int Cluster::replace(node_index_t index, bool defer_start) {
       return -1;
     }
 
-    addrs[0].toNodeConfig(nodes.at(index), !no_ssl_address_);
+    auto nodes_config = getConfig()->getNodesConfiguration();
 
-    if (hasStorageRole(index)) {
-      // only bump the config generation if the node has storage role
-      nodes[index].generation = gen;
+    {
+      auto sd = nodes_config->getNodeServiceDiscovery(index);
+      ld_check(sd);
+      auto new_sd = *sd;
+      addrs[0].toNodeConfig(new_sd, !no_ssl_address_);
+
+      folly::Optional<configuration::nodes::StorageNodeAttribute>
+          new_storage_attrs;
+
+      if (hasStorageRole(index)) {
+        // only bump the config generation if the node has storage role
+
+        auto storage_cfg = nodes_config->getNodeStorageAttribute(index);
+        ld_check(storage_cfg);
+
+        new_storage_attrs = *storage_cfg;
+        new_storage_attrs->generation = gen;
+      }
+
+      nodes_config = nodes_config->applyUpdate(
+          NodesConfigurationTestUtil::setNodeAttributesUpdate(
+              index,
+              std::move(new_sd),
+              folly::none,
+              std::move(new_storage_attrs)));
+      ld_check(nodes_config);
     }
-
-    Configuration::NodesConfig nodes_config(std::move(nodes));
-    auto config = config_->get();
-    std::shared_ptr<ServerConfig> new_server_config =
-        config->serverConfig()
-            ->withNodes(std::move(nodes_config))
-            ->withIncrementedVersion();
 
     // Update config on disk so that other nodes become aware of the swap as
     // soon as possible
-    int rv = writeConfig(new_server_config.get(), config->logsConfig().get());
+    int rv = updateNodesConfiguration(*nodes_config);
     if (rv != 0) {
       return -1;
     }
-    // Wait for all nodes to pick up the config update
-    waitForServersToPartiallyProcessConfigUpdate();
 
     nodes_[index] = createNode(index, std::move(addrs[0]));
     if (defer_start) {
@@ -2780,30 +3272,27 @@ int Cluster::replace(node_index_t index, bool defer_start) {
   return -1;
 }
 
-int Cluster::bumpGeneration(node_index_t index) {
-  // TODO: make it work with one config per nodes.
-  ld_check(!one_config_per_node_);
-  Configuration::Nodes nodes = config_->get()->serverConfig()->getNodes();
-  if (hasStorageRole(index)) {
-    // expect internal tracked replacemnt counter is in sync with configuration
-    ld_check(getNodeReplacementCounter(index) == nodes.at(index).generation);
-    // only bump configuration generation if the node has storage role
-    ++nodes.at(index).generation;
-  }
-
-  // always bump the internal node replacement counter
-  bumpNodeReplacementCounter(index);
-
-  Configuration::NodesConfig nodes_config(std::move(nodes));
-  auto config = config_->get();
-  std::shared_ptr<ServerConfig> new_server_config =
-      config->serverConfig()
-          ->withNodes(std::move(nodes_config))
-          ->withIncrementedVersion();
-  int rv = writeConfig(new_server_config.get(), config->logsConfig().get());
-  if (rv != 0) {
+int Cluster::bumpGeneration(thrift::AdminAPIAsyncClient& admin_client,
+                            node_index_t index) {
+  auto current_generation =
+      getConfig()->getNodesConfiguration()->getNodeGeneration(index);
+  thrift::NodesFilter filter;
+  thrift::NodeID node;
+  node.set_node_index(index);
+  filter.set_node(node);
+  thrift::BumpGenerationRequest req;
+  req.set_node_filters({filter});
+  thrift::BumpGenerationResponse resp;
+  admin_client.sync_bumpNodeGeneration(resp, req);
+  current_generation++;
+  if (resp.bumped_nodes_ref()->size() != 1) {
+    ld_error("Failed to find the node %d in the nodes configuration.", index);
     return -1;
   }
+  waitForServersAndClientsToProcessNodesConfiguration(
+      vcs_config_version_t(resp.get_new_nodes_configuration_version()));
+  // bump the internal node replacement counter
+  setNodeReplacementCounter(index, current_generation);
   return 0;
 }
 
@@ -2811,6 +3300,19 @@ int Cluster::updateNodeAttributes(node_index_t index,
                                   configuration::StorageState storage_state,
                                   int sequencer_weight,
                                   folly::Optional<bool> enable_sequencing) {
+  static const auto from_legacy_storage_state =
+      [](configuration::StorageState storage_state) {
+        switch (storage_state) {
+          case configuration::StorageState::READ_WRITE:
+            return membership::StorageState::READ_WRITE;
+          case configuration::StorageState::READ_ONLY:
+            return membership::StorageState::READ_ONLY;
+          case configuration::StorageState::DISABLED:
+            return membership::StorageState::NONE;
+        }
+        ld_check(false);
+        return membership::StorageState::INVALID;
+      };
   ld_info("Updating attributes of N%d: storage_state %s, sequencer weight %d, "
           "enable_sequencing %s",
           (int)index,
@@ -2820,46 +3322,92 @@ int Cluster::updateNodeAttributes(node_index_t index,
               ? enable_sequencing.value() ? "true" : "false"
               : "unchanged");
 
-  // TODO: make it work with one config per nodes.
-  ld_check(!one_config_per_node_);
-  Configuration::Nodes nodes = config_->get()->serverConfig()->getNodes();
-  if (!nodes.count(index)) {
+  auto nodes_config = getConfig()->getNodesConfiguration();
+
+  if (!nodes_config->isNodeInServiceDiscoveryConfig(index)) {
     ld_error("No such node: %d", (int)index);
     ld_check(false);
     return -1;
   }
-  const auto& node = nodes[index];
-  if (node.storage_attributes != nullptr) {
-    node.storage_attributes->state = storage_state;
-    if (storage_state == configuration::StorageState::READ_WRITE &&
-        node.storage_attributes->capacity == 0) {
-      node.storage_attributes->capacity = 1;
-    }
-  }
 
-  if (node.sequencer_attributes != nullptr) {
-    node.sequencer_attributes->setWeight(sequencer_weight);
+  if (nodes_config->isSequencerNode(index)) {
+    nodes_config = nodes_config->applyUpdate(
+        NodesConfigurationTestUtil::setSequencerWeightUpdate(
+            *nodes_config, {index}, sequencer_weight));
+
     if (enable_sequencing.has_value()) {
-      node.sequencer_attributes->setEnabled(enable_sequencing.value());
+      nodes_config = nodes_config->applyUpdate(
+          NodesConfigurationTestUtil::setSequencerEnabledUpdate(
+              *nodes_config, {index}, enable_sequencing.value()));
     }
   }
 
-  Configuration::NodesConfig nodes_config(std::move(nodes));
-  auto config = config_->get();
-  std::shared_ptr<ServerConfig> new_server_config =
-      config->serverConfig()
-          ->withNodes(std::move(nodes_config))
-          ->withIncrementedVersion();
-  int rv = writeConfig(new_server_config.get(), config->logsConfig().get());
+  if (nodes_config->isStorageNode(index)) {
+    nodes_config = nodes_config->applyUpdate(
+        NodesConfigurationTestUtil::setStorageMembershipUpdate(
+            *nodes_config,
+            {ShardID(index, -1)},
+            from_legacy_storage_state(storage_state),
+            folly::none));
+  }
+
+  int rv = updateNodesConfiguration(*nodes_config);
   if (rv != 0) {
     return -1;
   }
   return 0;
 }
 
+void Cluster::waitForServersAndClientsToProcessNodesConfiguration(
+    membership::MembershipVersion::Type version) {
+  auto server_check = [this, version]() {
+    for (auto& [_, node] : nodes_) {
+      if (node && !node->stopped_ && node->isRunning()) {
+        auto stats = node->stats();
+        auto version_itr =
+            stats.find("nodes_configuration_manager_published_version");
+        if (version_itr == stats.end()) {
+          return false;
+        }
+        auto published_version =
+            membership::MembershipVersion::Type(version_itr->second);
+        if (published_version < version) {
+          return false;
+        }
+      }
+    }
+    return true;
+  };
+
+  auto client_check = [this, version]() {
+    for (const auto& client_ptr : created_clients_) {
+      auto client = client_ptr.lock();
+      if (client == nullptr) {
+        continue;
+      }
+      auto client_impl = dynamic_cast<ClientImpl*>(client.get());
+      if (client_impl->getConfig()->getNodesConfiguration()->getVersion() <
+          version) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  auto config_check = [this, version]() {
+    if (config_->getNodesConfiguration() == nullptr) {
+      return true;
+    }
+    return config_->getNodesConfiguration()->getVersion() >= version;
+  };
+
+  wait_until(
+      folly::sformat("nodes config version procssed >= {}", version.val())
+          .c_str(),
+      [&]() { return server_check() && client_check() && config_check(); });
+}
+
 void Cluster::waitForServersToPartiallyProcessConfigUpdate() {
-  // TODO: make it work with one config per nodes.
-  ld_check(!one_config_per_node_);
   auto check = [this]() {
     std::shared_ptr<const Configuration> our_config = config_->get();
     const std::string expected_text = our_config->toString() + "\r\n";
@@ -2869,7 +3417,7 @@ void Cluster::waitForServersToPartiallyProcessConfigUpdate() {
         if (node_text != expected_text) {
           ld_info("Waiting for N%d:%d to pick up the most recent config",
                   it.first,
-                  our_config->serverConfig()->getNode(it.first)->generation);
+                  getNodeReplacementCounter(it.first));
           return false;
         }
       }
@@ -2886,7 +3434,9 @@ int Cluster::waitForRecovery(std::chrono::steady_clock::time_point deadline) {
 
   for (auto& it : nodes_) {
     node_index_t idx = it.first;
-    if (!config->serverConfig()->getNode(idx)->isSequencingEnabled()) {
+    if (!config->getNodesConfiguration()
+             ->getSequencerMembership()
+             ->isSequencingEnabled(idx)) {
       continue;
     }
 
@@ -2908,7 +3458,9 @@ int Cluster::waitUntilAllSequencersQuiescent(
   std::shared_ptr<const Configuration> config = config_->get();
   for (auto& it : nodes_) {
     node_index_t idx = it.first;
-    if (!config->serverConfig()->getNode(idx)->isSequencingEnabled()) {
+    if (!config->getNodesConfiguration()
+             ->getSequencerMembership()
+             ->isSequencingEnabled(idx)) {
       continue;
     }
 
@@ -2958,7 +3510,7 @@ int Cluster::waitUntilAllStartedAndPropagatedInGossip(
             bool starting = state["detector"]["starting"].getInt() == 1;
             // This is a workaround for a quirk in FailureDetector: it may mark
             // the node as ALIVE based on GetClusterState request, then soon
-            // mark it as DEAD if we're unlicky enough to not receive enough
+            // mark it as DEAD if we're unlucky enough to not receive enough
             // gossip messages to declare it alive.
             bool gossiped_recently =
                 state["detector"]["gossip"].getInt() < 1000;
@@ -3032,7 +3584,9 @@ int Cluster::waitForMetaDataLogWrites(
       epoch_t last_written_epoch{LSN_INVALID};
       for (auto& kv : nodes_) {
         node_index_t idx = kv.first;
-        if (!config->serverConfig()->getNode(idx)->isSequencingEnabled()) {
+        if (!config->getNodesConfiguration()
+                 ->getSequencerMembership()
+                 ->isSequencingEnabled(idx)) {
           continue;
         }
         auto seq = kv.second->sequencerInfo(log);
@@ -3142,19 +3696,9 @@ int Cluster::waitUntilAllClientsPickedConfig(
 }
 
 bool Cluster::isGossipEnabled() const {
-  static const std::string gossip_flag = "--gossip-enabled";
-  if (cmd_param_.find(ParamScope::ALL) == cmd_param_.end()) {
-    // Assumes the --gossip-enabled flag is explicitly set to false when passing
-    // cmdline arguments.
-    return false;
-  }
-  const auto& params = cmd_param_.at(ParamScope::ALL);
-  if (params.find(gossip_flag) == params.end()) {
-    // Assumes the --gossip-enabled flag is explicitly set to false when passing
-    // cmdline arguments.
-    return false;
-  }
-  return params.at(gossip_flag).value_or("true") == "true";
+  // Assumes gossip is always set in the config regardless of its value.
+  return config_->getServerConfig()->getServerSettingsConfig().at(
+             "gossip-enabled") == "true";
 }
 
 int Cluster::checkConsistency(argv_t additional_args) {
@@ -3214,6 +3758,16 @@ std::string ClusterFactory::actualServerBinary() const {
   return findBinary(relative_to_build_out);
 }
 
+std::string ClusterFactory::actualAdminServerBinary() const {
+  const char* envpath = getenv("LOGDEVICE_ADMIN_SERVER_BINARY");
+  if (envpath != nullptr) {
+    return envpath;
+  }
+  std::string relative_to_build_out =
+      admin_server_binary_.value_or(defaultAdminServerPath());
+  return findBinary(relative_to_build_out);
+}
+
 void ClusterFactory::setInternalLogAttributes(const std::string& name,
                                               logsconfig::LogAttributes attrs) {
   auto log_group_node = internal_logs_.insert(name, attrs);
@@ -3236,7 +3790,7 @@ void maybe_pause_for_gdb(Cluster& cluster,
     fprintf(stderr,
             "  Node N%d:%d: gdb %s %d\n",
             i,
-            cluster.getConfig()->get()->serverConfig()->getNode(i)->generation,
+            cluster.getNodeReplacementCounter(i),
             cluster.getNode(i).server_binary_.c_str(),
             cluster.getNode(i).logdeviced_->pid());
   }
@@ -3390,6 +3944,11 @@ lsn_t waitUntilShardsHaveEventLogState(std::shared_ptr<Client> client,
           std::vector<node_index_t> donors_remaining;
           const auto status = set.getShardAuthoritativeStatus(
               shard.node(), shard.shard(), donors_remaining);
+          ld_info("Shard N%u:%u has authoritative status %s, expected %s",
+                  shard.node(),
+                  shard.shard(),
+                  toString(status).c_str(),
+                  toString(st).c_str());
           if (!st.count(status) ||
               (wait_for_rebuilding && !donors_remaining.empty())) {
             return true;
@@ -3480,9 +4039,7 @@ std::string findBinary(const std::string& relative_path) {
 }
 
 bool Cluster::hasStorageRole(node_index_t node) const {
-  const Configuration::Nodes& nodes =
-      config_->get()->serverConfig()->getNodes();
-  return nodes.at(node).hasRole(configuration::NodeRole::STORAGE);
+  return getConfig()->getNodesConfiguration()->isStorageNode(node);
 }
 
 int Cluster::writeConfig(const ServerConfig* server_cfg,
@@ -3491,12 +4048,6 @@ int Cluster::writeConfig(const ServerConfig* server_cfg,
   int rv = overwriteConfig(config_path_.c_str(), server_cfg, logs_cfg);
   if (rv != 0) {
     return rv;
-  }
-  if (sync_server_config_to_nodes_configuration_ && server_cfg != nullptr) {
-    rv = updateNodesConfigurationFromServerConfig(server_cfg);
-    if (rv != 0) {
-      return rv;
-    }
   }
   if (!wait_for_update) {
     return 0;
@@ -3569,25 +4120,6 @@ Cluster::readNodesConfigurationFromStore() const {
   return NodesConfigurationCodec::deserialize(std::move(serialized));
 }
 
-int dump_file_to_stderr(const char* path) {
-  FILE* fp = std::fopen(path, "r");
-  if (fp == nullptr) {
-    ld_error("fopen(\"%s\") failed with errno %d (%s)",
-             path,
-             errno,
-             strerror(errno));
-    return -1;
-  }
-  fprintf(stderr, "=== begin %s\n", path);
-  std::vector<char> buf(16 * 1024);
-  while (std::fgets(buf.data(), buf.size(), fp) != nullptr) {
-    fprintf(stderr, "    %s", buf.data());
-  }
-  fprintf(stderr, "=== end %s\n", path);
-  std::fclose(fp);
-  return 0;
-}
-
 class ManualNodeSetSelector : public NodeSetSelector {
  public:
   ManualNodeSetSelector(std::set<node_index_t> node_indices, size_t num_shards)
@@ -3600,7 +4132,7 @@ class ManualNodeSetSelector : public NodeSetSelector {
       nodeset_size_t /* ignored */,
       uint64_t /* ignored */,
       const EpochMetaData* prev,
-      const Options* /* ignored */
+      const Options& /* options */
       ) override {
     Result res;
     const LogsConfig::LogGroupNodePtr logcfg =

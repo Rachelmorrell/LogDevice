@@ -7,6 +7,7 @@
  */
 #pragma once
 
+#include "logdevice/common/configuration/Node.h"
 #include "logdevice/common/configuration/nodes/NodesConfiguration.h"
 
 namespace facebook {
@@ -16,27 +17,16 @@ namespace facebook {
 extern const configuration::nodes::NodeServiceDiscovery::RoleSet kSeqRole;
 extern const configuration::nodes::NodeServiceDiscovery::RoleSet kStorageRole;
 extern const configuration::nodes::NodeServiceDiscovery::RoleSet kBothRoles;
-
-struct NodeTemplate {
-  node_index_t id;
-  configuration::nodes::NodeServiceDiscovery::RoleSet roles{kBothRoles};
-  std::string location{};
-  double sequencer_weight{1.0};
-  shard_size_t num_shards{2};
-  bool metadata_node{false};
-  node_gen_t generation{1};
-};
+extern const configuration::nodes::NodeServiceDiscovery::TagMap kTestTags;
 
 configuration::nodes::NodeServiceDiscovery
-genDiscovery(node_index_t n,
-             configuration::nodes::NodeServiceDiscovery::RoleSet roles,
-             std::string location);
+genDiscovery(node_index_t n, const configuration::Node& node);
 
 configuration::nodes::NodesConfiguration::Update
 initialAddShardsUpdate(std::vector<node_index_t> node_idxs);
 
 configuration::nodes::NodesConfiguration::Update
-initialAddShardsUpdate(std::vector<NodeTemplate> nodes,
+initialAddShardsUpdate(configuration::Nodes nodes,
                        ReplicationProperty metadata_rep = ReplicationProperty{
                            {NodeLocationScope::NODE, 2}});
 
@@ -44,9 +34,15 @@ std::shared_ptr<const configuration::nodes::NodesConfiguration> provisionNodes(
     configuration::nodes::NodesConfiguration::Update provision_update,
     std::unordered_set<ShardID> metadata_shards);
 
+// If an idx is passed, we use it, otherwise we use the largest idx + 1.
 configuration::nodes::NodesConfiguration::Update
 addNewNodeUpdate(const configuration::nodes::NodesConfiguration& existing,
-                 NodeTemplate node);
+                 const configuration::Node& node,
+                 folly::Optional<node_index_t> idx = folly::none);
+
+configuration::nodes::NodesConfiguration::Update
+addNewNodesUpdate(const configuration::nodes::NodesConfiguration& existing,
+                  configuration::Nodes nodes);
 
 // Create an NC::Update to transition all PROVISIONING shards to NONE by
 // applying a MARK_SHARD_PROVISIONED transition.
@@ -78,7 +74,7 @@ provisionNodes(std::vector<node_index_t> node_idxs,
                std::unordered_set<ShardID> metadata_shards = {});
 
 std::shared_ptr<const configuration::nodes::NodesConfiguration>
-provisionNodes(std::vector<NodeTemplate> nodes,
+provisionNodes(configuration::Nodes nodes,
                ReplicationProperty metadata_rep = ReplicationProperty{
                    {NodeLocationScope::NODE, 2}});
 
@@ -97,5 +93,41 @@ enablingReadUpdate(membership::MembershipVersion::Type base_version);
 // start disabling writes on N11 and N13
 configuration::nodes::NodesConfiguration::Update
 disablingWriteUpdate(membership::MembershipVersion::Type base_version);
+
+configuration::nodes::NodesConfiguration::Update setStorageMembershipUpdate(
+    const configuration::nodes::NodesConfiguration& existing,
+    std::vector<ShardID> shards,
+    folly::Optional<membership::StorageState> target_storage_state,
+    folly::Optional<membership::MetaDataStorageState> target_metadata_state);
+
+configuration::nodes::NodesConfiguration::Update setSequencerEnabledUpdate(
+    const configuration::nodes::NodesConfiguration& existing,
+    std::vector<node_index_t> nodes,
+    bool target_sequencer_enabled);
+
+configuration::nodes::NodesConfiguration::Update setSequencerWeightUpdate(
+    const configuration::nodes::NodesConfiguration& existing,
+    std::vector<node_index_t> nodes,
+    double target_sequencer_weight);
+
+configuration::nodes::NodesConfiguration::Update excludeFromNodesetUpdate(
+    const configuration::nodes::NodesConfiguration& existing,
+    std::vector<node_index_t> nodes,
+    bool target_exclude_from_nodeset);
+
+configuration::nodes::NodesConfiguration::Update
+setMetadataReplicationPropertyUpdate(
+    const configuration::nodes::NodesConfiguration& existing,
+    ReplicationProperty metadata_rep);
+
+configuration::nodes::NodesConfiguration::Update setNodeAttributesUpdate(
+    node_index_t node,
+    folly::Optional<configuration::nodes::NodeServiceDiscovery> svc_disc,
+    folly::Optional<configuration::nodes::SequencerNodeAttribute> seq_attrs,
+    folly::Optional<configuration::nodes::StorageNodeAttribute> storage_attrs);
+
+configuration::nodes::NodesConfiguration::Update
+shrinkNodesUpdate(const configuration::nodes::NodesConfiguration& existing,
+                  std::vector<node_index_t> nodes);
 
 }}} // namespace facebook::logdevice::NodesConfigurationTestUtil

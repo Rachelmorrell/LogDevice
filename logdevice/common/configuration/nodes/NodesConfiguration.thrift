@@ -7,6 +7,7 @@
  */
 
 include "logdevice/common/membership/Membership.thrift"
+include "logdevice/common/if/common.thrift"
 
 namespace cpp2 facebook.logdevice.configuration.nodes.thrift
 
@@ -16,9 +17,10 @@ typedef i32 (cpp2.type = "std::uint32_t") u32
 typedef i64 (cpp2.type = "std::uint64_t") u64
 
 typedef u16 node_idx
+typedef common.ClientNetworkPriority ClientNetworkPriority
 
  struct NodeServiceDiscovery {
-  1: string address;
+  1: string default_client_data_address;
   2: optional string gossip_address;
   3: optional string ssl_address;
   4: optional string location;
@@ -28,6 +30,10 @@ typedef u16 node_idx
   8: optional string admin_address;
   9: u64 version;
   10: optional string server_to_server_address;
+  11: map<string, string> tags;
+  12: optional string server_thrift_api_address;
+  13: optional string client_thrift_api_address;
+  14: map<ClientNetworkPriority, string> addresses_per_priority;
 }
 
 struct ServiceDiscoveryConfig {

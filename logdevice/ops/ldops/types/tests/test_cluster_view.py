@@ -133,7 +133,11 @@ class TestClusterView(TestCase):
         self.assertEqual(sorted(cv.get_all_node_names()), sorted(nc.name for nc in ncs))
 
         self.assertEqual(
-            sorted(cv.get_all_maintenance_ids()), sorted(mnt.group_id for mnt in mnts)
+            sorted(cv.get_all_maintenance_ids()),
+            # pyre-fixme[6]: Expected `Iterable[Variable[_LT (bound to
+            #  _SupportsLessThan)]]` for 1st param but got
+            #  `Generator[typing.Optional[str], None, None]`.
+            sorted(mnt.group_id for mnt in mnts),
         )
 
         self.assertEqual(
@@ -244,8 +248,11 @@ class TestClusterView(TestCase):
             self.assertEqual(group_id, cv.get_maintenance_view_by_id(group_id).group_id)
 
         self.assertListEqual(
-            list(sorted(m.group_id for m in mnts)),
-            list(sorted(mv.group_id for mv in cv.get_all_maintenance_views())),
+            # pyre-fixme[6]: Expected `Iterable[Variable[_LT (bound to
+            #  _SupportsLessThan)]]` for 1st param but got
+            #  `Generator[typing.Optional[str], None, None]`.
+            sorted(m.group_id for m in mnts),
+            sorted(mv.group_id for mv in cv.get_all_maintenance_views()),
         )
 
         # expand_shards
@@ -301,6 +308,29 @@ class TestClusterView(TestCase):
                 )
             ),
             getattr(ni_to_nc[nis[0]], "storage", StorageConfig()).num_shards + 1,
+        )
+
+        node50_storage = ni_to_nc[nis[50]].storage
+        self.assertEqual(
+            len(
+                cv.expand_shards(
+                    shards=[
+                        ShardID(node=NodeID(node_index=nis[50]), shard_index=ALL_SHARDS)
+                    ]
+                )
+            ),
+            0 if node50_storage is None else node50_storage.num_shards,
+        )
+        self.assertEqual(
+            len(
+                cv.expand_shards(
+                    shards=[
+                        ShardID(node=NodeID(node_index=nis[50]), shard_index=ALL_SHARDS)
+                    ],
+                    include_sequencers=True,
+                )
+            ),
+            1 if node50_storage is None else node50_storage.num_shards,
         )
 
         # normalize_node_id

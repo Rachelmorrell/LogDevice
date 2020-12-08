@@ -110,9 +110,12 @@ folly::NetworkSocket AsyncSocketAdapter::getNetworkSocket() const {
   return transport_->getNetworkSocket();
 }
 
-const folly::AsyncTransportCertificate*
-AsyncSocketAdapter::getPeerCertificate() const {
-  return transport_->getPeerCertificate();
+const SSL* AsyncSocketAdapter::getSSL() const {
+  auto ssl_socket = dynamic_cast<folly::AsyncSSLSocket*>(transport_.get());
+  if (ssl_socket == nullptr) {
+    return nullptr;
+  }
+  return ssl_socket->getSSL();
 }
 
 size_t AsyncSocketAdapter::getRawBytesWritten() const {
@@ -157,6 +160,25 @@ int AsyncSocketAdapter::getSockOptVirtual(int level,
                                           void* optval,
                                           socklen_t* optlen) {
   return transport_->getSockOptVirtual(level, optname, optval, optlen);
+}
+
+bool AsyncSocketAdapter::getSSLSessionReused() const {
+  auto transport = dynamic_cast<folly::AsyncSSLSocket*>(transport_.get());
+  ld_check(transport);
+  return transport->getSSLSessionReused();
+}
+
+std::shared_ptr<folly::ssl::SSLSession> AsyncSocketAdapter::getSSLSession() {
+  auto transport = dynamic_cast<folly::AsyncSSLSocket*>(transport_.get());
+  ld_check(transport);
+  return transport->getSSLSessionV2();
+}
+
+void AsyncSocketAdapter::setSSLSession(
+    std::shared_ptr<folly::ssl::SSLSession> session) {
+  auto transport = dynamic_cast<folly::AsyncSSLSocket*>(transport_.get());
+  ld_check(transport);
+  transport->setSSLSessionV2(session);
 }
 
 }} // namespace facebook::logdevice

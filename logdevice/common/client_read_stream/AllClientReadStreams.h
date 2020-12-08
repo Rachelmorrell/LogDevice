@@ -8,7 +8,8 @@
 #pragma once
 
 #include <memory>
-#include <unordered_map>
+
+#include <folly/container/F14Map.h>
 
 #include "logdevice/common/AdminCommandTable-fwd.h"
 #include "logdevice/common/ShardAuthoritativeStatusMap.h"
@@ -28,11 +29,22 @@
 
 namespace facebook { namespace logdevice {
 
-struct DataRecordOwnsPayload;
+struct RawDataRecord;
 class Processor;
 
 class AllClientReadStreams : public ShardAuthoritativeStatusSubscriber {
  public:
+  using Callback = std::function<void(const ClientReadStream&)>;
+
+  struct Subscriber {
+    Callback onStreamAdd = [](auto&&...) { return; };
+    Callback onStreamRemoved = [](auto&&...) { return; };
+  };
+
+  ~AllClientReadStreams() override {
+    clearSubscriber();
+  }
+
   /**
    * Claims ownership of the ClientReadStream, and kicks off reading by
    * calling start() on it.
@@ -52,7 +64,7 @@ class AllClientReadStreams : public ShardAuthoritativeStatusSubscriber {
   void onDataRecord(ShardID shard,
                     logid_t log_id,
                     read_stream_id_t read_stream_id,
-                    std::unique_ptr<DataRecordOwnsPayload>&& record);
+                    std::unique_ptr<RawDataRecord>&& record);
 
   /**
    * Informs the appropriate ClientReadStream of the outcome of trying to send
@@ -93,6 +105,7 @@ class AllClientReadStreams : public ShardAuthoritativeStatusSubscriber {
    * Forces the map to get cleared and all read streams destroyed.
    */
   void clear() {
+    clearSubscriber();
     streams_.clear();
   }
 
@@ -118,14 +131,28 @@ class AllClientReadStreams : public ShardAuthoritativeStatusSubscriber {
    */
   void forEachStream(std::function<void(ClientReadStream& read_stream)> cb);
 
-  void sampleAllReadStreamsDebugInfo() const;
+  void subscribe(Subscriber&& subscriber) {
+    subscriber_ = std::move(subscriber);
+  }
+
+  void unsubscribe() {
+    subscriber_ = {};
+  }
 
  private:
+  void clearSubscriber() {
+    forEachStream([this](ClientReadStream& read_stream) {
+      subscriber_.onStreamRemoved(read_stream);
+    });
+  }
+
   // Actual container
-  std::unordered_map<read_stream_id_t,
-                     std::unique_ptr<ClientReadStream>,
-                     read_stream_id_t::Hash>
+  folly::F14FastMap<read_stream_id_t,
+                    std::unique_ptr<ClientReadStream>,
+                    read_stream_id_t::Hash>
       streams_;
+
+  Subscriber subscriber_;
 };
 
 }} // namespace facebook::logdevice

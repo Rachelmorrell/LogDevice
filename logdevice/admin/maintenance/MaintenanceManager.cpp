@@ -407,9 +407,11 @@ MaintenanceManager::getNodeStateInternal(
   state.set_config(std::move(node_config));
 
   if (cluster_state) {
-    // Set node state
-    state.set_daemon_state(
-        toThrift<thrift::ServiceState>(cluster_state->getNodeState(node)));
+    // Set node state. If the state is UNKNOWN, let's use it as is without
+    // masking. This makes it that external callers to Admin API will see that
+    // we still don't have a stable state for this node.
+    state.set_daemon_state(toThrift<thrift::ServiceState>(
+        cluster_state->getNodeState(node, ClusterStateNodeState::UNKNOWN)));
     // Set node health status
     state.set_daemon_health_status(toThrift<thrift::ServiceHealthStatus>(
         cluster_state->getNodeStatus(node)));
@@ -495,10 +497,6 @@ MaintenanceManager::getShardStateInternal(ShardID shard) const {
   ld_check(storageState.hasValue());
   state.set_storage_state(
       toThrift<membership::thrift::StorageState>(storageState.value()));
-
-  // TODO: DEPRECATED. remove once we enable MM everywere.
-  state.set_current_storage_state(
-      toThrift<thrift::ShardStorageState>(storageState.value()));
 
   auto metadataState = getMetaDataStorageStateInternal(shard);
   if (metadataState.hasError()) {
@@ -618,7 +616,7 @@ thrift::MaintenanceProgress MaintenanceManager::getMaintenanceProgressInternal(
   // Let's check shards
   for (const auto& shard : def.get_shards()) {
     ShardID ld_shard{
-        shard.node.node_index_ref().value(), shard.get_shard_index()};
+        shard.node_ref()->node_index_ref().value(), shard.get_shard_index()};
     auto op_state = getShardOperationalStateInternal(ld_shard);
     if (op_state.hasError()) {
       // We cannot determine the current operational state of this shard, in
@@ -1396,8 +1394,7 @@ MaintenanceManager::augmentWithProgressInfo(
                 def.group_id_ref().value().c_str(),
                 error_name(result.error()));
           } else {
-            def.set_last_check_impact_result(
-                toThrift<thrift::CheckImpactResponse>(result.value()));
+            def.set_last_check_impact_result(result.value());
           }
           // Augment with the maintenance progress
           def.set_progress(getMaintenanceProgressInternal(def));
@@ -1737,16 +1734,23 @@ MaintenanceManager::runShardWorkflows() {
   for (const auto& it : active_shard_workflows_) {
     auto shard_id = it.first;
     ShardWorkflow* wf = it.second.first.get();
-    auto current_storage_state =
+    auto shard_state =
         nodes_config_->getStorageMembership()->getShardState(shard_id);
     auto sa = nodes_config_->getNodeStorageAttribute(shard_id.node());
     bool exclude_from_nodeset = sa->exclude_from_nodesets;
     // Getting the ClusterStateNodeState for this node, if we don't have gossip
     // information (no ClusterState) we assume FULLY_STARTED as this is the
     // safest option to avoid blocking ENABLE(s).
+    //
+    // This case should never happen in practice (ClusterState is always
+    // non-null on admin server).
     ClusterStateNodeState gossip_state = ClusterStateNodeState::FULLY_STARTED;
     if (cluster_state != nullptr) {
-      gossip_state = cluster_state->getNodeState(shard_id.node());
+      // If the node state is UNKNOWN (happens if this node was just added, or
+      // admin server just started). We want to assume that it's dead to avoid
+      // enabling it before it attempts to start.
+      gossip_state = cluster_state->getNodeState(
+          shard_id.node(), ClusterStateNodeState::DEAD);
     } else {
       RATELIMIT_INFO(
           std::chrono::seconds(10),
@@ -1756,15 +1760,17 @@ MaintenanceManager::runShardWorkflows() {
     }
     // The shard should be in NodesConfig since workflow is created
     // only for shards in the config
-    ld_check(current_storage_state.has_value());
+    ld_check(shard_state.has_value());
     shards.push_back(shard_id);
-    futures.push_back(wf->run(current_storage_state.value(),
-                              exclude_from_nodeset,
-                              getShardDataHealthInternal(shard_id),
-                              getCurrentRebuildingMode(shard_id),
-                              isShardDraining(shard_id),
-                              isRebuildingNonAuthoritative(shard_id),
-                              gossip_state));
+    futures.push_back(
+        wf->run(shard_state.value(),
+                exclude_from_nodeset,
+                getShardDataHealthInternal(shard_id),
+                getCurrentRebuildingMode(shard_id),
+                isShardDraining(shard_id),
+                isRebuildingNonAuthoritative(shard_id),
+                gossip_state,
+                deps_->settings()->use_force_restore_rebuilding_flag));
   }
   return std::make_pair(std::move(shards), std::move(futures));
 }
@@ -1903,7 +1909,11 @@ MaintenanceManager::runSequencerWorkflows() {
     ld_check(node_state.has_value());
     ClusterStateNodeState gossip_state = ClusterStateNodeState::FULLY_STARTED;
     if (cluster_state != nullptr) {
-      gossip_state = cluster_state->getNodeState(node);
+      // If the node state is UNKNOWN (happens if this node was just added, or
+      // admin server just started). We want to assume that it's dead to avoid
+      // enabling it before it attempts to start.
+      gossip_state =
+          cluster_state->getNodeState(node, ClusterStateNodeState::DEAD);
     } else {
       RATELIMIT_INFO(
           std::chrono::seconds(10),
@@ -2044,7 +2054,7 @@ void MaintenanceManager::purgeExpiredMaintenances(
   STAT_INCR(deps_->getStats(), admin_server.mm_expired_maintenances_removed);
 
   thrift::MaintenancesFilter fltr;
-  fltr.set_group_ids(std::move(to_remove));
+  fltr.set_group_ids(to_remove);
 
   thrift::RemoveMaintenancesRequest req;
   req.set_filter(std::move(fltr));

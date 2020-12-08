@@ -106,8 +106,8 @@ void AsyncReaderImpl::setHealthChangeCallback(
   health_change_callback_ = std::move(cb);
 }
 
-void AsyncReaderImpl::setMonitoringTier(MonitoringTier tier) {
-  monitoring_tier_ = tier;
+void AsyncReaderImpl::addMonitoringTag(std::string tag) {
+  monitoring_tags_.emplace(std::move(tag));
 }
 
 void AsyncReaderImpl::withoutPayload() {
@@ -321,6 +321,8 @@ int AsyncReaderImpl::startReading(logid_t log_id,
                                           : HealthChangeType::LOG_UNHEALTHY);
         }
       });
+  deps->setReaderName(reader_name_);
+
   auto read_stream = std::make_unique<ClientReadStream>(
       rsid,
       log_id,
@@ -333,7 +335,7 @@ int AsyncReaderImpl::startReading(logid_t log_id,
       processor_->config_,
       nullptr,
       attrs,
-      monitoring_tier_);
+      monitoring_tags_);
 
   if (without_payload_) {
     read_stream->setNoPayload();
@@ -462,11 +464,11 @@ bool AsyncReaderImpl::handleBufferedWrite(std::unique_ptr<DataRecord>& record) {
   record_with_attributes = nullptr; // no longer safe
 
   auto decoder = std::make_shared<BufferedWriteDecoderImpl>();
-  std::vector<Payload> payloads;
+  std::vector<PayloadGroup> payload_groups;
   // We use an overload of BufferedWriteDecoderImpl that does not claim
   // ownership of the input DataRecord, in case the client rejects delivery
   // and we need to return the record to ClientReadStream intact.
-  int rv = decoder->decodeOne(*record, payloads);
+  int rv = decoder->decodeOne(*record, payload_groups);
   if (rv != 0) {
     // Whoops, decoding failed. This is tragic and unlikely with checksums
     // but let's generate a DATALOSS gap to inform the client.
@@ -489,21 +491,21 @@ bool AsyncReaderImpl::handleBufferedWrite(std::unique_ptr<DataRecord>& record) {
   folly::SharedMutex::ReadHolder guard_map(nullptr);
   LogState* log_state = nullptr;
 
-  for (const Payload& payload : payloads) {
+  for (PayloadGroup& payload_group : payload_groups) {
     std::unique_ptr<DataRecord> sub_record =
         std::make_unique<DataRecordOwnsPayload>(
             log_id,
-            payload,
+            std::move(payload_group),
             decoder, // shared ownership of the decoder
             attrs.lsn,
             attrs.timestamp,
             flags & ~RECORD_Header::BUFFERED_WRITER_BLOB,
-            nullptr, // no rebuilding metadata
-            batch_offset++,
             // Report the same offsets for all subrecords. This may be
             // confusing but we don't have better options since offsets
             // currently count the bytes of compressed batches.
-            attrs.offsets);
+            attrs.offsets,
+            nullptr, // no rebuilding metadata
+            batch_offset++);
     if (buffer_rest) {
       // The application already rejected a previous record in this batch,
       // just buffer for later redelivery

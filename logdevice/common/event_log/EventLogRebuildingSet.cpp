@@ -189,9 +189,15 @@ int EventLogRebuildingSet::onShardNeedsRebuild(
     }
   }
 
+  // DEPRECATED. Will be removed.
   RebuildingMode requestedMode = flags & SHARD_NEEDS_REBUILD_Header::RELOCATE
       ? RebuildingMode::RELOCATE
       : RebuildingMode::RESTORE;
+
+  // FORCE_RESTORE will override the RELOCATE flag (hence the FORCE_ wording)
+  if (flags & SHARD_NEEDS_REBUILD_Header::FORCE_RESTORE) {
+    requestedMode = RebuildingMode::RESTORE;
+  }
 
   // Remove the existing node entry if it was already in the rebuilding set.
   // Before that, gather the information that is sticky about that node entry,
@@ -296,7 +302,9 @@ int EventLogRebuildingSet::onShardNeedsRebuild(
   node_info.drain = drain;
   node_info.mode = requestedMode;
   if (flags & SHARD_NEEDS_REBUILD_Header::DRAIN) {
-    if (flags & SHARD_NEEDS_REBUILD_Header::RELOCATE) {
+    if (flags & SHARD_NEEDS_REBUILD_Header::FORCE_RESTORE) {
+      currentMode = RebuildingMode::RESTORE;
+    } else if (flags & SHARD_NEEDS_REBUILD_Header::RELOCATE) {
       RATELIMIT_INFO(std::chrono::seconds(1),
                      1,
                      "Rebuilding mode is set "
@@ -305,6 +313,7 @@ int EventLogRebuildingSet::onShardNeedsRebuild(
     }
     // When drain flag is set, preserve the existing mode
     // if one exists. Otherwise, set mode to RELOCATE.
+    // if FORCE_RESTORE is set, we always use it.
     node_info.mode = currentMode.has_value() ? currentMode.value()
                                              : RebuildingMode::RELOCATE;
     node_info.drain = true;
@@ -400,12 +409,13 @@ int EventLogRebuildingSet::onShardAckRebuilt(
   if (node_info.drain) {
     // The node acknowledged rebuilding but a drain is still requested (the user
     // did not get a chance to write a SHARD_UNDRAIN event). This should not
-    // happen as storage nodes should wait for that message. However there are
-    // old versions of the server that may not wait for that message so do not
-    // fail.
+    // happen as storage nodes should wait for that message.
     ld_warning("Found event log record %s but the shard is being drained",
                record.describe().c_str());
+    err = E::FAILED;
+    return -1;
   }
+
   node_info.ack_lsn = lsn;
   node_info.ack_version = ptr->header.version;
 
@@ -584,15 +594,6 @@ int EventLogRebuildingSet::onShardUndrain(
                lsn_to_string(lsn).c_str(),
                record.describe().c_str(),
                node_id);
-    err = E::FAILED;
-    return -1;
-  }
-
-  if (!shard_info.nodes_[ptr->header.nodeIdx].drain) {
-    ld_warning("Found event log record with lsn %s: %s but this shard is not "
-               "being drained. Discarding.",
-               lsn_to_string(lsn).c_str(),
-               record.describe().c_str());
     err = E::FAILED;
     return -1;
   }
@@ -854,9 +855,7 @@ void EventLogRebuildingSet::recomputeAuthoritativeStatus(
   const auto& storage_membership = nodes_configuration.getStorageMembership();
   std::unordered_set<node_index_t> storage_nodes;
   for (const auto& n : *storage_membership) {
-    if (storage_membership->hasShardShouldReadFrom(n)) {
-      storage_nodes.insert(n);
-    }
+    storage_nodes.insert(n);
   }
 
   auto it_shard = shards_.find(shard);

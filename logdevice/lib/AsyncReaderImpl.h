@@ -40,7 +40,7 @@ class AsyncReaderImpl : public AsyncReader {
                    const ReadStreamAttributes* attrs = nullptr) override;
   int stopReading(logid_t log_id, std::function<void()> callback) override;
   int resumeReading(logid_t log_id) override;
-  void setMonitoringTier(MonitoringTier tier) override;
+  void addMonitoringTag(std::string) override;
   void withoutPayload() override;
   void payloadHashOnly();
   void forceNoSingleCopyDelivery() override;
@@ -49,6 +49,10 @@ class AsyncReaderImpl : public AsyncReader {
   void includeByteOffset() override;
   void doNotSkipPartiallyTrimmedSections() override;
   void getBytesBuffered(std::function<void(size_t)> callback) override;
+
+  void setReaderName(const std::string& reader_name) override {
+    reader_name_ = reader_name;
+  }
 
   // specify the buffer type for reading the log
   void setBufferType(ClientReadStreamBufferType buffer_type) {
@@ -92,7 +96,7 @@ class AsyncReaderImpl : public AsyncReader {
   std::function<void(logid_t)> done_callback_;
   std::function<void(logid_t, HealthChangeType)> health_change_callback_;
 
-  MonitoringTier monitoring_tier_{MonitoringTier::MEDIUM_PRI};
+  std::set<std::string> monitoring_tags_{};
 
   // Indicates withoutPayload() was called
   bool without_payload_ = false;
@@ -173,6 +177,8 @@ class AsyncReaderImpl : public AsyncReader {
 
   // Used to differentiate subsequent requests for stats.
   int statRequestId_{0};
+
+  std::string reader_name_;
 };
 
 }} // namespace facebook::logdevice

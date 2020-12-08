@@ -8,6 +8,7 @@
 
 #include "logdevice/common/configuration/nodes/ServerBasedNodesConfigurationStore.h"
 
+#include <folly/synchronization/Baton.h>
 #include <gtest/gtest.h>
 
 #include "logdevice/common/ConfigurationFetchRequest.h"
@@ -27,15 +28,15 @@ using namespace facebook::logdevice::configuration::nodes;
 TEST(ServerBasedNodesConfigurationStoreTest, SuccessScenario) {
   auto updatable_config =
       std::make_shared<UpdateableConfig>(createSimpleConfig(3, 0));
-  updatable_config->updateableNodesConfiguration()->update(
-      updatable_config->getServerConfig()
-          ->getNodesConfigurationFromServerConfigSource());
-  updatable_config->updateableNCMNodesConfiguration()->update(
-      updatable_config->getServerConfig()
-          ->getNodesConfigurationFromServerConfigSource());
   Settings settings = create_default_settings<Settings>();
   settings.num_workers = 5;
   settings.bootstrapping = true;
+
+  // TODO the following 2 settings are required to make the NCPublisher pick
+  // the NCM NodesConfiguration. Should be removed when NCM is the default.
+  settings.enable_nodes_configuration_manager = true;
+  settings.use_nodes_configuration_manager_nodes_configuration = true;
+
   auto processor = make_test_processor(
       settings, std::move(updatable_config), nullptr, NodeID(0, 1));
   auto nc = processor->getNodesConfiguration();

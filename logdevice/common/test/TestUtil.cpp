@@ -31,18 +31,20 @@
 
 #include "logdevice/common/NoopTraceLogger.h"
 #include "logdevice/common/PermissionChecker.h"
-#include "logdevice/common/PrincipalParser.h"
 #include "logdevice/common/Processor.h"
 #include "logdevice/common/ReaderImpl.h"
 #include "logdevice/common/SequencerLocator.h"
 #include "logdevice/common/Timer.h"
 #include "logdevice/common/Worker.h"
 #include "logdevice/common/configuration/ConfigParser.h"
+#include "logdevice/common/configuration/nodes/NodesConfigurationCodec.h"
+#include "logdevice/common/configuration/nodes/NodesConfigurationManagerFactory.h"
 #include "logdevice/common/debug.h"
 #include "logdevice/common/plugin/CommonBuiltinPlugins.h"
 #include "logdevice/common/protocol/MessageTypeNames.h"
 #include "logdevice/common/request_util.h"
 #include "logdevice/common/settings/Settings.h"
+#include "logdevice/common/test/NodesConfigurationTestUtil.h"
 #include "logdevice/common/util.h"
 #include "logdevice/include/Reader.h"
 
@@ -139,18 +141,21 @@ TemporaryDirectory::~TemporaryDirectory() {
   }
 }
 
-ServerConfig::NodesConfig createSimpleNodesConfig(size_t nnodes) {
-  ServerConfig::Nodes nodes;
+std::shared_ptr<const NodesConfiguration>
+createSimpleNodesConfig(size_t nnodes,
+                        shard_size_t num_shards,
+                        bool all_metadata,
+                        int replication_factor) {
+  configuration::Nodes nodes;
   for (size_t i = 0; i < nnodes; ++i) {
-    auto& node = nodes[i];
-    node.name = folly::sformat("server-{}", i);
-    node.address = Sockaddr("::1", folly::to<std::string>(4440 + i));
-    node.gossip_address = Sockaddr("::1", folly::to<std::string>(5440 + i));
-    node.generation = 1;
-    node.addSequencerRole();
-    node.addStorageRole(/*num_shards*/ 2);
+    nodes[i] = configuration::Node::withTestDefaults(i)
+                   .addSequencerRole()
+                   .addStorageRole(num_shards)
+                   .setIsMetadataNode(all_metadata || i == 0);
   }
-  return ServerConfig::NodesConfig(std::move(nodes));
+  return NodesConfigurationTestUtil::provisionNodes(
+      std::move(nodes),
+      ReplicationProperty{{NodeLocationScope::NODE, replication_factor}});
 }
 
 ServerConfig::MetaDataLogsConfig
@@ -185,30 +190,7 @@ createMetaDataLogsConfig(std::vector<node_index_t> positive_weight_nodes,
   return cfg;
 }
 
-ServerConfig::MetaDataLogsConfig
-createMetaDataLogsConfig(const ServerConfig::NodesConfig& nodes_config,
-                         size_t max_metadata_nodes,
-                         size_t max_replication,
-                         NodeLocationScope sync_replication_scope) {
-  // calculate a nodeset which has weights > 0 and resize with max_metadata
-  // accordingly
-  std::vector<node_index_t> positive_weight_nodes;
-  for (const auto& it : nodes_config.getNodes()) {
-    if (it.second.isWritableStorageNode()) {
-      positive_weight_nodes.push_back(it.first);
-    }
-  }
-  size_t meta_nodeset_size =
-      std::min(positive_weight_nodes.size(), max_metadata_nodes);
-  positive_weight_nodes.resize(meta_nodeset_size);
-
-  return createMetaDataLogsConfig(std::move(positive_weight_nodes),
-                                  max_replication,
-                                  sync_replication_scope);
-}
-
-std::shared_ptr<Configuration>
-createSimpleConfig(ServerConfig::NodesConfig nodes, size_t logs) {
+std::shared_ptr<Configuration> createSimpleConfig(size_t nnodes, size_t logs) {
   auto log_attrs = logsconfig::LogAttributes().with_replicationFactor(1);
   auto logs_config = std::make_shared<configuration::LocalLogsConfig>();
   logs_config->insert(
@@ -216,29 +198,10 @@ createSimpleConfig(ServerConfig::NodesConfig nodes, size_t logs) {
       "log1",
       log_attrs);
 
-  ServerConfig::MetaDataLogsConfig meta_config =
-      createMetaDataLogsConfig(nodes, 1, 1);
-
-  auto server_config = ServerConfig::fromDataTest(__FILE__, nodes, meta_config);
+  auto nodes = createSimpleNodesConfig(nnodes);
+  auto server_config = ServerConfig::fromDataTest(__FILE__);
   return std::make_shared<Configuration>(
-      std::move(server_config), std::move(logs_config));
-}
-
-std::shared_ptr<Configuration> createSimpleConfig(size_t nnodes, size_t logs) {
-  ServerConfig::Nodes nodes;
-  for (size_t i = 0; i < nnodes; ++i) {
-    Configuration::Node node;
-    node.name = folly::sformat("server-{}", i);
-    node.address = Sockaddr("::1", folly::to<std::string>(4440 + i));
-    node.gossip_address =
-        Sockaddr("::1", folly::to<std::string>(4440 + nnodes + i));
-    node.generation = 1;
-    node.addSequencerRole();
-    node.addStorageRole(/*num_shards*/ 2);
-    nodes[i] = std::move(node);
-  }
-  ServerConfig::NodesConfig nodes_config(nodes);
-  return createSimpleConfig(std::move(nodes_config), logs);
+      std::move(server_config), std::move(logs_config), std::move(nodes));
 }
 
 int wait_until(const char* reason,
@@ -252,7 +215,7 @@ int wait_until(const char* reason,
   auto last_logged = start;
 
   if (reason != nullptr) {
-    ld_info("Waiting until: %s", reason);
+    ld_info("\033[0;34mWaiting until:\033[0m %s", reason);
   }
 
   while (1) {
@@ -261,23 +224,26 @@ int wait_until(const char* reason,
         std::chrono::duration_cast<std::chrono::duration<double>>(now - start);
 
     if (cond()) {
-      ld_info(
-          "Finished waiting until: %s (%.3fs)", reason, seconds_waited.count());
+      ld_info("\033[0;32mFinished waiting until:\033[0m %s (%.3fs)",
+              reason,
+              seconds_waited.count());
       return 0;
     }
 
     if (now > deadline) {
-      ld_info("Timed out when waiting until: %s (%.3fs)",
+      ld_info("\033[0;31mTimed out when waiting until:\033[0m %s (%.3fs)",
               reason,
               seconds_waited.count());
       return -1;
     }
     if (now - last_logged >= std::chrono::seconds(5)) {
       if (reason != nullptr) {
-        ld_info(
-            "Still waiting until: %s (%.3fs)", reason, seconds_waited.count());
+        ld_info("\033[0;33mStill waiting until:\033[0m %s (%.3fs)",
+                reason,
+                seconds_waited.count());
       } else {
-        ld_info("Still waiting (%.3fs)", seconds_waited.count());
+        ld_info(
+            "\033[0;33mStill waiting (%.3fs)\033[0m", seconds_waited.count());
       }
       last_logged = now;
     }
@@ -497,6 +463,31 @@ std::string get_localhost_address_str() {
     }
   }
   throw std::runtime_error("couldn't find any loopback interfaces");
+}
+
+std::unique_ptr<folly::test::TemporaryDirectory>
+provisionTempNodesConfiguration(const NodesConfiguration& nodes_config) {
+  auto temp_dir = std::make_unique<folly::test::TemporaryDirectory>();
+
+  using namespace logdevice::configuration::nodes;
+  NodesConfigurationStoreFactory::Params params;
+  params.type = NodesConfigurationStoreFactory::NCSType::File;
+  params.file_store_root_dir = temp_dir->path().string();
+  params.path = NodesConfigurationStoreFactory::getDefaultConfigStorePath(
+      NodesConfigurationStoreFactory::NCSType::File, "");
+
+  auto store = NodesConfigurationStoreFactory::create(std::move(params));
+  if (store == nullptr) {
+    return nullptr;
+  }
+
+  auto serialized = NodesConfigurationCodec::serialize(nodes_config);
+  if (serialized.empty()) {
+    return nullptr;
+  }
+  store->updateConfigSync(
+      std::move(serialized), NodesConfigurationStore::Condition::overwrite());
+  return temp_dir;
 }
 
 }} // namespace facebook::logdevice

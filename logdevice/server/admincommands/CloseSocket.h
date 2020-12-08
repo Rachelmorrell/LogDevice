@@ -7,7 +7,7 @@
  */
 #pragma once
 
-#include "logdevice/common/Connection.h"
+#include "logdevice/common/ConnectionInfo.h"
 #include "logdevice/common/Processor.h"
 #include "logdevice/common/Sender.h"
 #include "logdevice/common/WorkerType.h"
@@ -96,21 +96,31 @@ class CloseSocket : public AdminCommand {
   void run() override {
     auto cb = [&] {
       Sender& sender = Worker::onThisThread()->sender();
-      int rv;
+      int closed = 0;
+      std::vector<Address> addresses;
       if (all_clients_) {
-        return sender.closeAllClientSockets(E::PEER_CLOSED);
-      }
-      if (address_.isClientAddress()) {
-        rv = sender.closeClientSocket(address_.asClientID(), E::PEER_CLOSED);
+        sender.forEachConnection([&addresses](const ConnectionInfo& info) {
+          const auto peer_name = info.peer_name;
+          if (peer_name.isClientAddress()) {
+            addresses.push_back(peer_name);
+          }
+        });
       } else {
-        rv = sender.closeServerSocket(address_.asNodeID(), E::PEER_CLOSED);
+        if (address_.valid()) {
+          addresses.push_back(address_);
+        }
       }
-      if (rv == 0) {
-        return 1;
-      } else {
-        ld_check(err == E::NOTFOUND);
-        return 0;
+      for (const auto& address : addresses) {
+        int rv = sender.closeConnection(address, E::PEER_CLOSED);
+        if (rv != 0) {
+          ld_error("Failed to close connection %s due to %s",
+                   address.toString().c_str(),
+                   error_name(err));
+        } else {
+          closed++;
+        }
       }
+      return closed;
     };
 
     int count = 0;

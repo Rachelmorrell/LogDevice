@@ -15,7 +15,6 @@
 
 #include <folly/io/async/EventBaseThread.h>
 
-#include "logdevice/admin/AdminServer.h"
 #include "logdevice/admin/maintenance/ClusterMaintenanceStateMachine.h"
 #include "logdevice/common/Processor.h"
 #include "logdevice/common/Request.h"
@@ -25,13 +24,14 @@
 #include "logdevice/common/Worker.h"
 #include "logdevice/server/ConnectionListener.h"
 #include "logdevice/server/LogStoreMonitor.h"
-#include "logdevice/server/RebuildingCoordinator.h"
-#include "logdevice/server/RebuildingSupervisor.h"
 #include "logdevice/server/ServerProcessor.h"
 #include "logdevice/server/UnreleasedRecordDetector.h"
 #include "logdevice/server/locallogstore/ShardedRocksDBLocalLogStore.h"
 #include "logdevice/server/read_path/LogStorageStateMap.h"
+#include "logdevice/server/rebuilding/RebuildingCoordinator.h"
+#include "logdevice/server/rebuilding/RebuildingSupervisor.h"
 #include "logdevice/server/storage_tasks/ShardedStorageThreadPool.h"
+#include "logdevice/server/thrift/LogDeviceThriftServer.h"
 #include "logdevice/server/util.h"
 
 namespace facebook { namespace logdevice {
@@ -130,14 +130,17 @@ using std::chrono::milliseconds;
 using std::chrono::steady_clock;
 
 void shutdown_server(
-    std::unique_ptr<AdminServer>& admin_server,
+    std::unique_ptr<LogDeviceThriftServer>& admin_server,
+    std::unique_ptr<LogDeviceThriftServer>& s2s_thrift_api_server,
+    std::unique_ptr<LogDeviceThriftServer>& c2s_thrift_api_server,
     std::unique_ptr<Listener>& connection_listener,
+    std::map<ServerSettings::ClientNetworkPriority, std::unique_ptr<Listener>>&
+        listeners_per_priority,
     std::unique_ptr<Listener>& gossip_listener,
     std::unique_ptr<Listener>& ssl_connection_listener,
     std::unique_ptr<Listener>& server_to_server_listener,
     std::unique_ptr<folly::EventBaseThread>& connection_listener_loop,
     std::unique_ptr<folly::EventBaseThread>& gossip_listener_loop,
-    std::unique_ptr<folly::EventBaseThread>& ssl_connection_listener_loop,
     std::unique_ptr<folly::EventBaseThread>& server_to_server_listener_loop,
     std::unique_ptr<LogStoreMonitor>& logstore_monitor,
     std::shared_ptr<ServerProcessor>& processor,
@@ -150,7 +153,8 @@ void shutdown_server(
     std::shared_ptr<UnreleasedRecordDetector>& unreleased_record_detector,
     std::unique_ptr<maintenance::ClusterMaintenanceStateMachine>&
         cluster_maintenance_state_machine,
-    bool fast_shutdown) {
+    bool fast_shutdown,
+    uint64_t& shutdown_duration_ms) {
   auto t1 = steady_clock::now();
 
   // Stop the Admin API Server
@@ -160,6 +164,18 @@ void shutdown_server(
     // cleanly shutdown any threads/workers managed by the Admin API server.
     admin_server->stop();
     ld_info("Admin API server stopped accepting requests");
+  }
+
+  if (s2s_thrift_api_server) {
+    ld_info("Stopping server to server Thrift API server");
+    s2s_thrift_api_server->stop();
+    ld_info("Server to server Thrift API server stopped accepting requests");
+  }
+
+  if (c2s_thrift_api_server) {
+    ld_info("Stopping client-facing Thrift API server");
+    c2s_thrift_api_server->stop();
+    ld_info("Client-facing Thrift API server stopped accepting requests");
   }
 
   if (sequencer_placement && !fast_shutdown) {
@@ -185,35 +201,38 @@ void shutdown_server(
 
   // stop accepting new connections
   ld_info("Destroying listeners");
-  std::vector<folly::SemiFuture<folly::Unit>> listeners_closed;
+  std::vector<folly::SemiFuture<folly::Unit>> closed_listeners;
   if (connection_listener) {
-    listeners_closed.emplace_back(
+    closed_listeners.emplace_back(
         connection_listener->stopAcceptingConnections());
+  }
+  for (auto& [_, listener] : listeners_per_priority) {
+    closed_listeners.emplace_back(listener->stopAcceptingConnections());
   }
 
   if (gossip_listener) {
-    listeners_closed.emplace_back(gossip_listener->stopAcceptingConnections());
+    closed_listeners.emplace_back(gossip_listener->stopAcceptingConnections());
   }
   if (ssl_connection_listener) {
-    listeners_closed.emplace_back(
+    closed_listeners.emplace_back(
         ssl_connection_listener->stopAcceptingConnections());
   }
   if (server_to_server_listener) {
-    listeners_closed.emplace_back(
+    closed_listeners.emplace_back(
         server_to_server_listener->stopAcceptingConnections());
   }
 
-  folly::collectAllUnsafe(listeners_closed.begin(), listeners_closed.end())
+  folly::collectAllUnsafe(closed_listeners.begin(), closed_listeners.end())
       .wait();
 
-  connection_listener.reset();
-  connection_listener_loop.reset();
   gossip_listener.reset();
   gossip_listener_loop.reset();
   ssl_connection_listener.reset();
-  ssl_connection_listener_loop.reset();
+  listeners_per_priority.clear();
   server_to_server_listener.reset();
   server_to_server_listener_loop.reset();
+  connection_listener.reset();
+  connection_listener_loop.reset();
 
   auto health_monitor_closed = processor->getHealthMonitor() != nullptr
       ? processor->getHealthMonitor()->shutdown()
@@ -369,6 +388,7 @@ void shutdown_server(
       t.join();
     }
   }
+
   if (sharded_store) {
     ld_info("Destroying local log store");
     sharded_store.reset();
@@ -377,8 +397,7 @@ void shutdown_server(
   processor.reset();
 
   auto t2 = steady_clock::now();
-  int64_t duration = duration_cast<milliseconds>(t2 - t1).count();
-  ld_info("Shutdown took %ld ms", duration);
+  shutdown_duration_ms = duration_cast<milliseconds>(t2 - t1).count();
 }
 
 }} // namespace facebook::logdevice

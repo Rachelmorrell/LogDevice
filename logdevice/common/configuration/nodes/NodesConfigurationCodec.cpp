@@ -24,7 +24,8 @@ thrift::NodeServiceDiscovery NodesConfigurationThriftConverter::toThrift(
   thrift::NodeServiceDiscovery disc;
   disc.set_name(discovery.name);
   disc.set_version(discovery.version);
-  disc.set_address(discovery.address.toString());
+  disc.set_default_client_data_address(
+      discovery.default_client_data_address.toString());
   if (discovery.gossip_address.has_value()) {
     disc.set_gossip_address(discovery.gossip_address->toString());
   }
@@ -38,10 +39,28 @@ thrift::NodeServiceDiscovery NodesConfigurationThriftConverter::toThrift(
     disc.set_server_to_server_address(
         discovery.server_to_server_address.value().toString());
   }
+
+  if (discovery.server_thrift_api_address.has_value()) {
+    disc.set_server_thrift_api_address(
+        discovery.server_thrift_api_address.value().toString());
+  }
+  if (discovery.client_thrift_api_address.has_value()) {
+    disc.set_client_thrift_api_address(
+        discovery.client_thrift_api_address.value().toString());
+  }
+
+  std::map<NodeServiceDiscovery::ClientNetworkPriority, std::string>
+      addresses_per_priority;
+  for (const auto& [priority, sock_addr] : discovery.addresses_per_priority) {
+    addresses_per_priority[priority] = sock_addr.toString();
+  }
+  disc.set_addresses_per_priority(addresses_per_priority);
+
   if (discovery.location.has_value()) {
     disc.set_location(discovery.location.value().toString());
   }
   disc.set_roles(discovery.roles.to_ullong());
+  disc.tags_ref()->insert(discovery.tags.begin(), discovery.tags.end());
   return disc;
 }
 
@@ -51,19 +70,20 @@ int NodesConfigurationThriftConverter::fromThrift(
     NodeServiceDiscovery* out) {
   NodeServiceDiscovery result;
 
-  result.name = obj.name;
-  result.version = obj.version;
+  result.name = *obj.name_ref();
+  result.version = *obj.version_ref();
 
-  if (obj.address.empty()) {
+  if (obj.default_client_data_address_ref()->empty()) {
     ld_error("Missing required field address.");
     return -1;
   } else {
-    auto sock = Sockaddr::fromString(obj.address);
+    auto sock =
+        Sockaddr::fromString(obj.default_client_data_address_ref().value());
     if (!sock.has_value()) {
       ld_error("malformed socket addr field address.");
       return -1;
     }
-    result.address = sock.value();
+    result.default_client_data_address = sock.value();
   }
 
   if (obj.gossip_address_ref().has_value()) {
@@ -103,6 +123,38 @@ int NodesConfigurationThriftConverter::fromThrift(
     result.server_to_server_address = sock.value();
   }
 
+  if (obj.server_thrift_api_address_ref().has_value()) {
+    auto sock =
+        Sockaddr::fromString(obj.server_thrift_api_address_ref().value());
+    if (!sock.has_value()) {
+      ld_error("malformed socket addr field server_thrift_api_address.");
+      return -1;
+    }
+    result.server_thrift_api_address = sock.value();
+  }
+
+  if (obj.client_thrift_api_address_ref().has_value()) {
+    auto sock =
+        Sockaddr::fromString(obj.client_thrift_api_address_ref().value());
+    if (!sock.has_value()) {
+      ld_error("malformed socket addr field client_thrift_api_address.");
+      return -1;
+    }
+    result.client_thrift_api_address = sock.value();
+  }
+
+  if (obj.addresses_per_priority_ref().has_value()) {
+    for (const auto& [priority, address] :
+         obj.addresses_per_priority_ref().value()) {
+      auto sock = Sockaddr::fromString(address);
+      if (!sock.has_value()) {
+        ld_error("malformed socket addr field addresses_per_priority.");
+        return -1;
+      }
+      result.addresses_per_priority[priority] = sock.value();
+    }
+  }
+
   if (obj.location_ref().has_value()) {
     NodeLocation location;
     int rv = location.fromDomainString(obj.location_ref().value());
@@ -114,7 +166,9 @@ int NodesConfigurationThriftConverter::fromThrift(
     result.location = location;
   }
 
-  result.roles = NodeServiceDiscovery::RoleSet(obj.roles);
+  result.roles = NodeServiceDiscovery::RoleSet(*obj.roles_ref());
+  result.tags = NodeServiceDiscovery::TagMap(
+      obj.tags_ref()->begin(), obj.tags_ref()->end());
 
   if (out != nullptr) {
     *out = result;
@@ -157,8 +211,10 @@ thrift::StorageNodeAttribute NodesConfigurationThriftConverter::toThrift(
 int NodesConfigurationThriftConverter::fromThrift(
     const thrift::StorageNodeAttribute& obj,
     StorageNodeAttribute* out) {
-  StorageNodeAttribute result{
-      obj.capacity, obj.num_shards, obj.generation, obj.exclude_from_nodesets};
+  StorageNodeAttribute result{*obj.capacity_ref(),
+                              *obj.num_shards_ref(),
+                              *obj.generation_ref(),
+                              *obj.exclude_from_nodesets_ref()};
 
   if (out != nullptr) {
     *out = result;
@@ -185,7 +241,7 @@ int NodesConfigurationThriftConverter::fromThrift(
   std::shared_ptr<_Config> NodesConfigurationThriftConverter::fromThrift( \
       const thrift::_Config& _thrift_config) {                            \
     auto result = std::make_shared<_Config>();                            \
-    for (const auto& state : _thrift_config.node_states) {                \
+    for (const auto& state : *_thrift_config.node_states_ref()) {         \
       node_index_t node = state.first;                                    \
       auto node_attribute = state.second;                                 \
       _Attribute attr;                                                    \
@@ -229,13 +285,13 @@ GEN_SERIALIZATION_NODE_ATTRS_CONFIG(StorageAttributeConfig,
   /*static*/                                                                 \
   std::shared_ptr<_Config> NodesConfigurationThriftConverter::fromThrift(    \
       const thrift::_Config& _thrift_config) {                               \
-    auto attr_config = fromThrift(_thrift_config.attr_conf);                 \
+    auto attr_config = fromThrift(*_thrift_config.attr_conf_ref());          \
     if (attr_config == nullptr) {                                            \
       err = E::INVALID_CONFIG;                                               \
       return nullptr;                                                        \
     }                                                                        \
     auto membership = membership::MembershipThriftConverter::fromThrift(     \
-        _thrift_config.membership);                                          \
+        *_thrift_config.membership_ref());                                   \
     if (membership == nullptr) {                                             \
       err = E::INVALID_CONFIG;                                               \
       return nullptr;                                                        \
@@ -284,12 +340,13 @@ NodesConfigurationThriftConverter::fromThrift(
     const thrift::MetaDataLogsReplication& thrift_config) {
   auto result = std::make_shared<MetaDataLogsReplication>();
   std::vector<ReplicationProperty::ScopeReplication> scopes;
-  for (const auto& scope : thrift_config.replication.scopes) {
-    scopes.emplace_back(static_cast<NodeLocationScope>(scope.scope),
-                        static_cast<int>(scope.replication_factor));
+  for (const auto& scope : *thrift_config.replication_ref()->scopes_ref()) {
+    scopes.emplace_back(static_cast<NodeLocationScope>(*scope.scope_ref()),
+                        static_cast<int>(*scope.replication_factor_ref()));
   }
 
-  result->version_ = membership::MembershipVersion::Type(thrift_config.version);
+  result->version_ =
+      membership::MembershipVersion::Type(*thrift_config.version_ref());
 
   // allow empty scopes here (which is
   // prohibited in
@@ -333,7 +390,8 @@ NodesConfigurationThriftConverter::toThrift(const NodesConfiguration& config) {
 std::shared_ptr<NodesConfiguration>
 NodesConfigurationThriftConverter::fromThrift(
     const thrift::NodesConfiguration& thrift_config) {
-  NodesConfigurationCodec::ProtocolVersion pv = thrift_config.proto_version;
+  NodesConfigurationCodec::ProtocolVersion pv =
+      *thrift_config.proto_version_ref();
   if (pv > NodesConfigurationCodec::CURRENT_PROTO_VERSION) {
     RATELIMIT_ERROR(std::chrono::seconds(10),
                     5,
@@ -350,14 +408,14 @@ NodesConfigurationThriftConverter::fromThrift(
 
   auto result = std::make_shared<NodesConfiguration>();
 
-#define PARSE_SUB_CONF(_name)                             \
-  do {                                                    \
-    result->_name##_ = fromThrift(thrift_config._name);   \
-    if (result->_name##_ == nullptr) {                    \
-      ld_error("failure to parse subconfig %s.", #_name); \
-      err = E::INVALID_CONFIG;                            \
-      return nullptr;                                     \
-    }                                                     \
+#define PARSE_SUB_CONF(_name)                                    \
+  do {                                                           \
+    result->_name##_ = fromThrift(*thrift_config._name##_ref()); \
+    if (result->_name##_ == nullptr) {                           \
+      ld_error("failure to parse subconfig %s.", #_name);        \
+      err = E::INVALID_CONFIG;                                   \
+      return nullptr;                                            \
+    }                                                            \
   } while (0)
 
   PARSE_SUB_CONF(service_discovery);
@@ -366,8 +424,9 @@ NodesConfigurationThriftConverter::fromThrift(
   PARSE_SUB_CONF(metadata_logs_rep);
 #undef PARSE_SUB_CONF
 
-  result->version_ = membership::MembershipVersion::Type(thrift_config.version);
-  result->last_change_timestamp_ = thrift_config.last_timestamp;
+  result->version_ =
+      membership::MembershipVersion::Type(*thrift_config.version_ref());
+  result->last_change_timestamp_ = *thrift_config.last_timestamp_ref();
 
   // recompute all config metadata
   result->recomputeConfigMetadata();

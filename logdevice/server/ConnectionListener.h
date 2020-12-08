@@ -16,6 +16,7 @@
 #include <folly/io/async/EventHandler.h>
 #include <folly/net/NetworkSocket.h>
 
+#include "logdevice/common/ConnectionKind.h"
 #include "logdevice/common/Processor.h"
 #include "logdevice/common/ResourceBudget.h"
 #include "logdevice/common/SimpleEnumMap.h"
@@ -36,18 +37,7 @@ class ConnectionListener : public Listener {
     std::atomic_int last_client_idx_{0};
   };
 
-  /*
-   * Represents the listener type.
-   */
-  enum class ListenerType : uint8_t {
-    DATA,
-    DATA_SSL,
-    GOSSIP,
-    SERVER_TO_SERVER,
-    MAX,
-  };
-
-  static const SimpleEnumMap<ListenerType, std::string>& listenerTypeNames();
+  static const char* connectionKindToThreadName(ConnectionKind);
 
   // EventLoop on which ConnectionListener is running
   KeepAlive loop_;
@@ -55,8 +45,9 @@ class ConnectionListener : public Listener {
   explicit ConnectionListener(Listener::InterfaceDef iface,
                               KeepAlive loop,
                               std::shared_ptr<SharedState> shared_state,
-                              ListenerType listener_type,
-                              ResourceBudget& connection_backlog_budget);
+                              ConnectionKind connection_kind,
+                              ResourceBudget& connection_backlog_budget,
+                              bool enable_dscp_reflection);
 
   void setProcessor(Processor* processor) {
     processor_ = processor;
@@ -127,7 +118,7 @@ class ConnectionListener : public Listener {
   // Pointer to Processor to hand connections off to. Unowned.
   Processor* processor_ = nullptr;
   std::shared_ptr<SharedState> shared_state_;
-  ListenerType listener_type_;
+  ConnectionKind connection_kind_;
 };
 
 }} // namespace facebook::logdevice

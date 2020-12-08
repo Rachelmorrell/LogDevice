@@ -192,12 +192,13 @@ class AsyncReader {
   virtual int resumeReading(logid_t log_id) = 0;
 
   /**
-   * Defines monitoring tier for this reader. Each tier is tracked separately,
-   * allowing for different alarming, SLAs, etc for each.
+   * Adds a monitoring tag to this reader. Monitoring tags are used to help
+   * identify readers that belong to a particular user, use case, function, etc
+   * for monitoring purposes.
    *
    * Only affects subsequent startReading() calls.
    */
-  virtual void setMonitoringTier(MonitoringTier tier) = 0;
+  virtual void addMonitoringTag(std::string tag) = 0;
 
   /**
    * If called, data records read by this AsyncReader will not include payloads.
@@ -300,6 +301,8 @@ class AsyncReader {
    * ClientReadStreamBuffers currently occupy
    */
   virtual void getBytesBuffered(std::function<void(size_t)> callback) = 0;
+
+  virtual void setReaderName(const std::string& reader_name) = 0;
 
   virtual ~AsyncReader() {}
 };
